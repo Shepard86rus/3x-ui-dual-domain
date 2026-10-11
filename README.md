@@ -190,6 +190,7 @@ bash 3x-ui-dual-domain.sh install
 | `bash 3x-ui-dual-domain.sh add-reality` | перевод схемы на Reality (из TLS) |
 | `bash 3x-ui-dual-domain.sh add-hy2` | добавление Hysteria2-инбаунда (с preflight-проверкой порта) |
 | `bash 3x-ui-dual-domain.sh rebind-ip` | сервер сменил IP — перепрописать конфиги |
+| `bash 3x-ui-dual-domain.sh upgrade` | обновить сам этот скрипт до новейшей версии с репо |
 
 ## Обновление панели
 

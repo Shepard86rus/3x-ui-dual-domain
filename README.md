@@ -58,6 +58,12 @@ decoy-сайты, ufw + fail2ban.
   панели держат изменения только в превью: без «Сохранить» слева вверху и
   перезапуска панели всё исчезает (грабля дважды, обе — с болью).
 
+## Получение
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/lucx-dual-domain.sh -o lucx-dual-domain.sh
+```
+
 ## Установка
 
 Требования: Ubuntu 22.04/24.04, root, **два домена** с A-записями на IP
@@ -66,6 +72,9 @@ decoy-сайты, ufw + fail2ban.
 ```bash
 bash lucx-dual-domain.sh install
 ```
+
+Если скрипт лежит в другом месте — указывайте полный путь,
+например: `bash /root/lucx-dual-domain.sh install`.
 
 Скрипт интерактивный: спросит домены и режим 443 (TLS/Reality), предложит
 выбор версии панели (Enter = последняя стабильная), в конце сохранит креды
@@ -81,12 +90,12 @@ bash lucx-dual-domain.sh healthcheck
 
 | Команда | Что делает |
 |---|---|
-| `install` | полная установка с нуля |
-| `healthcheck` | 60+ проверок: сервисы, порты, ufw, nginx, серты, decoys, БД, подписки, AWG, скан открытых портов |
-| `add-vls` | перевод схемы на TLS (из Reality), с fallback-вхостом |
-| `add-reality` | перевод схемы на Reality (из TLS) |
-| `add-hy2` | добавление Hysteria2-инбаунда (с preflight-проверкой порта) |
-| `rebind-ip` | сервер сменил IP — перепрописать конфиги |
+| `bash lucx-dual-domain.sh install` | полная установка с нуля |
+| `bash lucx-dual-domain.sh healthcheck` | 60+ проверок: сервисы, порты, ufw, nginx, серты, decoys, БД, подписки, AWG, скан открытых портов |
+| `bash lucx-dual-domain.sh add-vls` | перевод схемы на TLS (из Reality), с fallback-вхостом |
+| `bash lucx-dual-domain.sh add-reality` | перевод схемы на Reality (из TLS) |
+| `bash lucx-dual-domain.sh add-hy2` | добавление Hysteria2-инбаунда (с preflight-проверкой порта) |
+| `bash lucx-dual-domain.sh rebind-ip` | сервер сменил IP — перепрописать конфиги |
 
 ## Обновление панели
 

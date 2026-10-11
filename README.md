@@ -182,9 +182,10 @@ bash 3x-ui-dual-domain.sh rebind-ip
 
 Если инструмент оказался полезным — можно поддержать разработку:
 
+- **Boosty** (разовый донат): [boosty.to/shepard86rus/donate](https://boosty.to/shepard86rus/donate)
 - **ЮMoney**: [yoomoney.ru/to/4100175017397](https://yoomoney.ru/to/4100175017397)
 
-Спасибо! Вопросы по проекту — в ишуи или на странице Boosty.
+Спасибо! Вопросы по проекту — в ишуи или в комментарии на Boosty.
 
 ## Лицензия
 

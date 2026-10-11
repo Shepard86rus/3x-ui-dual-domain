@@ -1,4 +1,4 @@
-# lucx-dual-domain
+# 3x-ui-dual-domain
 
 **Автор: Shepard86rus**
 
@@ -61,8 +61,12 @@ decoy-сайты, ufw + fail2ban.
 ## Получение
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/lucx-dual-domain.sh -o lucx-dual-domain.sh
+curl -fsSL https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/3x-ui-dual-domain.sh -o 3x-ui-dual-domain.sh
 ```
+
+> Версии вида `v0.4.x` в тексте — номера из changelog'а самого скрипта (шапка
+> файла). GitHub-релизы репо начинаются с `v0.4.6` — репо молодое; более ранние
+> версии скрипта существуют, но публиковались только в виде файла, без релизов.
 
 ## Два домена — зачем именно два
 
@@ -92,7 +96,7 @@ curl -fsSL https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main
 | | TLS | Reality |
 |---|---|---|
 | Как работает | TLS терминирует nginx на 443, xray внутри на loopback, «чужие» подключения уходят на decoy №2 | xray сам терминирует Reality-протокол, «чужие» подключения — на decoy №2 |
-| Настройка клиента | vless+TLS, raw, fp=firefox, flow=none | vless+Reality, fp=chrome |
+| Настройка клиента | vless+TLS, raw, fp=firefox, flow=none | vless+Reality, fp=firefox |
 | Из России | ✅ работает | ✅ работает |
 
 Передумать — не проблема: `add-vls` (→ TLS) или `add-reality` (→ Reality)
@@ -104,38 +108,37 @@ curl -fsSL https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main
 на IP. DNS должно уже резолвиться — скрипт проверяет.
 
 ```bash
-bash lucx-dual-domain.sh install
+bash 3x-ui-dual-domain.sh install
 ```
 
 Если скрипт лежит в другом месте — указывайте полный путь,
-например: `bash /root/lucx-dual-domain.sh install`.
+например: `bash /root/3x-ui-dual-domain.sh install`.
 
 Скрипт интерактивный: спросит домены и режим 443 (TLS/Reality), предложит
 выбор версии панели (Enter = последняя стабильная), в конце сохранит креды
 в `/root/.lucx-credentials` (mode 600) и напечатает итог.
 
-**Сразу после установки — запустите healthcheck:**
-
-```bash
-bash lucx-dual-domain.sh healthcheck
-```
+> ⚠️ **healthcheck — только после ПОЛНОЙ настройки панели.** Сразу после
+> `install` ключей и части инбаундов ещё нет — проверка покажет FAIL'ы,
+> и это будет ожидаемо, а не поломка. Порядок: `install` → настройка панели
+> (клиенты, ключи, AWG) → `healthcheck`.
 
 ## Команды
 
 | Команда | Что делает |
 |---|---|
-| `bash lucx-dual-domain.sh install` | полная установка с нуля |
-| `bash lucx-dual-domain.sh healthcheck` | 60+ проверок: сервисы, порты, ufw, nginx, серты, decoys, БД, подписки, AWG, скан открытых портов |
-| `bash lucx-dual-domain.sh add-vls` | перевод схемы на TLS (из Reality), с fallback-вхостом |
-| `bash lucx-dual-domain.sh add-reality` | перевод схемы на Reality (из TLS) |
-| `bash lucx-dual-domain.sh add-hy2` | добавление Hysteria2-инбаунда (с preflight-проверкой порта) |
-| `bash lucx-dual-domain.sh rebind-ip` | сервер сменил IP — перепрописать конфиги |
+| `bash 3x-ui-dual-domain.sh install` | полная установка с нуля |
+| `bash 3x-ui-dual-domain.sh healthcheck` | 60+ проверок: сервисы, порты, ufw, nginx, серты, decoys, БД, подписки, AWG, скан открытых портов |
+| `bash 3x-ui-dual-domain.sh add-vls` | перевод схемы на TLS (из Reality), с fallback-вхостом |
+| `bash 3x-ui-dual-domain.sh add-reality` | перевод схемы на Reality (из TLS) |
+| `bash 3x-ui-dual-domain.sh add-hy2` | добавление Hysteria2-инбаунда (с preflight-проверкой порта) |
+| `bash 3x-ui-dual-domain.sh rebind-ip` | сервер сменил IP — перепрописать конфиги |
 
 ## Обновление панели
 
 ```bash
 x-ui update
-bash lucx-dual-domain.sh healthcheck
+bash 3x-ui-dual-domain.sh healthcheck
 ```
 
 **Неинтерактивно** (cron/скрипты, без терминала) — обновление задаёт **два вопроса**:
@@ -161,7 +164,7 @@ grep -aoE 'v3\.9\.0-lucx\.[0-9]+' /usr/local/x-ui/x-ui | tail -1
 У регистратора поменяйте A-записи, затем:
 
 ```bash
-bash lucx-dual-domain.sh rebind-ip
+bash 3x-ui-dual-domain.sh rebind-ip
 ```
 
 ## Типичные проблемы

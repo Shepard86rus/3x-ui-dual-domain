@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# lucx-dual-domain.sh
+# 3x-ui-dual-domain.sh
 # --------------------
 # Установка + healthcheck для lucx-ui с двумя доменами и Reality на 443.
 # Версия с автоматическим фиксом подписок (подтверждённые ключи БД + nginx location).
@@ -47,7 +47,7 @@
 #   Добавлен интерактивный выбор версии lucx-ui при установке: показывает
 #   последние 10 стабильных релизов, Enter = последняя. Можно также
 #   зафиксировать версию без вопросов через переменную окружения:
-#     LUCX_PIN_VERSION=v3.7.0-lucx.192 sudo bash lucx-dual-domain.sh install
+#     LUCX_PIN_VERSION=v3.7.0-lucx.192 sudo bash 3x-ui-dual-domain.sh install
 #   При неинтерактивном запуске (без терминала) молча берёт последнюю.
 #
 # v0.0.7: версия САМОГО этого скрипта (не lucx-ui) теперь выводится и
@@ -128,9 +128,9 @@
 #   Теперь проверяем любой AWG-интерфейс с listening port: 443.
 #
 # Режимы:
-#   sudo bash lucx-dual-domain.sh install      — установить всё с нуля
-#   sudo bash lucx-dual-domain.sh healthcheck  — проверить текущую связку
-#   sudo bash lucx-dual-domain.sh              — по умолчанию install
+#   sudo bash 3x-ui-dual-domain.sh install      — установить всё с нуля
+#   sudo bash 3x-ui-dual-domain.sh healthcheck  — проверить текущую связку
+#   sudo bash 3x-ui-dual-domain.sh              — по умолчанию install
 #
 # Запускать от root на чистой Debian/Ubuntu.
 
@@ -458,7 +458,7 @@
 #   ИЗМЕНЕНИЯ:
 #   - install [9/10]: снова "listen ${SERVER_IP}:443;" (проверенная форма
 #     со времён v0.0.1, работает на всех четырёх серверах);
-#   - НОВЫЙ РЕЖИМ `rebind-ip`: sudo bash lucx-dual-domain.sh rebind-ip —
+#   - НОВЫЙ РЕЖИМ `rebind-ip`: sudo bash 3x-ui-dual-domain.sh rebind-ip —
 #     определяет текущий IP, сверяет A-записи (warn если DNS не переключён),
 #     правит listen-строку (обе формы: legacy explicit и отозванный
 #     wildcard), бэкап, nginx -t, restart, проверка бинда через ss.
@@ -3837,7 +3837,7 @@ cmd_healthcheck() {
   # ВАЖНО: `|| true` обязателен — под set -e -o pipefail отсутствие сети/404
   # приватного репо убивало весь healthcheck (поймано в тесте на полигоне)
   # v0.4.7-fix (ревью Клоуда): единый источник с upgrade — raw main, а не releases/latest
-  hc_latest_ver=$(timeout 8 curl -fsSL "https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/lucx-dual-domain.sh" 2>/dev/null | grep -m1 '^VERSION=' | cut -d'"' -f2 || true)
+  hc_latest_ver=$(timeout 8 curl -fsSL "https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/3x-ui-dual-domain.sh" 2>/dev/null | grep -m1 '^VERSION=' | cut -d'"' -f2 || true)
   if [[ -n "$hc_latest_ver" && "$hc_latest_ver" != "$VERSION" ]]; then
     echo "INFO: доступна новая версия скрипта v${hc_latest_ver} (установлена v${VERSION}) — обновление: bash $0 upgrade"
   fi
@@ -4665,13 +4665,13 @@ cmd_rebind_ip() {
 # ================== UPGRADE (v0.4.7): патч скрипта без переустановки ==================
 
 cmd_upgrade() {
-  local raw_url="https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/lucx-dual-domain.sh"
+  local raw_url="https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/3x-ui-dual-domain.sh"
   local tmp self_dir
   # v0.4.7-fix (ревью Клоуда): tmp в каталоге скрипта (та же ФС) — mv = rename(2),
   # а не copy+unlink с обрезкой inode под работающим bash
   self_dir=$(dirname -- "$0")
   [[ -d "$self_dir" && -w "$self_dir" ]] || self_dir="/tmp"
-  tmp=$(mktemp "$self_dir/lucx-upgrade.XXXXXX") || { echo "ОШИБКА: не создать временный файл"; return 1; }
+  tmp=$(mktemp "$self_dir/3xui-upgrade.XXXXXX") || { echo "ОШИБКА: не создать временный файл"; return 1; }
   echo "Скачиваю новейшую версию скрипта с GitHub..."
   if ! curl -fsSL --max-time 120 "$raw_url" -o "$tmp"; then
     rm -f "$tmp"; echo "ОШИБКА: скачивание не удалось ($raw_url)"; return 1

@@ -716,7 +716,19 @@
 #   затронут (приёмка №1 63/0 — sshd на 22); мина была под будущие
 #   установки с кастомным SSH-портом в образе хостера. v0.4.5 пропущена
 #   стабильной линией (экспериментальная xhttp-ветка, направление закрыто).
-VERSION="0.4.6"
+# v0.4.7: КОМАНДА UPGRADE + INFO о версиях + правила панели в конце install.
+#   `upgrade`: качает новейший скрипт с GitHub-репо (raw main) во временный файл,
+#   bash -n, сравнение VERSION (актуальна -> no-op), атомарная замена себя
+#   (бэкап *.upgrade-old; запущенный bash держит старый inode - безопасно),
+#   затем exec healthcheck новой версией. Запуск не из файла (/dev/fd/*) - отказ.
+#   healthcheck: INFO «доступна версия X (установлена Y)» через GitHub API
+#   (тихо без сети). install: в конце печатает правила «панель: можно / нельзя»
+#   (дублируют README; грабли 2026-10-10/11: форма инбаунда теряет proxy protocol
+#   и клиентов, TLS<->Reality руками, Masking на 443, порт 8443, диалоги без
+#   «Сохранить», неинтерактивный x-ui update без 'y\n4\n').
+#   Файл публикуется в репо Shepard86rus/3x-ui-dual-domain (скраб-политика:
+#   в комментариях нет хостнеймов/IP/имён клиентов).
+VERSION="0.4.7"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
 # С v3.7.0-lucx.203 install-awg-module.sh качает исходники tarball'ом
@@ -3817,6 +3829,13 @@ cmd_healthcheck() {
   MARKER_INSTALLED=$(head -c 64 "$SCRIPT_MARKER" 2>/dev/null | tr -d '[:space:]' || true)
   echo "Версия скрипта: ${VERSION}"
   echo "Версия управления (маркер): ${MARKER_INSTALLED:-<нет — установка до v0.4.1>}"
+  # v0.4.7: INFO о новой версии скрипта (тихо без сети; не влияет на итог hc).
+  # ВАЖНО: `|| true` обязателен — под set -e -o pipefail отсутствие сети/404
+  # приватного репо убивало весь healthcheck (поймано в тесте на полигоне)
+  hc_latest_ver=$(timeout 6 curl -fsSL "https://api.github.com/repos/Shepard86rus/3x-ui-dual-domain/releases/latest" 2>/dev/null | grep -m1 -oE '"tag_name": *"v[^"]*"' | cut -d'"' -f4 | tr -d 'v' || true)
+  if [[ -n "$hc_latest_ver" && "$hc_latest_ver" != "$VERSION" ]]; then
+    echo "INFO: доступна новая версия скрипта v${hc_latest_ver} (установлена v${VERSION}) — обновление: bash $0 upgrade"
+  fi
   echo "Публичный IP сервера: ${SERVER_IP:-не определён}"
   echo
 
@@ -4623,7 +4642,58 @@ cmd_rebind_ip() {
     exit 1
   fi
   echo "OK: nginx подтверждён на ${SERVER_IP}:443."
+  echo ""
+  echo "========== ПАНЕЛЬ: можно / нельзя =========="
+  echo "  МОЖНО:   клиентов (добавить/удалить/переименовать), подписки, Инси,"
+  echo "           порт/путь панели, x-ui update (патчи своей линии)"
+  echo "  НЕЛЬЗЯ:  сохранять боевые инбаунды через ФОРМУ (теряются proxy protocol"
+  echo "           и клиенты — правка только через «Расширенный шаблон»/JSON);"
+  echo "           переключать TLS<->Reality руками (только: bash $0 add-vls |"
+  echo "           add-reality); включать Masking на 443; вешать инбаунды на 8443"
+  echo "           (занят панелью); «Исходящие»/«Маршрутизация» без кнопки"
+  echo "           «Сохранить» слева вверху (правки теряются)."
+  echo "  Подробности — в README (раздел «После установки»)."
+  echo "============================================"
   echo "Проверка связки: bash $0 healthcheck (блок [2] и Decoy №2 должны быть зелёными)."
+}
+
+# ================== UPGRADE (v0.4.7): патч скрипта без переустановки ==================
+
+cmd_upgrade() {
+  local raw_url="https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/lucx-dual-domain.sh"
+  local tmp
+  tmp=$(mktemp /tmp/lucx-upgrade.XXXXXX) || { echo "ОШИБКА: не создать временный файл"; return 1; }
+  echo "Скачиваю новейшую версию скрипта с GitHub..."
+  if ! curl -fsSL --max-time 120 "$raw_url" -o "$tmp"; then
+    rm -f "$tmp"; echo "ОШИБКА: скачивание не удалось ($raw_url)"; return 1
+  fi
+  if ! bash -n "$tmp"; then
+    rm -f "$tmp"; echo "ОШИБКА: новый файл не проходит bash -n — откат"; return 1
+  fi
+  local new_ver
+  new_ver=$(grep -m1 '^VERSION=' "$tmp" | cut -d'"' -f2)
+  if [[ -z "$new_ver" ]]; then
+    rm -f "$tmp"; echo "ОШИБКА: в новом файле не найден VERSION — откат"; return 1
+  fi
+  if [[ "$new_ver" == "$VERSION" ]]; then
+    rm -f "$tmp"; echo "Скрипт уже актуален: v$VERSION. Обновлять нечего."; return 0
+  fi
+  local self="$0"
+  case "$self" in
+    /dev/fd/*|/dev/stdin|"")
+      rm -f "$tmp"; echo "ОШИБКА: скрипт запущен не из файла — скачай его и запускай как файл"; return 1 ;;
+  esac
+  if [[ ! -f "$self" ]]; then
+    rm -f "$tmp"; echo "ОШИБКА: не определил свой путь ($0) — скопируй файл вручную"; return 1
+  fi
+  # атомарная замена: running bash держит fd на СТАРЫЙ inode, mv подменяет
+  # запись в каталоге — текущее исполнение продолжается без сюрпризов
+  cp -p "$self" "${self}.upgrade-old" || { rm -f "$tmp"; echo "ОШИБКА: не создать бэкап"; return 1; }
+  mv -f "$tmp" "$self" || { rm -f "$tmp"; echo "ОШИБКА: замена не удалась"; return 1; }
+  chmod --reference="${self}.upgrade-old" "$self" 2>/dev/null || chmod +x "$self"
+  echo "Обновлено: v$VERSION -> v$new_ver (бэкап предыдущей: ${self}.upgrade-old)"
+  echo "Запускаю healthcheck новой версией..."
+  exec bash "$self" healthcheck
 }
 
 # ================== РАЗБОР АРГУМЕНТОВ ==================
@@ -4647,10 +4717,15 @@ case "${1:-install}" in
   add-reality|reality)
     cmd_switch_mode reality
     ;;
+  upgrade|update-script)
+    cmd_upgrade
+    ;;
   *)
     echo "Использование:"
     echo "  sudo bash $0 install       — установить всё с нуля (чистый сервер;"
     echo "                               спросит режим 443: VLESS+TLS или Reality)"
+    echo "  sudo bash $0 upgrade       — обновить сам этот скрипт до новейшей версии"
+    echo "                               с GitHub (патч без переустановки)"
     echo "  sudo bash $0 add-vls       — переключить 443 на vless+TLS (с Reality-"
     echo "                               сервера; ключи сохраняются в /root/.lucx-mode-backup/)"
     echo "  sudo bash $0 add-reality   — вернуть Reality (из бэкапа ключей)"

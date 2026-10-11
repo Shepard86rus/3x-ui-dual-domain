@@ -5,7 +5,9 @@ install-result*
 Состояние-флота.md
 *.db
 *.log
+social-preview.png
 
 # служебное
 *.bak
 *.tmp
+test_upgrade.sh

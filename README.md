@@ -1,6 +1,7 @@
 # 3x-ui-dual-domain
 
 **Автор: Shepard86rus**
+Разработка ведётся совместно с ИИ-ассистентом (**ZCode AI** / Claude).
 
 Установщик и healthcheck для VPN-панели на одном сервере: два домена,
 nginx SNI-роутинг на 443, режимы TLS/Reality, Hysteria2, AmneziaWG, подписки,

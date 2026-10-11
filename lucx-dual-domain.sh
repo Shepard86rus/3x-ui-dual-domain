@@ -728,6 +728,10 @@
 #   «Сохранить», неинтерактивный x-ui update без 'y\n4\n').
 #   Файл публикуется в репо Shepard86rus/3x-ui-dual-domain (скраб-политика:
 #   в комментариях нет хостнеймов/IP/имён клиентов).
+#   Патч по ревью Клоуда (2026-10-11): sort -V (защита от даунгрейда при локальной
+#   версии новее remote), единый источник версий (raw main для INFO и upgrade,
+#   а не releases/latest), tmp рядом со скриптом (rename-атомарность, не
+#   copy+unlink через /tmp).
 VERSION="0.4.7"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -3832,7 +3836,8 @@ cmd_healthcheck() {
   # v0.4.7: INFO о новой версии скрипта (тихо без сети; не влияет на итог hc).
   # ВАЖНО: `|| true` обязателен — под set -e -o pipefail отсутствие сети/404
   # приватного репо убивало весь healthcheck (поймано в тесте на полигоне)
-  hc_latest_ver=$(timeout 6 curl -fsSL "https://api.github.com/repos/Shepard86rus/3x-ui-dual-domain/releases/latest" 2>/dev/null | grep -m1 -oE '"tag_name": *"v[^"]*"' | cut -d'"' -f4 | tr -d 'v' || true)
+  # v0.4.7-fix (ревью Клоуда): единый источник с upgrade — raw main, а не releases/latest
+  hc_latest_ver=$(timeout 8 curl -fsSL "https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/lucx-dual-domain.sh" 2>/dev/null | grep -m1 '^VERSION=' | cut -d'"' -f2 || true)
   if [[ -n "$hc_latest_ver" && "$hc_latest_ver" != "$VERSION" ]]; then
     echo "INFO: доступна новая версия скрипта v${hc_latest_ver} (установлена v${VERSION}) — обновление: bash $0 upgrade"
   fi
@@ -4661,8 +4666,12 @@ cmd_rebind_ip() {
 
 cmd_upgrade() {
   local raw_url="https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/lucx-dual-domain.sh"
-  local tmp
-  tmp=$(mktemp /tmp/lucx-upgrade.XXXXXX) || { echo "ОШИБКА: не создать временный файл"; return 1; }
+  local tmp self_dir
+  # v0.4.7-fix (ревью Клоуда): tmp в каталоге скрипта (та же ФС) — mv = rename(2),
+  # а не copy+unlink с обрезкой inode под работающим bash
+  self_dir=$(dirname -- "$0")
+  [[ -d "$self_dir" && -w "$self_dir" ]] || self_dir="/tmp"
+  tmp=$(mktemp "$self_dir/lucx-upgrade.XXXXXX") || { echo "ОШИБКА: не создать временный файл"; return 1; }
   echo "Скачиваю новейшую версию скрипта с GitHub..."
   if ! curl -fsSL --max-time 120 "$raw_url" -o "$tmp"; then
     rm -f "$tmp"; echo "ОШИБКА: скачивание не удалось ($raw_url)"; return 1
@@ -4677,6 +4686,11 @@ cmd_upgrade() {
   fi
   if [[ "$new_ver" == "$VERSION" ]]; then
     rm -f "$tmp"; echo "Скрипт уже актуален: v$VERSION. Обновлять нечего."; return 0
+  fi
+  # v0.4.7-fix (ревью Клоуда): направление сравнения — локальная новее удалённой
+  # означает даунгрейд, его не делаем (паттерн маркера v0.4.1: sort -V)
+  if [[ "$(printf '%s\n%s\n' "$VERSION" "$new_ver" | sort -V | head -n1)" != "$VERSION" ]]; then
+    rm -f "$tmp"; echo "ОТКАЗ: локальная версия v$VERSION НОВЕЕ удалённой v$new_ver — даунгрейд не выполняю"; return 1
   fi
   local self="$0"
   case "$self" in

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# 3x-ui-dual-domain.sh
+# lucx-dual-domain.sh
 # --------------------
 # Установка + healthcheck для lucx-ui с двумя доменами и Reality на 443.
 # Версия с автоматическим фиксом подписок (подтверждённые ключи БД + nginx location).
@@ -47,7 +47,7 @@
 #   Добавлен интерактивный выбор версии lucx-ui при установке: показывает
 #   последние 10 стабильных релизов, Enter = последняя. Можно также
 #   зафиксировать версию без вопросов через переменную окружения:
-#     LUCX_PIN_VERSION=v3.7.0-lucx.192 sudo bash 3x-ui-dual-domain.sh install
+#     LUCX_PIN_VERSION=v3.7.0-lucx.192 sudo bash lucx-dual-domain.sh install
 #   При неинтерактивном запуске (без терминала) молча берёт последнюю.
 #
 # v0.0.7: версия САМОГО этого скрипта (не lucx-ui) теперь выводится и
@@ -128,9 +128,9 @@
 #   Теперь проверяем любой AWG-интерфейс с listening port: 443.
 #
 # Режимы:
-#   sudo bash 3x-ui-dual-domain.sh install      — установить всё с нуля
-#   sudo bash 3x-ui-dual-domain.sh healthcheck  — проверить текущую связку
-#   sudo bash 3x-ui-dual-domain.sh              — по умолчанию install
+#   sudo bash lucx-dual-domain.sh install      — установить всё с нуля
+#   sudo bash lucx-dual-domain.sh healthcheck  — проверить текущую связку
+#   sudo bash lucx-dual-domain.sh              — по умолчанию install
 #
 # Запускать от root на чистой Debian/Ubuntu.
 
@@ -458,7 +458,7 @@
 #   ИЗМЕНЕНИЯ:
 #   - install [9/10]: снова "listen ${SERVER_IP}:443;" (проверенная форма
 #     со времён v0.0.1, работает на всех четырёх серверах);
-#   - НОВЫЙ РЕЖИМ `rebind-ip`: sudo bash 3x-ui-dual-domain.sh rebind-ip —
+#   - НОВЫЙ РЕЖИМ `rebind-ip`: sudo bash lucx-dual-domain.sh rebind-ip —
 #     определяет текущий IP, сверяет A-записи (warn если DNS не переключён),
 #     правит listen-строку (обе формы: legacy explicit и отозванный
 #     wildcard), бэкап, nginx -t, restart, проверка бинда через ss.
@@ -732,7 +732,21 @@
 #   версии новее remote), единый источник версий (raw main для INFO и upgrade,
 #   а не releases/latest), tmp рядом со скриптом (rename-атомарность, не
 #   copy+unlink через /tmp).
-VERSION="0.4.7"
+# v0.4.8: ОПЦИОНАЛЬНЫЙ TELEGRAM-БОТ УПРАВЛЕНИЯ (решение владельца 2026-10-13).
+#   В конце install вопрос «Поставить Telegram-бота управления? [y/N]» — дефолт НЕТ,
+#   шаг полностью пропускается. Если да: токен @BotFather (пусто — вписать позже),
+#   Telegram ID (пусто — режим обучения: бот пришлёт chat_id по /start), имя ноды
+#   в боте [hostname] — префикс всех ответов. Ставится: /etc/tgbot/env (600:
+#   TOKEN/CHAT_ID/NODE_NAME/SCRIPT_PATH), тело бота /opt/tgbot/tgbot.sh,
+#   systemd-юнит tgbot (включается только при вписанном токене). Ноль новых
+#   открытых портов — бот сам ходит в api.telegram.org (long polling). Команды —
+#   карточками: статус/версии/диск/лог/hc/бэкап; деструктив (рестарты, upgrade,
+#   update панели) — только через подтверждение кнопками (120 сек). Словарь
+#   фиксированный, whitelist по CHAT_ID, чужие молча игнорируются, /exec нет.
+#   Новые команды: add-bot (на живую установку; идемпотентен, env не затирает),
+#   remove-bot. HEALTHCHECK [12]: юнит/токен/chat_id/версия тела (не установлен —
+#   строка-пропуск, не FAIL).
+VERSION="0.4.8"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
 # С v3.7.0-lucx.203 install-awg-module.sh качает исходники tarball'ом
@@ -3650,6 +3664,17 @@ EOF
   echo "=== [10a] Hysteria 2 inbound на UDP/443 (SQLite) ==="
   create_hy2_inbound || exit 1
 
+  # --- [10b] Опция: Telegram-бот управления (v0.4.8; дефолт НЕТ) ---
+  echo
+  echo "=== [10b] Telegram-бот управления панелью (опция) ==="
+  local BOT_WANT=""
+  read -rp "Поставить Telegram-бота управления? [y/N]: " BOT_WANT || BOT_WANT=""
+  if [[ "$BOT_WANT" =~ ^[Yy] ]]; then
+    cmd_add_bot || echo "Бот не поставился — установка панели не пострадала; поставь позже: sudo bash $0 add-bot"
+  else
+    echo "Пропущено (поставить позже: sudo bash $0 add-bot)"
+  fi
+
   # --- Финал ---
   echo
   echo "================= ГОТОВО ================="
@@ -3838,7 +3863,7 @@ cmd_healthcheck() {
   # приватного репо убивало весь healthcheck (поймано в тесте на полигоне)
   # v0.4.7-fix (ревью Клоуда): единый источник с upgrade — raw main, а не releases/latest
   hc_latest_ver=$(timeout 8 curl -fsSL "https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/3x-ui-dual-domain.sh" 2>/dev/null | grep -m1 '^VERSION=' | cut -d'"' -f2 || true)
-  if [[ -n "$hc_latest_ver" && "$hc_latest_ver" != "$VERSION" ]]; then
+  if [[ -n "$hc_latest_ver" && "$hc_latest_ver" != "$VERSION" ]] && [[ "$(printf '%s\n%s\n' "$VERSION" "$hc_latest_ver" | sort -V | head -n1)" == "$VERSION" ]]; then
     echo "INFO: доступна новая версия скрипта v${hc_latest_ver} (установлена v${VERSION}) — обновление: bash $0 upgrade"
   fi
   echo "Публичный IP сервера: ${SERVER_IP:-не определён}"
@@ -4566,6 +4591,45 @@ cmd_healthcheck() {
     check "Скан открытых портов: публичные слушатели только из белого списка (TCP:${HC11_ALLOW_TCP} UDP:${HC11_ALLOW_UDP})" ok
   fi
   unset HC11_SEEN
+
+  # ================== [12] Telegram-бот управления (v0.4.8, опция) ==================
+  echo "=== [12] Telegram-бот управления ==="
+  if [[ ! -f "$TGBOT_DIR/.version" ]]; then
+    echo "    не установлен (опция install / команда add-bot) — пропуск"
+  else
+    local st12 en12 tok12 cid12 v12
+    st12=$(systemctl is-active tgbot 2>/dev/null || true)
+    en12=$(systemctl is-enabled tgbot 2>/dev/null || true)
+    if [[ "$st12" == "active" ]]; then
+      check "бот: сервис active" ok
+    else
+      check "бот: сервис НЕ активен (${st12:-unknown}) — смотри journalctl -u tgbot" fail
+    fi
+    if [[ "$en12" == "enabled" ]]; then
+      check "бот: автозапуск enabled" ok
+    else
+      check "бот: автозапуск не включён (systemctl enable tgbot)" fail
+    fi
+    tok12=$(grep "^TOKEN=" "$TGBOT_ENV" 2>/dev/null | head -1 | sed "s/^TOKEN='//; s/'\$//" || true)
+    cid12=$(grep "^CHAT_ID=" "$TGBOT_ENV" 2>/dev/null | head -1 | sed "s/^CHAT_ID='//; s/'\$//" || true)
+    if [ -n "$tok12" ]; then
+      check "бот: токен вписан" ok
+    else
+      check "бот: токен НЕ вписан (бот молчит) — впиши TOKEN= в $TGBOT_ENV" fail
+    fi
+    if [ -n "$cid12" ]; then
+      check "бот: whitelist настроен (CHAT_ID)" ok
+    else
+      check "бот: режим обучения (CHAT_ID пуст — команды не работают), /start пришлёт chat_id" warn
+    fi
+    v12=$(cat "$TGBOT_DIR/.version" 2>/dev/null || true)
+    if [[ "$v12" == "$TGBOT_BODY_VERSION" ]]; then
+      check "бот: тело v$v12 актуально" ok
+    else
+      check "бот: тело v${v12:-?} не совпадает со скриптом v$TGBOT_BODY_VERSION — обнови: sudo bash $0 add-bot (env сохранится)" warn
+    fi
+  fi
+
   echo
   echo "============================================"
   echo "Итого: ${pass} проверок ОК, ${fail} провалено"
@@ -4671,7 +4735,7 @@ cmd_upgrade() {
   # а не copy+unlink с обрезкой inode под работающим bash
   self_dir=$(dirname -- "$0")
   [[ -d "$self_dir" && -w "$self_dir" ]] || self_dir="/tmp"
-  tmp=$(mktemp "$self_dir/3xui-upgrade.XXXXXX") || { echo "ОШИБКА: не создать временный файл"; return 1; }
+  tmp=$(mktemp "$self_dir/lucx-upgrade.XXXXXX") || { echo "ОШИБКА: не создать временный файл"; return 1; }
   echo "Скачиваю новейшую версию скрипта с GitHub..."
   if ! curl -fsSL --max-time 120 "$raw_url" -o "$tmp"; then
     rm -f "$tmp"; echo "ОШИБКА: скачивание не удалось ($raw_url)"; return 1
@@ -4710,6 +4774,360 @@ cmd_upgrade() {
   exec bash "$self" healthcheck
 }
 
+# ================== TELEGRAM-БОТ УПРАВЛЕНИЯ (v0.4.8, опция) ==================
+# Один бот = одна нода. Карточки-кнопки в Telegram, whitelist по CHAT_ID,
+# фиксированный словарь команд, локальное исполнение. Ноль новых открытых
+# портов — бот сам ходит в api.telegram.org (long polling). Тело бота живёт
+# в /opt/tgbot/tgbot.sh и правится только новой версией этого скрипта
+# (add-bot перезаписывает тело, env не трогает).
+TGBOT_DIR="/opt/tgbot"
+TGBOT_ENV="/etc/tgbot/env"
+TGBOT_BODY_VERSION="0.4.8"
+
+tgbot_write_body() { # тело бота (правки — только через новую версию скрипта)
+  mkdir -p "$TGBOT_DIR"
+  cat > "$TGBOT_DIR/tgbot.sh" <<'TGBOT_EOF'
+#!/usr/bin/env bash
+# TG-бот управления нодой 3x-ui (ставится скриптом 3x-ui-dual-domain v0.4.8: install/add-bot)
+# Карточки-кнопки, whitelist по CHAT_ID, фиксированный словарь команд, локальное исполнение.
+# Конфиг: /etc/tgbot/env (600): TOKEN=, CHAT_ID= (пусто = режим обучения), NODE_NAME=, SCRIPT_PATH=
+set -u
+ENV_FILE="/etc/tgbot/env"
+[ -f "$ENV_FILE" ] && . "$ENV_FILE"
+NODE_NAME="${NODE_NAME:-$(hostname)}"
+API="https://api.telegram.org/bot${TOKEN:-}"
+OFFSET=0
+ASK_CMD=''; ASK_TS=0
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' <<<"$1"; }
+
+api_post() { local m="$1"; shift; curl -s --max-time 30 -X POST "$API/$m" "$@"; }
+send_txt() { api_post sendMessage -d chat_id="$1" --data-urlencode "text=$2" >/dev/null; }
+send_card() { api_post sendMessage -d chat_id="$1" --data-urlencode "text=$2" -d parse_mode="HTML" --data-urlencode "reply_markup=$3" >/dev/null; }
+answer() {
+  if [ -n "${2:-}" ]; then
+    api_post answerCallbackQuery -d callback_query_id="$1" --data-urlencode "text=$2" >/dev/null
+  else
+    api_post answerCallbackQuery -d callback_query_id="$1" >/dev/null
+  fi
+}
+home_text() { printf '🖥 <b>%s</b> — пульт ноды:' "$(esc "$NODE_NAME")"; }
+show_home() { send_card "$1" "$(home_text)" "$(kb_home)"; }
+edit_card() { # $1 chat, $2 message_id, $3 html, $4 markup; карточку старше 48ч не отредактировать — шлём новую
+  local r
+  r=$(api_post editMessageText -d chat_id="$1" -d message_id="$2" --data-urlencode "text=$3" -d parse_mode="HTML" --data-urlencode "reply_markup=$4")
+  case "$r" in *'"ok":false'*) show_home "$1" ;; esac
+}
+
+kb_home() {
+  jq -nc '{inline_keyboard:[
+    [{text:"📊 Статус",callback_data:"cmd:status"},{text:"🔢 Версии",callback_data:"cmd:versions"}],
+    [{text:"💾 Диск",callback_data:"cmd:disk"},{text:"📜 Лог x-ui",callback_data:"cmd:log"}],
+    [{text:"🩺 Healthcheck",callback_data:"cmd:hc"},{text:"🔐 Бэкап БД",callback_data:"cmd:backup"}],
+    [{text:"♻ Рестарт панели",callback_data:"ask:restart_panel"},{text:"♻ Рестарт xray",callback_data:"ask:restart_xray"}],
+    [{text:"⬆ Скрипт (upgrade)",callback_data:"ask:upgrade"},{text:"⬆ Панель (update)",callback_data:"ask:update_panel"}]
+  ]}'
+}
+kb_confirm() { # $1 cmd
+  jq -nc --arg c "$1" '{inline_keyboard:[
+    [{text:"✅ Да, выполняй",callback_data:("yes:"+$c)},{text:"❌ Отмена",callback_data:"home"}]
+  ]}'
+}
+
+script_file() {
+  if [ -n "${SCRIPT_PATH:-}" ] && [ -f "$SCRIPT_PATH" ]; then echo "$SCRIPT_PATH"; return; fi
+  ls -1 /root/3x-ui-dual-domain*.sh 2>/dev/null | tail -1
+}
+snippet() { # $1 cmd — фиксированный словарь, исполнение локально
+  case "$1" in
+    status)
+      cat <<'EOS'
+echo "панель: $(systemctl is-active x-ui 2>/dev/null); nginx: $(systemctl is-active nginx 2>/dev/null); xray: $(pgrep -c xray 2>/dev/null || echo 0)"
+for d in /etc/letsencrypt/live/*/; do
+  [ -f "$d/cert.pem" ] || continue
+  echo "серт $(basename "$d"): до $(openssl x509 -enddate -noout -in "$d/cert.pem" 2>/dev/null | cut -d= -f2)"
+done
+echo "диск: $(df -h / | tail -1 | awk "{print \$4}") свободно; load: $(cut -d" " -f1-3 /proc/loadavg)"
+EOS
+      ;;
+    versions)
+      cat <<'EOS'
+echo "панель: $(/usr/local/x-ui/x-ui -v 2>/dev/null | head -1 || echo '?')"
+xbin="/usr/local/x-ui/bin/xray-linux-$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')"
+echo "xray: $([ -x "$xbin" ] && "$xbin" -version 2>/dev/null | head -1 | awk '{print $2}' || echo '?')"
+echo "скрипт: $(cat /root/.lucx-script-version 2>/dev/null || echo '?')"
+EOS
+      ;;
+    disk)    echo 'df -h /' ;;
+    log)     echo 'journalctl -u x-ui -n 15 --no-pager 2>/dev/null | tail -15 | cut -c1-200' ;;
+    backup)  echo 'f="/root/x-ui-backup-$(date +%F-%H%M).db"; cp /etc/x-ui/x-ui.db "$f" && echo "бэкап: $f" || echo "ОШИБКА бэкапа"' ;;
+    restart_panel) echo 'systemctl restart x-ui && echo "панель перезапущена" || echo "ОШИБКА рестарта"' ;;
+    restart_xray)  echo 'pkill -f "[x]ray-linux-"; sleep 3; n=$(pgrep -c -f "[x]ray-linux-" 2>/dev/null); n=${n:-0}; if [ "$n" -eq 0 ]; then sleep 5; n=$(pgrep -c -f "[x]ray-linux-" 2>/dev/null); n=${n:-0}; fi; echo "xray процессов: $n"' ;;
+    update_panel)
+      echo 'printf "y\n4\n" | timeout 300 x-ui update >/dev/null 2>&1; sleep 30; echo "сервис: $(systemctl is-active x-ui); версия: $(/usr/local/x-ui/x-ui -v 2>/dev/null | head -1)"'
+      ;;
+    *)
+      echo ''
+      ;;
+  esac
+}
+snippet_hc() { # $1 путь к скрипту установки
+  cat <<EOS
+s="$1"
+if [ -z "\$s" ]; then echo "ОШИБКА: скрипт установки не найден — задай SCRIPT_PATH в /etc/tgbot/env"; else
+  o=\$(timeout 280 bash "\$s" healthcheck 2>&1)
+  echo "\$o" | grep -E "Итого:|FAIL\]" || echo "\$o" | tail -5
+fi
+EOS
+}
+snippet_upgrade() { # $1 путь к скрипту установки
+  cat <<EOS
+s="$1"
+if [ -z "\$s" ]; then echo "ОШИБКА: скрипт установки не найден — задай SCRIPT_PATH в /etc/tgbot/env"; else
+  o=\$(timeout 120 bash "\$s" upgrade 2>&1)
+  grep -E "Обновлено|уже актуален|ОТКАЗ|ОШИБКА" <<<"\$o" | head -3 || echo "upgrade: вывода нет — проверь hc"
+fi
+EOS
+}
+run_cmd() { # $1 cmd — словарь проверен вызывающим
+  local sf
+  case "$1" in
+    hc)      sf=$(script_file); bash -c "$(snippet_hc "$sf")" 2>&1 ;;
+    upgrade) sf=$(script_file); bash -c "$(snippet_upgrade "$sf")" 2>&1 ;;
+    *)       bash -c "$(snippet "$1")" 2>&1 ;;
+  esac
+}
+
+on_callback() { # $1 = callback_query json
+  local cbid data mid cid c t out
+  cbid=$(jq -r '.id' <<<"$1")
+  cid=$(jq -r '.message.chat.id // .from.id // empty' <<<"$1")
+  mid=$(jq -r '.message.message_id // empty' <<<"$1")
+  data=$(jq -r '.data // empty' <<<"$1")
+  if [ -z "$cid" ] || [ "$cid" != "${CHAT_ID:-}" ]; then answer "$cbid" 'нет доступа'; return; fi
+  case "$data" in
+    home)
+      answer "$cbid" ''
+      edit_card "$cid" "$mid" "$(home_text)" "$(kb_home)"
+      ;;
+    cmd:*)
+      c=${data#cmd:}
+      case "$c" in status|versions|disk|log|backup|hc) ;; *) answer "$cbid" 'неизвестная команда'; return ;; esac
+      if [ "$c" = 'hc' ]; then answer "$cbid" 'гоняю healthcheck…'; else answer "$cbid" 'выполняю…'; fi
+      out=$(run_cmd "$c")
+      [ -z "$out" ] && out='пустой ответ'
+      [ "${#out}" -gt 3900 ] && out=${out:0:3900}
+      send_txt "$cid" "[$NODE_NAME]
+$out"
+      ;;
+    ask:*)
+      c=${data#ask:}
+      case "$c" in restart_panel|restart_xray|upgrade|update_panel) ;; *) answer "$cbid" 'неизвестная команда'; return ;; esac
+      ASK_CMD="$c"; ASK_TS=$(date +%s)
+      case "$c" in
+        restart_panel) t='рестарт панели' ;;
+        restart_xray)  t='рестарт xray (клиенты переподключатся)' ;;
+        upgrade)       t='обновление скрипта (до новейшей + hc)' ;;
+        update_panel)  t='обновление панели (~1-2 мин, панель кратко недоступна)' ;;
+      esac
+      answer "$cbid" ''
+      edit_card "$cid" "$mid" "⚠ <b>$(esc "$NODE_NAME")</b>: $t. Выполнять?" "$(kb_confirm "$c")"
+      ;;
+    yes:*)
+      c=${data#yes:}
+      if [ "$c" = "$ASK_CMD" ] && [ $(( $(date +%s) - ASK_TS )) -le 120 ]; then
+        answer "$cbid" 'выполняю…'
+        out=$(run_cmd "$c")
+        [ -z "$out" ] && out='пустой ответ'
+        [ "${#out}" -gt 3900 ] && out=${out:0:3900}
+        send_txt "$cid" "[$NODE_NAME]
+$out"
+        ASK_CMD=''
+      else
+        answer "$cbid" 'подтверждение истекло — запроси заново'
+      fi
+      ;;
+    *)
+      answer "$cbid" 'неизвестно'
+      ;;
+  esac
+}
+
+handle() { # $1 chat_id, $2 text
+  if [ -z "${CHAT_ID:-}" ]; then
+    if [ "$2" = '/start' ] || [ "$2" = '/help' ]; then
+      send_txt "$1" "ACCESS_CODE: chat_id=$1 — пришли этот номер владельцу. Он вписывает его в CHAT_ID в /etc/tgbot/env и делает systemctl restart tgbot. До этого команды не работают."
+    fi
+    return
+  fi
+  [ "$1" != "$CHAT_ID" ] && return
+  case "$2" in
+    /start|/help|/menu)
+      show_home "$1"
+      ;;
+    *)
+      send_txt "$1" 'кнопки: /menu'
+      ;;
+  esac
+}
+
+if [ "${1:-}" = selftest ]; then
+  kb_home | jq -e '.inline_keyboard | length == 5' >/dev/null && echo 'kb_home: ok' || echo 'kb_home: ПРОВАЛ'
+  kb_confirm restart_panel | jq -e '.inline_keyboard[0] | length == 2' >/dev/null && echo 'kb_confirm: ok' || echo 'kb_confirm: ПРОВАЛ'
+  ok=1
+  for c in status versions disk log backup restart_panel restart_xray update_panel; do
+    [ -n "$(snippet "$c")" ] || { echo "snippet $c: ПУСТОЙ"; ok=0; }
+  done
+  [ -n "$(snippet_hc /root/3x-ui-dual-domain.sh)" ] || { echo 'snippet hc: ПУСТОЙ'; ok=0; }
+  [ -n "$(snippet_upgrade /root/3x-ui-dual-domain.sh)" ] || { echo 'snippet upgrade: ПУСТОЙ'; ok=0; }
+  [ "$ok" = 1 ] && echo 'SELFTEST: ВСЁ ОК' || echo 'SELFTEST: ЕСТЬ ПРОВАЛЫ'
+  exit 0
+fi
+
+while true; do
+  resp=$(curl -s --max-time 40 "$API/getUpdates?timeout=30&offset=$OFFSET") || { sleep 5; continue; }
+  n=$(jq '.result | length' <<<"$resp" 2>/dev/null) || n=0
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    upd=$(jq -c ".result[$i]" <<<"$resp" 2>/dev/null)
+    OFFSET=$(jq -r '.update_id + 1' <<<"$upd" 2>/dev/null)
+    if jq -e '.callback_query != null' <<<"$upd" >/dev/null 2>&1; then
+      on_callback "$(jq -c '.callback_query' <<<"$upd")"
+    else
+      cid=$(jq -r '.message.chat.id // empty' <<<"$upd" 2>/dev/null)
+      text=$(jq -r '.message.text // empty' <<<"$upd" 2>/dev/null)
+      [ -n "$cid" ] && [ -n "$text" ] && handle "$cid" "$text"
+    fi
+    i=$((i + 1))
+  done
+done
+TGBOT_EOF
+  chmod 700 "$TGBOT_DIR/tgbot.sh"
+  echo "$TGBOT_BODY_VERSION" > "$TGBOT_DIR/.version"
+}
+
+tgbot_write_unit() {
+  cat > /etc/systemd/system/tgbot.service <<'TGBOT_UNIT_EOF'
+[Unit]
+Description=3x-ui TG node bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/tgbot/env
+ExecStart=/opt/tgbot/tgbot.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+TGBOT_UNIT_EOF
+  systemctl daemon-reload
+}
+
+tgbot_sh_quote() { # значение для env: одиночные кавычки -> '\''
+  printf "%s" "$1" | sed "s/'/'\\\\''/g"
+}
+
+tgbot_install_files() { # $1 token, $2 chat_id, $3 name, $4 script_path.
+  # Пустой ввод сохраняет старое значение env (повторный add-bot с Enter
+  # везде = безопасное обновление тела); непустой ввод ЗАМЕНЯЕТ значение.
+  local tok="$1" cid="$2" nm="$3" sp="$4" k v
+  mkdir -p "$(dirname "$TGBOT_ENV")"
+  touch "$TGBOT_ENV"
+  chmod 600 "$TGBOT_ENV"
+  for k in TOKEN CHAT_ID NODE_NAME SCRIPT_PATH; do
+    case "$k" in
+      TOKEN) v="$tok" ;;
+      CHAT_ID) v="$cid" ;;
+      NODE_NAME) v="$nm" ;;
+      SCRIPT_PATH) v="$sp" ;;
+    esac
+    if [ -z "$v" ]; then
+      continue
+    fi
+    if grep -q "^${k}=" "$TGBOT_ENV"; then
+      sed -i "/^${k}=/d" "$TGBOT_ENV"
+    fi
+    printf "%s='%s'\n" "$k" "$(tgbot_sh_quote "$v")" >> "$TGBOT_ENV"
+  done
+  tgbot_write_body
+  tgbot_write_unit
+}
+
+cmd_add_bot() {
+  echo "=== Telegram-бот управления (один бот = эта нода) ==="
+  echo "Понадобится токен от @BotFather (в Telegram: /newbot, займёт минуту)."
+  echo
+  local tok cid nm sp ans
+  read -rs -rp "Токен от @BotFather (пусто — вписать позже в $TGBOT_ENV; ввод скрыт): " tok || tok=""
+  echo
+  if [ -n "$tok" ] && ! printf '%s' "$tok" | grep -qE '^[0-9]+:[A-Za-z0-9_-]{30,}$'; then
+    echo "ВНИМАНИЕ: строка не похожа на токен BotFather (вида 123456789:AAx...)."
+    read -rp "Всё равно вписать? [y/N]: " ans || ans=""
+    if ! [[ "$ans" =~ ^[Yy] ]]; then
+      echo "Отменено."
+      return 0
+    fi
+  fi
+  read -rp "Твой Telegram ID — узнать у @userinfobot (пусто — режим обучения: бот сам пришлёт chat_id по /start): " cid || cid=""
+  read -rp "Название ноды в боте (пусто — оставить текущее; при первой установке будет $(hostname)): " nm || nm=""
+  sp=$(readlink -f "$0" 2>/dev/null || true)
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "Ставлю jq (нужен боту)..."
+    apt-get install -y jq >/dev/null 2>&1 || { echo "ОШИБКА: не поставить jq"; return 1; }
+  fi
+  tgbot_install_files "$tok" "$cid" "$nm" "$sp"
+  # фактические значения берём из env: пустой ввод сохранял старое
+  local tok_eff cid_eff
+  tok_eff=$(grep "^TOKEN=" "$TGBOT_ENV" 2>/dev/null | head -1 | sed "s/^TOKEN='//; s/'\$//" || true)
+  cid_eff=$(grep "^CHAT_ID=" "$TGBOT_ENV" 2>/dev/null | head -1 | sed "s/^CHAT_ID='//; s/'\$//" || true)
+  if systemctl is-active --quiet tgbot 2>/dev/null; then
+    systemctl try-restart tgbot
+    echo "  Тело бота обновлено, сервис перезапущен (env сохранён)."
+  elif [ -n "$tok_eff" ]; then
+    systemctl enable --now tgbot >/dev/null 2>&1 || true
+  fi
+  if [ -n "$tok_eff" ]; then
+    sleep 1
+    if [ "$(systemctl is-active tgbot 2>/dev/null)" = "active" ]; then
+      echo "✓ Бот установлен и запущен."
+      if [ -n "$cid_eff" ]; then
+        echo "  Открой бота в Telegram и отправь /start — придёт карточка ноды."
+      else
+        echo "  РЕЖИМ ОБУЧЕНИЯ: отправь боту /start — он пришлёт ACCESS_CODE (твой chat_id)."
+        echo "  Впиши его в $TGBOT_ENV (CHAT_ID=...) и выполни: systemctl restart tgbot"
+      fi
+    else
+      echo "ВНИМАНИЕ: юнит не поднялся — смотри journalctl -u tgbot -n 20"
+    fi
+  else
+    echo "✓ Файлы бота установлены (юнит не включён — токен не вписан)."
+    echo "  Когда вписать токен в $TGBOT_ENV (TOKEN=...), выполни: systemctl enable --now tgbot"
+  fi
+  echo "  Проверка: sudo bash $0 healthcheck (проверка [12])"
+}
+
+cmd_remove_bot() {
+  echo "=== Удаление Telegram-бота ==="
+  local ans
+  read -rp "Снести бота (юнит + $TGBOT_DIR + env с токеном)? [y/N]: " ans || ans=""
+  if ! [[ "$ans" =~ ^[Yy] ]]; then
+    echo "Отменено."
+    return 0
+  fi
+  systemctl disable --now tgbot >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/tgbot.service
+  systemctl daemon-reload
+  rm -rf "$TGBOT_DIR"
+  rm -f "$TGBOT_ENV"
+  rmdir /etc/tgbot 2>/dev/null || true
+  echo "✓ Бот удалён."
+}
+
 # ================== РАЗБОР АРГУМЕНТОВ ==================
 
 case "${1:-install}" in
@@ -4721,6 +5139,12 @@ case "${1:-install}" in
     ;;
   add-hy2|hy2|retrofit)
     cmd_add_hy2
+    ;;
+  add-bot|bot)
+    cmd_add_bot
+    ;;
+  remove-bot|unbot)
+    cmd_remove_bot
     ;;
   rebind-ip|rebind|newip)
     cmd_rebind_ip
@@ -4744,6 +5168,9 @@ case "${1:-install}" in
     echo "                               сервера; ключи сохраняются в /root/.lucx-mode-backup/)"
     echo "  sudo bash $0 add-reality   — вернуть Reality (из бэкапа ключей)"
     echo "  sudo bash $0 add-hy2       — добавить Hysteria 2 на существующий сервер"
+    echo "  sudo bash $0 add-bot       — поставить/обновить Telegram-бота управления"
+    echo "                               (спросит токен @BotFather; env не затирает)"
+    echo "  sudo bash $0 remove-bot    — удалить Telegram-бота"
     echo "  sudo bash $0 healthcheck   — проверить текущую связку"
     echo "  sudo bash $0 rebind-ip     — сменить IP в stream-роутере"
     echo "                               (после смены IP у провайдера)"

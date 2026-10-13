@@ -746,7 +746,26 @@
 #   Новые команды: add-bot (на живую установку; идемпотентен, env не затирает),
 #   remove-bot. HEALTHCHECK [12]: юнит/токен/chat_id/версия тела (не установлен —
 #   строка-пропуск, не FAIL).
-VERSION="0.4.8"
+# v0.4.9: ПРЕДОХРАНИТЕЛИ совместимости с панелью .291+ (по живому тесту на №5
+#   от 2026-10-13 и двум аудитам Клоуда).
+#   (1) ГАРАНТИЯ SQLITE: install.sh уже запускается в NONINTERACTIVE с
+#       XUI_DB_TYPE=sqlite (env-блок был и в v0.4.8) — v0.4.9 добавляет
+#       ПРОВЕРКУ ФАКТА после install.sh: install-result.env обязан сказать
+#       sqlite, иначе СТОП до наших манипуляций с БД (create_hy2_inbound/
+#       бэкапы/hc работают с SQLite-файлом; PostgreSQL не поддерживается).
+#       Защита от scenario «апстрим изменил обработку env или дефолт».
+#   (2) hc [13] «БД и песочница»: (а) БД = SQLite — FAIL при PG; (б) если стоит
+#       sandbox-дропин апстрима (10-xui-sandbox.conf, появляется с lucx.291) и в БД
+#       есть AWG-инбаунд — требуется 20-local.conf с ReadWritePaths=/etc/amnezia,
+#       иначе FAIL: без него панель не может писать /etc/amnezia/amneziawg/*.conf
+#       и AWG ляжет при обновлении/рестарте (живой кейс №5 от 2026-10-13 —
+#       «read-only file system» каждые 10 сек).
+#   (3) ensure_xui_sandbox_awg_dropin(): идемпотентно ставит 20-local.conf при
+#       install и после upgrade (на панелях без песочницы безвреден).
+#   (4) README: процедура printf для .291+ (SSL-меню исчезло — достаточно 'y'),
+#       строки про SQLite и дропин.
+#   Тело бота не менялось (маркер поднят до 0.4.9 для консистентности hc [12]).
+VERSION="0.4.9"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
 # С v3.7.0-lucx.203 install-awg-module.sh качает исходники tarball'ом
@@ -784,6 +803,34 @@ check() {
     echo -e "[$FAIL] $desc"
     fail=$((fail+1))
   fi
+}
+
+# v0.4.9: дропин песочницы апстрима (появляется с lucx.291): ProtectSystem=full
+# делает /etc read-only, а панель пишет конфиги AWG в /etc/amnezia/amneziawg/ —
+# без исключения AWG-инбаунд ляжет при обновлении/рестарте (живой кейс №5).
+# Идемпотентен; на панелях без песочницы файл ни на что не влияет.
+ensure_xui_sandbox_awg_dropin() {
+  local d="/etc/systemd/system/x-ui.service.d"
+  local f="$d/20-awg-amnezia.conf"
+  if [[ -f "$f" ]] && grep -q "/etc/amnezia" "$f" 2>/dev/null; then
+    return 0
+  fi
+  mkdir -p "$d"
+  cat > "$f" <<'AWG_LOC'
+# local addition (3x-ui-dual-domain v0.4.9): panel writes AWG configs under
+# /etc/amnezia — upstream sandbox (10-xui-sandbox.conf) covers only /etc/x-ui
+[Service]
+ReadWritePaths=-/etc/amnezia
+ReadWriteDirectories=-/etc/amnezia
+AWG_LOC
+  systemctl daemon-reload
+  # на панели с АКТИВНОЙ песочницей рестарт нужен, чтобы исключение вступило
+  # в силу сразу (на .289 песочницы нет — рестарт не требуется и не делается)
+  if [[ -f "$d/10-xui-sandbox.conf" ]]; then
+    systemctl try-restart x-ui
+    echo "  сервис x-ui перезапущен — исключение /etc/amnezia активно"
+  fi
+  echo "✓ Дропин песочницы для AWG установлен: $f"
 }
 
 read_domains() {
@@ -1614,6 +1661,16 @@ cmd_install() {
   bash "$LUCX_INSTALL_TMP" "$LUCX_TAG"
 
   rm -f "$LUCX_INSTALL_TMP"
+
+  # v0.4.9: проверка факта — БД обязана быть SQLite до наших манипуляций с ней
+  local res_db=""
+  res_db=$(grep -oP "^XUI_DB_TYPE=\K.*" /etc/x-ui/install-result.env 2>/dev/null | head -1 || true)
+  if [[ -n "$res_db" && "$res_db" != "sqlite" ]]; then
+    echo "ОШИБКА: панель установилась с БД '$res_db' — скрипт поддерживает только SQLite."
+    echo "  Инбаунды схемы ещё не создавались — можно переустанавливать безопасно:"
+    echo "  bash $0 install, в меню Database Selection выбрать 1) SQLite."
+    exit 1
+  fi
 
   # v0.4.2: гео-страж — lucx_fetch_geofiles может недополучить файлы (404 на
   # geoip_RU.dat замечен дважды), а без geoip_RU.dat xray не стартует
@@ -3675,6 +3732,9 @@ EOF
     echo "Пропущено (поставить позже: sudo bash $0 add-bot)"
   fi
 
+  # v0.4.9: дропин песочницы для AWG (на панелях без sandbox безвреден)
+  ensure_xui_sandbox_awg_dropin || echo "⚠ дропин песочницы не поставился — на панели .291+ AWG может не подняться"
+
   # --- Финал ---
   echo
   echo "================= ГОТОВО ================="
@@ -4630,6 +4690,36 @@ cmd_healthcheck() {
     fi
   fi
 
+  # ================== [13] БД и песочница (v0.4.9) ==================
+  echo "=== [13] БД и песочница ==="
+  local res_db13 awg13 loc13
+  res_db13=$(grep -oP "^XUI_DB_TYPE=\K.*" /etc/x-ui/install-result.env 2>/dev/null | head -1 || true)
+  if [[ -z "$res_db13" ]]; then
+    if [[ -f /etc/x-ui/x-ui.db ]]; then
+      check "БД панели: SQLite (x-ui.db на месте; install-result.env отсутствует — старая установка)" ok
+    else
+      check "БД панели: не найдено ни install-result.env, ни x-ui.db" fail
+    fi
+  elif [[ "$res_db13" == "sqlite" ]]; then
+    check "БД панели: SQLite" ok
+  else
+    check "БД панели: $res_db13 — скрипт поддерживает только SQLite (бэкапы/hy2-инбаунд лягут)" fail
+  fi
+  if [[ ! -f /etc/systemd/system/x-ui.service.d/10-xui-sandbox.conf ]]; then
+    echo "    systemd-песочницы нет (панель < lucx.291) — дропин не требуется"
+  else
+    awg13=$(sqlite3 /etc/x-ui/x-ui.db "SELECT COUNT(*) FROM inbounds WHERE protocol='awg';" 2>/dev/null || echo 0)
+    loc13=""
+    grep -rls "/etc/amnezia" /etc/systemd/system/x-ui.service.d/ 2>/dev/null | grep -q . && loc13=1
+    if [[ "${awg13:-0}" -eq 0 ]]; then
+      check "песочница: AWG-инбаундов нет — дропин /etc/amnezia не требуется" ok
+    elif [[ -n "$loc13" ]]; then
+      check "песочница: /etc/amnezia разрешён (дропин в x-ui.service.d) — AWG переживёт обновление/рестарт" ok
+    else
+      check "песочница: дропина нет — при обновлении/рестарте AWG ЛЯЖЕТ (панели запрещено писать /etc/amnezia); запусти sudo bash $0 upgrade (v0.4.9+) или добавь ReadWritePaths=-/etc/amnezia в x-ui.service.d/20-local.conf" fail
+    fi
+  fi
+
   echo
   echo "============================================"
   echo "Итого: ${pass} проверок ОК, ${fail} провалено"
@@ -4770,6 +4860,10 @@ cmd_upgrade() {
   mv -f "$tmp" "$self" || { rm -f "$tmp"; echo "ОШИБКА: замена не удалась"; return 1; }
   chmod --reference="${self}.upgrade-old" "$self" 2>/dev/null || chmod +x "$self"
   echo "Обновлено: v$VERSION -> v$new_ver (бэкап предыдущей: ${self}.upgrade-old)"
+  # v0.4.9: дропин ставит НОВАЯ версия скрипта ($self после атомарной замены —
+  # всегда v0.4.9+); запуск дочерним процессом работает и при апгрейде СО старой
+  # версии, где функции в памяти старого процесса ещё нет
+  bash "$self" ensure-awg-dropin || true
   echo "Запускаю healthcheck новой версией..."
   exec bash "$self" healthcheck
 }
@@ -4782,7 +4876,7 @@ cmd_upgrade() {
 # (add-bot перезаписывает тело, env не трогает).
 TGBOT_DIR="/opt/tgbot"
 TGBOT_ENV="/etc/tgbot/env"
-TGBOT_BODY_VERSION="0.4.8"
+TGBOT_BODY_VERSION="0.4.9"
 
 tgbot_write_body() { # тело бота (правки — только через новую версию скрипта)
   mkdir -p "$TGBOT_DIR"
@@ -5142,6 +5236,9 @@ case "${1:-install}" in
     ;;
   add-bot|bot)
     cmd_add_bot
+    ;;
+  ensure-awg-dropin|awg-dropin)
+    ensure_xui_sandbox_awg_dropin
     ;;
   remove-bot|unbot)
     cmd_remove_bot

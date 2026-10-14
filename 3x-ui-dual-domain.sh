@@ -765,7 +765,17 @@
 #   (4) README: процедура printf для .291+ (SSL-меню исчезло — достаточно 'y'),
 #       строки про SQLite и дропин.
 #   Тело бота не менялось (маркер поднят до 0.4.9 для консистентности hc [12]).
-VERSION="0.4.9"
+# v0.5.0: убран drop-in песочницы для AWG (ensure_xui_sandbox_awg_dropin), т.к.
+#   lucx.292 (13.10.2026) сам держит /etc/amnezia в ReadWritePaths юнита x-ui.
+#   (1) install/upgrade больше не ставят 20-awg-amnezia.conf; команда
+#       ensure-awg-dropin оставлена как безвредная заглушка (апгрейд из v0.4.9 её вызывает).
+#   (2) hc [13] проверяет факт (systemctl show x-ui -p ReadWritePaths), а не наш файл:
+#       FAIL только если AWG-инбаунды есть, а юнит не может писать /etc/amnezia (lucx.291).
+#   (3) hc [13]: WARN при подвисаниях диска (PSI full avg300 >= 3%).
+#   (4) Бот: «Бэкап БД» через sqlite3 .backup (cp живой БД в WAL даёт неполную копию).
+#   (5) Текст ошибки про выбор БД обновлён (меню в install.sh нет, БД передаётся env).
+#   Уже стоящие на нодах drop-in'ы безвредны; скрипт их не трогает и не удаляет.
+VERSION="0.5.0"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
 # С v3.7.0-lucx.203 install-awg-module.sh качает исходники tarball'ом
@@ -805,33 +815,8 @@ check() {
   fi
 }
 
-# v0.4.9: дропин песочницы апстрима (появляется с lucx.291): ProtectSystem=full
-# делает /etc read-only, а панель пишет конфиги AWG в /etc/amnezia/amneziawg/ —
-# без исключения AWG-инбаунд ляжет при обновлении/рестарте (живой кейс №5).
-# Идемпотентен; на панелях без песочницы файл ни на что не влияет.
-ensure_xui_sandbox_awg_dropin() {
-  local d="/etc/systemd/system/x-ui.service.d"
-  local f="$d/20-awg-amnezia.conf"
-  if [[ -f "$f" ]] && grep -q "/etc/amnezia" "$f" 2>/dev/null; then
-    return 0
-  fi
-  mkdir -p "$d"
-  cat > "$f" <<'AWG_LOC'
-# local addition (3x-ui-dual-domain v0.4.9): panel writes AWG configs under
-# /etc/amnezia — upstream sandbox (10-xui-sandbox.conf) covers only /etc/x-ui
-[Service]
-ReadWritePaths=-/etc/amnezia
-ReadWriteDirectories=-/etc/amnezia
-AWG_LOC
-  systemctl daemon-reload
-  # на панели с АКТИВНОЙ песочницей рестарт нужен, чтобы исключение вступило
-  # в силу сразу (на .289 песочницы нет — рестарт не требуется и не делается)
-  if [[ -f "$d/10-xui-sandbox.conf" ]]; then
-    systemctl try-restart x-ui
-    echo "  сервис x-ui перезапущен — исключение /etc/amnezia активно"
-  fi
-  echo "✓ Дропин песочницы для AWG установлен: $f"
-}
+# v0.5.0: функция ensure_xui_sandbox_awg_dropin удалена — с lucx.292 апстрим сам
+# держит /etc/amnezia в ReadWritePaths юнита x-ui (см. hc [13]).
 
 read_domains() {
   if [[ -f "$CREDS_FILE" ]]; then
@@ -1667,8 +1652,9 @@ cmd_install() {
   res_db=$(grep -oP "^XUI_DB_TYPE=\K.*" /etc/x-ui/install-result.env 2>/dev/null | head -1 || true)
   if [[ -n "$res_db" && "$res_db" != "sqlite" ]]; then
     echo "ОШИБКА: панель установилась с БД '$res_db' — скрипт поддерживает только SQLite."
-    echo "  Инбаунды схемы ещё не создавались — можно переустанавливать безопасно:"
-    echo "  bash $0 install, в меню Database Selection выбрать 1) SQLite."
+    echo "  Инбаунды схемы ещё не создавались — данные не затронуты."
+    echo "  Скрипт передаёт install.sh XUI_DB_TYPE=sqlite без меню; если панель всё равно выбрала другую БД —"
+    echo "  апстрим изменил обработку переменной окружения: сообщи об этом, переустанавливать вслепую не нужно."
     exit 1
   fi
 
@@ -3732,9 +3718,6 @@ EOF
     echo "Пропущено (поставить позже: sudo bash $0 add-bot)"
   fi
 
-  # v0.4.9: дропин песочницы для AWG (на панелях без sandbox безвреден)
-  ensure_xui_sandbox_awg_dropin || echo "⚠ дропин песочницы не поставился — на панели .291+ AWG может не подняться"
-
   # --- Финал ---
   echo
   echo "================= ГОТОВО ================="
@@ -4705,18 +4688,34 @@ cmd_healthcheck() {
   else
     check "БД панели: $res_db13 — скрипт поддерживает только SQLite (бэкапы/hy2-инбаунд лягут)" fail
   fi
-  if [[ ! -f /etc/systemd/system/x-ui.service.d/10-xui-sandbox.conf ]]; then
-    echo "    systemd-песочницы нет (панель < lucx.291) — дропин не требуется"
-  else
-    awg13=$(sqlite3 /etc/x-ui/x-ui.db "SELECT COUNT(*) FROM inbounds WHERE protocol='awg';" 2>/dev/null || echo 0)
-    loc13=""
-    grep -rls "/etc/amnezia" /etc/systemd/system/x-ui.service.d/ 2>/dev/null | grep -q . && loc13=1
-    if [[ "${awg13:-0}" -eq 0 ]]; then
-      check "песочница: AWG-инбаундов нет — дропин /etc/amnezia не требуется" ok
-    elif [[ -n "$loc13" ]]; then
-      check "песочница: /etc/amnezia разрешён (дропин в x-ui.service.d) — AWG переживёт обновление/рестарт" ok
+  # v0.5.0: подвисания диска ВМ (дают «database is locked» в панели).
+  # PSI full avg300 — доля времени, когда ВСЕ задачи ждали диск; WARN, не FAIL.
+  if [[ -r /proc/pressure/io ]]; then
+    local psi13
+    psi13=$(awk '/^full/{for(i=1;i<=NF;i++) if($i ~ /^avg300=/){sub("avg300=","",$i); print $i}}' /proc/pressure/io 2>/dev/null | head -1)
+    if [[ -n "$psi13" ]] && awk -v v="$psi13" 'BEGIN{exit !(v+0>=3.0)}'; then
+      check "диск: io-давление (PSI full avg300) = ${psi13}% — диск ВМ подвисает; возможны «database is locked» в панели" warn
     else
-      check "песочница: дропина нет — при обновлении/рестарте AWG ЛЯЖЕТ (панели запрещено писать /etc/amnezia); запусти sudo bash $0 upgrade (v0.4.9+) или добавь ReadWritePaths=-/etc/amnezia в x-ui.service.d/20-local.conf" fail
+      check "диск: io-давление в норме (PSI full avg300 = ${psi13:-n/a}%)" ok
+    fi
+  fi
+  if [[ ! -f /etc/systemd/system/x-ui.service.d/10-xui-sandbox.conf ]]; then
+    echo "    systemd-песочницы нет (панель < lucx.291) — ничего не требуется"
+  else
+    awg13=$(sqlite3 -readonly /etc/x-ui/x-ui.db "SELECT COUNT(*) FROM inbounds WHERE protocol='awg';" 2>/dev/null || echo 0)
+    # v0.5.0: смотрим ФАКТ (что реально разрешено юниту), а не наличие нашего drop-in:
+    # с lucx.292 /etc/amnezia в ReadWritePaths самого юнита x-ui
+    loc13=""
+    systemctl show x-ui -p ReadWritePaths 2>/dev/null | grep -q "/etc/amnezia" && loc13=1
+    if [[ -z "$loc13" ]]; then
+      grep -rqs "/etc/amnezia" /etc/systemd/system/x-ui.service /etc/systemd/system/x-ui.service.d/ 2>/dev/null && loc13=1
+    fi
+    if [[ "${awg13:-0}" -eq 0 ]]; then
+      check "песочница: AWG-инбаундов нет — доступ к /etc/amnezia не требуется" ok
+    elif [[ -n "$loc13" ]]; then
+      check "песочница: юнит x-ui может писать в /etc/amnezia — AWG переживёт обновление/рестарт" ok
+    else
+      check "песочница: юниту x-ui запрещено писать в /etc/amnezia (панель lucx.291) — AWG ляжет при рестарте; обнови панель до lucx.292+ (x-ui update)" fail
     fi
   fi
 
@@ -4860,10 +4859,6 @@ cmd_upgrade() {
   mv -f "$tmp" "$self" || { rm -f "$tmp"; echo "ОШИБКА: замена не удалась"; return 1; }
   chmod --reference="${self}.upgrade-old" "$self" 2>/dev/null || chmod +x "$self"
   echo "Обновлено: v$VERSION -> v$new_ver (бэкап предыдущей: ${self}.upgrade-old)"
-  # v0.4.9: дропин ставит НОВАЯ версия скрипта ($self после атомарной замены —
-  # всегда v0.4.9+); запуск дочерним процессом работает и при апгрейде СО старой
-  # версии, где функции в памяти старого процесса ещё нет
-  bash "$self" ensure-awg-dropin || true
   echo "Запускаю healthcheck новой версией..."
   exec bash "$self" healthcheck
 }
@@ -4876,7 +4871,7 @@ cmd_upgrade() {
 # (add-bot перезаписывает тело, env не трогает).
 TGBOT_DIR="/opt/tgbot"
 TGBOT_ENV="/etc/tgbot/env"
-TGBOT_BODY_VERSION="0.4.9"
+TGBOT_BODY_VERSION="0.5.0"
 
 tgbot_write_body() { # тело бота (правки — только через новую версию скрипта)
   mkdir -p "$TGBOT_DIR"
@@ -4956,7 +4951,7 @@ EOS
       ;;
     disk)    echo 'df -h /' ;;
     log)     echo 'journalctl -u x-ui -n 15 --no-pager 2>/dev/null | tail -15 | cut -c1-200' ;;
-    backup)  echo 'f="/root/x-ui-backup-$(date +%F-%H%M).db"; cp /etc/x-ui/x-ui.db "$f" && echo "бэкап: $f" || echo "ОШИБКА бэкапа"' ;;
+    backup)  echo 'f="/root/x-ui-backup-$(date +%F-%H%M).db"; sqlite3 /etc/x-ui/x-ui.db ".backup $f" && [ -s "$f" ] && echo "бэкап: $f" || echo "ОШИБКА бэкапа"' ;;
     restart_panel) echo 'systemctl restart x-ui && echo "панель перезапущена" || echo "ОШИБКА рестарта"' ;;
     restart_xray)  echo 'pkill -f "[x]ray-linux-"; sleep 3; n=$(pgrep -c -f "[x]ray-linux-" 2>/dev/null); n=${n:-0}; if [ "$n" -eq 0 ]; then sleep 5; n=$(pgrep -c -f "[x]ray-linux-" 2>/dev/null); n=${n:-0}; fi; echo "xray процессов: $n"' ;;
     update_panel)
@@ -5238,7 +5233,9 @@ case "${1:-install}" in
     cmd_add_bot
     ;;
   ensure-awg-dropin|awg-dropin)
-    ensure_xui_sandbox_awg_dropin
+    # v0.5.0: оставлено для совместимости (апгрейд из v0.4.9 вызывает эту команду
+    # у нового файла). Ничего не делает: drop-in больше не нужен (lucx.292+).
+    echo "v0.5.0: drop-in песочницы не требуется (lucx.292+ сам разрешает /etc/amnezia) — пропуск"
     ;;
   remove-bot|unbot)
     cmd_remove_bot

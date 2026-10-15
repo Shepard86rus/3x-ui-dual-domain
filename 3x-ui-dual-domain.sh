@@ -775,7 +775,19 @@
 #   (4) Бот: «Бэкап БД» через sqlite3 .backup (cp живой БД в WAL даёт неполную копию).
 #   (5) Текст ошибки про выбор БД обновлён (меню в install.sh нет, БД передаётся env).
 #   Уже стоящие на нодах drop-in'ы безвредны; скрипт их не трогает и не удаляет.
-VERSION="0.5.0"
+# v0.5.1: реакция на волну блокировок РКН (15.10.2026) + мелкие улучшения.
+#   (1) HSTS (max-age=31536000, без includeSubDomains/preload) в трёх шаблонах nginx:
+#       decoy2-http (в TLS-режиме именно он отдаёт заглушку: fallback xray ->
+#       127.0.0.1:8080), заглушка Reality-домена и vhost домена панели.
+#       На УЖЕ установленных нодах конфиги не переписываются (правится вручную).
+#   (2) VLESS+TLS: flow=xtls-rprx-vision по умолчанию (install, add-vls, ссылки):
+#       убирает отпечаток вложенного TLS. Старые клиенты без flow подключиться не смогут.
+#   (3) hc [14] (только INFO, на итог не влияет): число попыток входа на SSH за 1ч/24ч,
+#       уникальные адреса, fail2ban (в бане сейчас / всего); подсказка про add-swap.
+#   (4) hc [13]: порог PSI вынесен в переменную PSI_WARN_PCT (по умолчанию 3.0).
+#   (5) Новые команды add-swap / remove-swap (по явному запуску, не из install).
+#   (6) Тексты про маркер версии управления поясняют, что это версия при установке.
+VERSION="0.5.1"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
 # С v3.7.0-lucx.203 install-awg-module.sh качает исходники tarball'ом
@@ -799,6 +811,8 @@ LUCX_REPO="AlexeyLCP/lucx-ui"
 CREDS_FILE="/root/.lucx-credentials"
 LOG_FILE="/var/log/lucx-install.log"
 XUIDB="/etc/x-ui/x-ui.db"
+# v0.5.1: порог WARN по io-давлению диска (PSI full avg300, %); можно переопределить окружением
+PSI_WARN_PCT="${PSI_WARN_PCT:-3.0}"
 
 # ================== Общие функции ==================
 
@@ -1090,6 +1104,7 @@ server {
     listen 127.0.0.1:8080;
     server_name ${REALITY_DOMAIN};
     server_tokens off;
+    add_header Strict-Transport-Security "max-age=31536000" always;
     root /var/www/decoy-reality;
     index index.html;
     error_page 404 /404.html;
@@ -1209,7 +1224,7 @@ cmd_switch_mode() {
     ensure_decoy2_http_vhost || { systemctl start x-ui; echo "ОШИБКА: не создать decoy2-http vhost."; exit 1; }
     stream_backup="/root/.lucx-mode-backup/stream-reality-${stamp2}.json"
     sqlite3 "$XUIDB" "SELECT stream_settings FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" > "$stream_backup"
-    if ! sqlite3 "$XUIDB" "UPDATE inbounds SET settings = json_set(settings, '\$.clients[0].flow', '', '\$.fallbacks', json('[{\"dest\":\"127.0.0.1:8080\",\"xver\":0}]')), stream_settings = json('{\"network\":\"tcp\",\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"${REALITY_DOMAIN}\",\"minVersion\":\"1.2\",\"maxVersion\":\"1.3\",\"cipherSuites\":\"\",\"rejectUnknownSni\":false,\"disableSystemRoot\":false,\"enableSessionResumption\":false,\"certificates\":[{\"ocspStapling\":0,\"oneTimeLoading\":false,\"usage\":\"encipherment\",\"buildChain\":false,\"certificateFile\":\"/etc/letsencrypt/live/${REALITY_DOMAIN}/fullchain.pem\",\"keyFile\":\"/etc/letsencrypt/live/${REALITY_DOMAIN}/privkey.pem\"}],\"alpn\":[\"http/1.1\"],\"echServerKeys\":\"\",\"settings\":{\"echConfigList\":\"\",\"pinnedPeerCertSha256\":[],\"verifyPeerCertByName\":\"\"}},\"tcpSettings\":{\"acceptProxyProtocol\":true,\"header\":{\"type\":\"none\"}}}') WHERE protocol='vless' AND port=443 AND listen='127.0.0.1';"; then
+    if ! sqlite3 "$XUIDB" "UPDATE inbounds SET settings = json_set(settings, '\$.clients[0].flow', 'xtls-rprx-vision', '\$.fallbacks', json('[{\"dest\":\"127.0.0.1:8080\",\"xver\":0}]')), stream_settings = json('{\"network\":\"tcp\",\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"${REALITY_DOMAIN}\",\"minVersion\":\"1.2\",\"maxVersion\":\"1.3\",\"cipherSuites\":\"\",\"rejectUnknownSni\":false,\"disableSystemRoot\":false,\"enableSessionResumption\":false,\"certificates\":[{\"ocspStapling\":0,\"oneTimeLoading\":false,\"usage\":\"encipherment\",\"buildChain\":false,\"certificateFile\":\"/etc/letsencrypt/live/${REALITY_DOMAIN}/fullchain.pem\",\"keyFile\":\"/etc/letsencrypt/live/${REALITY_DOMAIN}/privkey.pem\"}],\"alpn\":[\"http/1.1\"],\"echServerKeys\":\"\",\"settings\":{\"echConfigList\":\"\",\"pinnedPeerCertSha256\":[],\"verifyPeerCertByName\":\"\"}},\"tcpSettings\":{\"acceptProxyProtocol\":true,\"header\":{\"type\":\"none\"}}}') WHERE protocol='vless' AND port=443 AND listen='127.0.0.1';"; then
       echo "ОШИБКА: UPDATE не удался. Бэкап БД: ${XUIDB}.backup.*, stream: ${stream_backup}"
       systemctl start x-ui
       exit 1
@@ -1287,7 +1302,7 @@ cmd_switch_mode() {
   echo "Режим 443: ${cur_sec} -> ${target}"
   if [[ "$target" == "tls" ]]; then
     echo "Ссылка для клиентов (fp из рабочей связки RU-клиентов):"
-    echo "  vless://${uuid}@${REALITY_DOMAIN}:443?type=tcp&security=tls&sni=${REALITY_DOMAIN}&fp=firefox#vls"
+    echo "  vless://${uuid}@${REALITY_DOMAIN}:443?type=tcp&security=tls&sni=${REALITY_DOMAIN}&fp=firefox&flow=xtls-rprx-vision#vls"
   else
     echo "Public key (сверь с клиентскими ссылками):"
     sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.realitySettings.settings.publicKey') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true
@@ -3498,6 +3513,7 @@ server {
     set_real_ip_from 127.0.0.1;
     real_ip_header proxy_protocol;
     server_tokens off;
+    add_header Strict-Transport-Security "max-age=31536000" always;
     ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
@@ -3552,6 +3568,7 @@ EOF
 server {
     listen 127.0.0.1:${REALITY_DECOY_INTERNAL_PORT} ssl;
     server_tokens off;
+    add_header Strict-Transport-Security "max-age=31536000" always;
     ssl_certificate     /etc/letsencrypt/live/${REALITY_DOMAIN}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${REALITY_DOMAIN}/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
@@ -3652,13 +3669,13 @@ EOF
         # v0.3.9 TLS-режим: конфигурация, проверенная живьём на
         # prod-node-1 (2026-09-30). xray терминирует TLS сам, серт с
         # диска; fallback -> :80 даёт пробам 301-фасад; flow="" — рабочая
-        # связка RU-клиентов (fp=firefox, raw), Vision опционален.
+        # связка RU-клиентов (fp=firefox, raw). v0.5.1: flow=xtls-rprx-vision по умолчанию.
         if [[ ! -f "/etc/letsencrypt/live/${REALITY_DOMAIN}/fullchain.pem" || ! -f "/etc/letsencrypt/live/${REALITY_DOMAIN}/privkey.pem" ]]; then
           echo "ОШИБКА: серт ${REALITY_DOMAIN} не найден в /etc/letsencrypt/live/ — TLS-режим невозможен."
           systemctl start x-ui
           exit 1
         fi
-        SETTINGS_JSON='{"clients":[{"id":"'"${CLIENT_UUID}"'","flow":"","email":"client1","limitIp":0,"totalGB":0,"expiryTime":0,"enable":true,"tgId":0,"subId":"primary","reset":0,"created_at":'"${NOW_MS}"',"updated_at":'"${NOW_MS}"'}],"decryption":"none","fallbacks":[{"dest":"127.0.0.1:8080","xver":0}]}'
+        SETTINGS_JSON='{"clients":[{"id":"'"${CLIENT_UUID}"'","flow":"xtls-rprx-vision","email":"client1","limitIp":0,"totalGB":0,"expiryTime":0,"enable":true,"tgId":0,"subId":"primary","reset":0,"created_at":'"${NOW_MS}"',"updated_at":'"${NOW_MS}"'}],"decryption":"none","fallbacks":[{"dest":"127.0.0.1:8080","xver":0}]}'
         STREAM_JSON='{"network":"tcp","security":"tls","tlsSettings":{"serverName":"'"${REALITY_DOMAIN}"'","minVersion":"1.2","maxVersion":"1.3","cipherSuites":"","rejectUnknownSni":false,"disableSystemRoot":false,"enableSessionResumption":false,"certificates":[{"ocspStapling":0,"oneTimeLoading":false,"usage":"encipherment","buildChain":false,"certificateFile":"/etc/letsencrypt/live/'"${REALITY_DOMAIN}"'/fullchain.pem","keyFile":"/etc/letsencrypt/live/'"${REALITY_DOMAIN}"'/privkey.pem"}],"alpn":["http/1.1"],"echServerKeys":"","settings":{"echConfigList":"","pinnedPeerCertSha256":[],"verifyPeerCertByName":""}},"tcpSettings":{"acceptProxyProtocol":true,"header":{"type":"none"}}}'
       fi
 
@@ -3744,10 +3761,10 @@ EOF
       echo "VLESS+TLS inbound:   готов (remark: ${REALITY_REMARK}, fallback -> 127.0.0.1:8080)"
       echo "  Client UUID:       ${CLIENT_UUID:-(см. панель)}"
       echo "  ServerName/SNI:     ${REALITY_DOMAIN}"
-      echo "  Ссылка для клиента (рабочая связка: raw + fp=firefox, flow off):"
-      echo "  vless://${CLIENT_UUID:-(UUID)}@${REALITY_DOMAIN}:443?type=tcp&security=tls&sni=${REALITY_DOMAIN}&fp=firefox#${REALITY_REMARK}"
-      echo "  (Vision совместим с plain-TLS: можно добавить &flow=xtls-rprx-vision,"
-      echo "   но дефолт — без него, по эмпирике RU-клиентов 2026-09-30)"
+      echo "  Ссылка для клиента (raw + fp=firefox + Vision):"
+      echo "  vless://${CLIENT_UUID:-(UUID)}@${REALITY_DOMAIN}:443?type=tcp&security=tls&sni=${REALITY_DOMAIN}&fp=firefox&flow=xtls-rprx-vision#${REALITY_REMARK}"
+      echo "  (v0.5.1: Vision включён по умолчанию — убирает отпечаток вложенного TLS."
+      echo "   Клиент должен поддерживать flow xtls-rprx-vision; старый клиент без flow подключиться не сможет.)"
     fi
   else
     echo "vless inbound:       НЕ создан — создай вручную через панель."
@@ -3791,7 +3808,7 @@ EOF
       echo "Public Key: ${REALITY_PUBLIC}" >> "$CREDS_FILE"
       echo "Short IDs: ${SHORT_ID_1}, ${SHORT_ID_2}" >> "$CREDS_FILE"
     else
-      echo "VLESS Link: vless://${CLIENT_UUID}@${REALITY_DOMAIN}:443?type=tcp&security=tls&sni=${REALITY_DOMAIN}&fp=firefox#${REALITY_REMARK}" >> "$CREDS_FILE"
+      echo "VLESS Link: vless://${CLIENT_UUID}@${REALITY_DOMAIN}:443?type=tcp&security=tls&sni=${REALITY_DOMAIN}&fp=firefox&flow=xtls-rprx-vision#${REALITY_REMARK}" >> "$CREDS_FILE"
     fi
   fi
   if [[ -n "${HY2_AUTH:-}" ]]; then
@@ -3900,7 +3917,7 @@ cmd_healthcheck() {
   SCRIPT_MARKER="/root/.lucx-script-version"
   MARKER_INSTALLED=$(head -c 64 "$SCRIPT_MARKER" 2>/dev/null | tr -d '[:space:]' || true)
   echo "Версия скрипта: ${VERSION}"
-  echo "Версия управления (маркер): ${MARKER_INSTALLED:-<нет — установка до v0.4.1>}"
+  echo "Версия управления (маркер = версия скрипта при install/add-vls/add-reality): ${MARKER_INSTALLED:-<нет — установка до v0.4.1>}"
   # v0.4.7: INFO о новой версии скрипта (тихо без сети; не влияет на итог hc).
   # ВАЖНО: `|| true` обязателен — под set -e -o pipefail отсутствие сети/404
   # приватного репо убивало весь healthcheck (поймано в тесте на полигоне)
@@ -4528,11 +4545,11 @@ cmd_healthcheck() {
       check "Маркер версии отсутствует (установка до v0.4.1). Запиши фактическую: echo \"0.3.9\" > /root/.lucx-script-version" warn
     fi
   elif [[ "$marker" == "$VERSION" ]]; then
-    check "Версия управления: ${marker} (совпадает со скриптом)" ok
+    check "Версия управления (при установке): ${marker} — совпадает со скриптом" ok
   elif [[ "$(printf '%s\n%s\n' "$marker" "$VERSION" | sort -V | head -n1)" == "$VERSION" ]]; then
     check "Версия управления: ${marker} НОВЕЕ скрипта на диске (${VERSION}) — скрипт откатывали? Проверь" warn
   else
-    check "Версия управления: ${marker}, скрипт на диске новее (${VERSION}) — штатно; add-vls/add-reality при запуске обновят маркер" ok
+    check "Версия управления (при установке): ${marker}; скрипт на диске новее (${VERSION}) — штатно (маркер обновляют только add-vls/add-reality, это не показатель устаревания ноды)" ok
   fi
   echo
 
@@ -4665,6 +4682,21 @@ cmd_healthcheck() {
     else
       check "бот: режим обучения (CHAT_ID пуст — команды не работают), /start пришлёт chat_id" warn
     fi
+    local apit12 pp12 pb12 code12
+    apit12=$(grep "^PANEL_API_TOKEN=" "$TGBOT_ENV" 2>/dev/null | head -1 | sed "s/^PANEL_API_TOKEN='//; s/'\$//" || true)
+    if [ -z "$apit12" ]; then
+      check "бот: управление клиентами выключено (PANEL_API_TOKEN пуст) — по желанию: sudo bash $0 add-bot" warn
+    else
+      pp12=$(sqlite3 "$XUIDB" "SELECT value FROM settings WHERE key='webPort' LIMIT 1;" 2>/dev/null || true)
+      pb12=$(sqlite3 "$XUIDB" "SELECT value FROM settings WHERE key='webBasePath' LIMIT 1;" 2>/dev/null || true)
+      pb12="${pb12#/}"; pb12="${pb12%/}"; [ -n "$pb12" ] && pb12="/$pb12"
+      code12=$(printf 'header = "Authorization: Bearer %s"\n' "$apit12" | curl -s -o /dev/null -w '%{http_code}' --max-time 10 -K - "http://127.0.0.1:${pp12}${pb12}/panel/api/clients/list" 2>/dev/null || true)
+      if [[ "$code12" == "200" ]]; then
+        check "бот: API-токен панели принят (список клиентов, HTTP 200)" ok
+      else
+        check "бот: API-токен панели не принят (HTTP ${code12:-нет ответа}) — создай токен scope admin и впиши PANEL_API_TOKEN=" fail
+      fi
+    fi
     v12=$(cat "$TGBOT_DIR/.version" 2>/dev/null || true)
     if [[ "$v12" == "$TGBOT_BODY_VERSION" ]]; then
       check "бот: тело v$v12 актуально" ok
@@ -4693,8 +4725,8 @@ cmd_healthcheck() {
   if [[ -r /proc/pressure/io ]]; then
     local psi13
     psi13=$(awk '/^full/{for(i=1;i<=NF;i++) if($i ~ /^avg300=/){sub("avg300=","",$i); print $i}}' /proc/pressure/io 2>/dev/null | head -1)
-    if [[ -n "$psi13" ]] && awk -v v="$psi13" 'BEGIN{exit !(v+0>=3.0)}'; then
-      check "диск: io-давление (PSI full avg300) = ${psi13}% — диск ВМ подвисает; возможны «database is locked» в панели" warn
+    if [[ -n "$psi13" ]] && awk -v v="$psi13" -v t="$PSI_WARN_PCT" 'BEGIN{exit !(v+0>=t+0)}'; then
+      check "диск: io-давление (PSI full avg300) = ${psi13}% (порог ${PSI_WARN_PCT}%) — диск ВМ подвисает; возможны «database is locked» в панели" warn
     else
       check "диск: io-давление в норме (PSI full avg300 = ${psi13:-n/a}%)" ok
     fi
@@ -4717,6 +4749,31 @@ cmd_healthcheck() {
     else
       check "песочница: юниту x-ui запрещено писать в /etc/amnezia (панель lucx.291) — AWG ляжет при рестарте; обнови панель до lucx.292+ (x-ui update)" fail
     fi
+  fi
+
+  echo
+  # ================== [14] SSH-атаки и ресурсы (v0.5.1, только справочно) ==================
+  echo "=== [14] SSH-атаки и ресурсы (справочно, на итог не влияет) ==="
+  if command -v journalctl >/dev/null 2>&1; then
+    local ssh_1h ssh_24h ssh_ips f2b_banned f2b_total f2b_txt
+    ssh_1h=$(journalctl _COMM=sshd --since "1 hour ago" --no-pager 2>/dev/null | grep -cE 'Failed password|Invalid user|authentication failure' || true)
+    ssh_24h=$(journalctl _COMM=sshd --since "24 hours ago" --no-pager 2>/dev/null | grep -cE 'Failed password|Invalid user|authentication failure' || true)
+    ssh_ips=$(journalctl _COMM=sshd --since "24 hours ago" --no-pager 2>/dev/null | grep -E 'Failed password|Invalid user' | grep -oE 'from [0-9a-fA-F.:]+' | sort -u | wc -l || true)
+    f2b_txt="fail2ban: не активен"
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+      f2b_banned=$(fail2ban-client status sshd 2>/dev/null | grep -oE 'Currently banned:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)
+      f2b_total=$(fail2ban-client status sshd 2>/dev/null | grep -oE 'Total banned:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)
+      f2b_txt="fail2ban: в бане ${f2b_banned:-?}, всего ${f2b_total:-?}"
+    fi
+    echo "    [INFO] SSH: попыток входа за 1ч: ${ssh_1h:-0}, за 24ч: ${ssh_24h:-0} (уникальных адресов за 24ч: ${ssh_ips:-0}); ${f2b_txt}"
+  else
+    echo "    [INFO] SSH: journalctl недоступен — счётчик пропущен"
+  fi
+  local mem_kb14 swap_kb14
+  mem_kb14=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  swap_kb14=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  if [[ "${mem_kb14:-0}" -le 1300000 && "${swap_kb14:-0}" -eq 0 ]]; then
+    echo "    [INFO] ОЗУ ≈ 1 ГБ и swap нет — запас на пики мал. Опционально: sudo bash $0 add-swap (не включай на ВМ с WARN про io-давление выше)"
   fi
 
   echo
@@ -4871,15 +4928,16 @@ cmd_upgrade() {
 # (add-bot перезаписывает тело, env не трогает).
 TGBOT_DIR="/opt/tgbot"
 TGBOT_ENV="/etc/tgbot/env"
-TGBOT_BODY_VERSION="0.5.0"
+TGBOT_BODY_VERSION="0.5.1"
 
 tgbot_write_body() { # тело бота (правки — только через новую версию скрипта)
   mkdir -p "$TGBOT_DIR"
   cat > "$TGBOT_DIR/tgbot.sh" <<'TGBOT_EOF'
 #!/usr/bin/env bash
-# TG-бот управления нодой 3x-ui (ставится скриптом 3x-ui-dual-domain v0.4.8: install/add-bot)
+# TG-бот управления нодой 3x-ui (ставится скриптом 3x-ui-dual-domain: install/add-bot)
 # Карточки-кнопки, whitelist по CHAT_ID, фиксированный словарь команд, локальное исполнение.
 # Конфиг: /etc/tgbot/env (600): TOKEN=, CHAT_ID= (пусто = режим обучения), NODE_NAME=, SCRIPT_PATH=
+# Клиенты (v0.5.1, опц.): PANEL_API_TOKEN= (пусто = функция выключена), CLIENT_INBOUNDS=1,2 (пусто = vless+hysteria из БД), CLIENT_TZ=
 set -u
 ENV_FILE="/etc/tgbot/env"
 [ -f "$ENV_FILE" ] && . "$ENV_FILE"
@@ -4911,19 +4969,186 @@ edit_card() { # $1 chat, $2 message_id, $3 html, $4 markup; карточку с�
 }
 
 kb_home() {
-  jq -nc '{inline_keyboard:[
+  local base row
+  base=$(jq -nc '{inline_keyboard:[
     [{text:"📊 Статус",callback_data:"cmd:status"},{text:"🔢 Версии",callback_data:"cmd:versions"}],
     [{text:"💾 Диск",callback_data:"cmd:disk"},{text:"📜 Лог x-ui",callback_data:"cmd:log"}],
     [{text:"🩺 Healthcheck",callback_data:"cmd:hc"},{text:"🔐 Бэкап БД",callback_data:"cmd:backup"}],
     [{text:"♻ Рестарт панели",callback_data:"ask:restart_panel"},{text:"♻ Рестарт xray",callback_data:"ask:restart_xray"}],
     [{text:"⬆ Скрипт (upgrade)",callback_data:"ask:upgrade"},{text:"⬆ Панель (update)",callback_data:"ask:update_panel"}]
-  ]}'
+  ]}')
+  if cl_enabled; then
+    row='[{"text":"➕ Клиент","callback_data":"cl:add"},{"text":"🗑 Удалить клиента","callback_data":"cl:del"},{"text":"📋 Список","callback_data":"cl:list"}]'
+    jq -c --argjson r "$row" '.inline_keyboard += [$r]' <<<"$base"
+  else
+    printf '%s\n' "$base"
+  fi
 }
 kb_confirm() { # $1 cmd
   jq -nc --arg c "$1" '{inline_keyboard:[
     [{text:"✅ Да, выполняй",callback_data:("yes:"+$c)},{text:"❌ Отмена",callback_data:"home"}]
   ]}'
 }
+
+# ---------- клиенты (v0.5.1): создать / удалить / список через API панели ----------
+CLIENT_TZ="${CLIENT_TZ:-Asia/Yekaterinburg}"
+CL_STATE=''; CL_NAME=''; CL_LIMIT=0; CL_EXP=0; CL_TS=0; CL_DEL=''
+
+cl_enabled() { [ -n "${PANEL_API_TOKEN:-}" ] && printf '%s' "$PANEL_API_TOKEN" | grep -qE '^[A-Za-z0-9._~+/=-]{8,200}$'; }
+xdb() { sqlite3 -readonly /etc/x-ui/x-ui.db "$1" 2>/dev/null; } # только фиксированные запросы
+cl_base() {
+  if [ -n "${PANEL_API_BASE:-}" ]; then printf '%s' "$PANEL_API_BASE"; return 0; fi
+  local p b
+  p=$(xdb "SELECT value FROM settings WHERE key='webPort' LIMIT 1;")
+  b=$(xdb "SELECT value FROM settings WHERE key='webBasePath' LIMIT 1;")
+  b=${b#/}; b=${b%/}
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  if [ -n "$b" ]; then printf 'http://127.0.0.1:%s/%s' "$p" "$b"; else printf 'http://127.0.0.1:%s' "$p"; fi
+}
+cl_api() { # $1 GET|POST, $2 путь /panel/api/clients/..., $3 json-тело (опц.). Токен — через stdin curl, не в аргументах
+  local base
+  base=$(cl_base) || { echo '{"success":false,"msg":"порт панели не найден"}'; return 0; }
+  local args=(-s --max-time 25 -X "$1" -K - -H 'Accept: application/json')
+  if [ -n "${3:-}" ]; then args+=(-H 'Content-Type: application/json' --data-binary "$3"); fi
+  printf 'header = "Authorization: Bearer %s"\n' "$PANEL_API_TOKEN" | curl "${args[@]}" "$base$2" || echo '{"success":false,"msg":"панель не ответила"}'
+}
+cl_inbounds() { # id инбаундов через пробел: CLIENT_INBOUNDS или vless+hysteria из БД
+  local raw
+  if [ -n "${CLIENT_INBOUNDS:-}" ]; then raw=$(printf '%s' "$CLIENT_INBOUNDS" | tr ',' ' ')
+  else raw=$(xdb "SELECT id FROM inbounds WHERE enable=1 AND protocol IN ('vless','hysteria','hysteria2') ORDER BY id;" | tr '\n' ' '); fi
+  for i in $raw; do case "$i" in ''|*[!0-9]*) ;; *) printf '%s ' "$i" ;; esac; done
+}
+cl_inb_desc() { local i; for i in $1; do xdb "SELECT '#'||id||' '||protocol||':'||port FROM inbounds WHERE id=$i;"; done | tr '\n' ' '; }
+cl_fmt_exp() { # $1 мс
+  if [ "${1:-0}" -le 0 ] 2>/dev/null; then echo 'без срока'; return; fi
+  TZ="$CLIENT_TZ" date -d "@$(( $1 / 1000 ))" '+%d.%m.%Y %H:%M'
+}
+cl_exists() { cl_api GET /panel/api/clients/list | jq -e --arg e "$1" '.success==true and ((.obj // []) | map(.email) | index($e) != null)' >/dev/null 2>&1; }
+cl_reset() { CL_STATE=''; CL_NAME=''; CL_LIMIT=0; CL_EXP=0; CL_DEL=''; }
+
+kb_cl_limit() { jq -nc '{inline_keyboard:[[{text:"1",callback_data:"cl:lim:1"},{text:"2",callback_data:"cl:lim:2"},{text:"3",callback_data:"cl:lim:3"},{text:"5",callback_data:"cl:lim:5"},{text:"без лимита",callback_data:"cl:lim:0"}],[{text:"❌ Отмена",callback_data:"cl:cancel"}]]}'; }
+kb_cl_exp() { jq -nc '{inline_keyboard:[[{text:"+30 дн",callback_data:"cl:exp:30"},{text:"+90 дн",callback_data:"cl:exp:90"},{text:"+365 дн",callback_data:"cl:exp:365"}],[{text:"без срока",callback_data:"cl:exp:0"},{text:"✍ ввести дату",callback_data:"cl:exp:man"}],[{text:"❌ Отмена",callback_data:"cl:cancel"}]]}'; }
+kb_cl_yes() { jq -nc --arg y "$1" '{inline_keyboard:[[{text:"✅ Да",callback_data:$y},{text:"❌ Отмена",callback_data:"cl:cancel"}]]}'; }
+
+cl_confirm_create() { # $1 chat
+  local ids
+  ids=$(cl_inbounds)
+  send_card "$1" "➕ <b>Новый клиент</b>
+Имя: <code>$(esc "$CL_NAME")</code>
+Лимит IP: $([ "$CL_LIMIT" -eq 0 ] && echo 'без лимита' || echo "$CL_LIMIT")
+Срок: $(cl_fmt_exp "$CL_EXP")
+Протоколы: $(esc "$(cl_inb_desc "$ids")")
+Создать?" "$(kb_cl_yes cl:create)"
+}
+cl_do_create() { # $1 chat
+  local ids idsj sub payload r link suburi
+  ids=$(cl_inbounds)
+  if [ -z "$ids" ]; then send_txt "$1" "[$NODE_NAME] ОШИБКА: не нашёл инбаунды (vless/hysteria) — задай CLIENT_INBOUNDS в /etc/tgbot/env"; return; fi
+  idsj=$(printf '%s\n' $ids | jq -Rsc 'split("\n") | map(select(length>0) | tonumber)')
+  sub=$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 16)
+  payload=$(jq -nc --arg e "$CL_NAME" --arg s "$sub" --argjson l "$CL_LIMIT" --argjson x "$CL_EXP" --argjson ids "$idsj" \
+    '{client:{email:$e,subId:$s,limitIp:$l,totalGB:0,expiryTime:$x,enable:true,tgId:0,comment:"создан ботом",flow:"xtls-rprx-vision"},inboundIds:$ids}')
+  r=$(cl_api POST /panel/api/clients/add "$payload")
+  if jq -e '.success==true' <<<"$r" >/dev/null 2>&1 && cl_exists "$CL_NAME"; then
+    suburi=$(xdb "SELECT value FROM settings WHERE key='subURI' LIMIT 1;")
+    link="${suburi}${sub}"
+    send_txt "$1" "[$NODE_NAME] ✅ Клиент $CL_NAME создан (срок: $(cl_fmt_exp "$CL_EXP"), лимит IP: $CL_LIMIT).
+Подписка (одна ссылка — все протоколы):
+$link"
+  else
+    send_txt "$1" "[$NODE_NAME] ОШИБКА создания клиента: $(jq -r '.msg // "нет ответа"' <<<"$r" 2>/dev/null | cut -c1-300)"
+  fi
+  cl_reset
+}
+cl_do_delete() { # $1 chat
+  local r
+  r=$(cl_api POST "/panel/api/clients/del/$CL_DEL")
+  if jq -e '.success==true' <<<"$r" >/dev/null 2>&1 && ! cl_exists "$CL_DEL"; then
+    send_txt "$1" "[$NODE_NAME] 🗑 Клиент $CL_DEL удалён."
+  else
+    send_txt "$1" "[$NODE_NAME] ОШИБКА удаления $CL_DEL: $(jq -r '.msg // "нет ответа"' <<<"$r" 2>/dev/null | cut -c1-300)"
+  fi
+  cl_reset
+}
+cl_do_list() { # $1 chat
+  local r out n e x en l
+  r=$(cl_api GET /panel/api/clients/list)
+  if ! jq -e '.success==true' <<<"$r" >/dev/null 2>&1; then
+    send_txt "$1" "[$NODE_NAME] ОШИБКА списка: $(jq -r '.msg // "нет ответа"' <<<"$r" 2>/dev/null | cut -c1-300)"; return
+  fi
+  n=$(jq '(.obj // []) | length' <<<"$r")
+  out="[$NODE_NAME] Клиентов: $n"
+  while IFS=$'\t' read -r e x en l; do
+    [ -z "$e" ] && continue
+    out="$out
+$([ "$en" = true ] && echo '🟢' || echo '⚪') $e — до $(cl_fmt_exp "$x"), IP: $l"
+  done < <(jq -r '(.obj // [])[:60][] | [.email, (.expiryTime // 0), (.enable // false), (.limitIp // 0)] | @tsv' <<<"$r")
+  [ "$n" -gt 60 ] && out="$out
+… показаны первые 60"
+  [ "${#out}" -gt 3900 ] && out=${out:0:3900}
+  send_txt "$1" "$out"
+}
+cl_cb() { # $1 chat, $2 callback_id, $3 data
+  local d="${3#cl:}" days
+  if ! cl_enabled; then answer "$2" 'управление клиентами выключено (нет PANEL_API_TOKEN)'; return; fi
+  if [ -n "$CL_STATE" ] && [ $(( $(date +%s) - CL_TS )) -gt 600 ]; then cl_reset; fi
+  case "$d" in
+    add)  cl_reset; CL_STATE=name; CL_TS=$(date +%s); answer "$2" ''
+          send_txt "$1" 'Имя нового клиента: латиница, цифры, _ и -, 3–32 символа. /cancel — отмена.' ;;
+    del)  cl_reset; CL_STATE=delname; CL_TS=$(date +%s); answer "$2" ''
+          send_txt "$1" 'Имя клиента для удаления (точно как в списке). /cancel — отмена.' ;;
+    list) answer "$2" 'читаю…'; cl_do_list "$1" ;;
+    cancel) cl_reset; answer "$2" 'отменено' ;;
+    lim:*)
+      [ "$CL_STATE" = limit ] || { answer "$2" 'шаг устарел — начни заново'; return; }
+      case "${d#lim:}" in 0|1|2|3|5) CL_LIMIT="${d#lim:}" ;; *) answer "$2" 'неверное значение'; return ;; esac
+      CL_STATE=exp; CL_TS=$(date +%s); answer "$2" ''
+      send_card "$1" 'Срок действия:' "$(kb_cl_exp)" ;;
+    exp:*)
+      [ "$CL_STATE" = exp ] || { answer "$2" 'шаг устарел — начни заново'; return; }
+      days="${d#exp:}"
+      case "$days" in
+        0)   CL_EXP=0 ;;
+        30|90|365) CL_EXP=$(( ($(date +%s) + days * 86400) * 1000 )) ;;
+        man) CL_STATE=exp_manual; CL_TS=$(date +%s); answer "$2" ''
+             send_txt "$1" "Дата и время окончания в формате ДД.ММ.ГГГГ ЧЧ:ММ (часовой пояс $CLIENT_TZ). /cancel — отмена."; return ;;
+        *)   answer "$2" 'неверное значение'; return ;;
+      esac
+      CL_STATE=confirm; CL_TS=$(date +%s); answer "$2" ''
+      cl_confirm_create "$1" ;;
+    create)
+      [ "$CL_STATE" = confirm ] || { answer "$2" 'подтверждение устарело — начни заново'; return; }
+      answer "$2" 'создаю…'; cl_do_create "$1" ;;
+    delyes)
+      [ "$CL_STATE" = delconfirm ] && [ -n "$CL_DEL" ] || { answer "$2" 'подтверждение устарело — начни заново'; return; }
+      answer "$2" 'удаляю…'; cl_do_delete "$1" ;;
+    *) answer "$2" 'неизвестно' ;;
+  esac
+}
+cl_text() { # $1 chat, $2 text — ввод в процессе мастера
+  local t="$2" sec
+  if [ $(( $(date +%s) - CL_TS )) -gt 600 ]; then cl_reset; send_txt "$1" 'Время ввода вышло — начни заново: /menu'; return; fi
+  case "$CL_STATE" in
+    name)
+      if ! printf '%s' "$t" | grep -qE '^[A-Za-z0-9_-]{3,32}$'; then send_txt "$1" 'Имя: латиница, цифры, _ и -, 3–32 символа. Ещё раз или /cancel.'; return; fi
+      if cl_exists "$t"; then send_txt "$1" 'Такой клиент уже есть. Другое имя или /cancel.'; return; fi
+      CL_NAME="$t"; CL_STATE=limit; CL_TS=$(date +%s)
+      send_card "$1" 'Лимит одновременных IP (устройств):' "$(kb_cl_limit)" ;;
+    exp_manual)
+      if ! printf '%s' "$t" | grep -qE '^[0-9]{2}\.[0-9]{2}\.[0-9]{4} [0-9]{2}:[0-9]{2}$'; then send_txt "$1" 'Формат: ДД.ММ.ГГГГ ЧЧ:ММ, например 31.12.2026 23:59. Ещё раз или /cancel.'; return; fi
+      sec=$(TZ="$CLIENT_TZ" date -d "${t:6:4}-${t:3:2}-${t:0:2} ${t:11:5}" +%s 2>/dev/null) || { send_txt "$1" 'Такой даты не существует. Ещё раз или /cancel.'; return; }
+      if [ "$sec" -le "$(date +%s)" ]; then send_txt "$1" 'Дата уже прошла. Ещё раз или /cancel.'; return; fi
+      CL_EXP=$(( sec * 1000 )); CL_STATE=confirm; CL_TS=$(date +%s)
+      cl_confirm_create "$1" ;;
+    delname)
+      if ! printf '%s' "$t" | grep -qE '^[A-Za-z0-9_@.-]{1,64}$'; then send_txt "$1" 'Недопустимое имя. Ещё раз или /cancel.'; return; fi
+      if ! cl_exists "$t"; then send_txt "$1" 'Клиент не найден (см. 📋 Список). Ещё раз или /cancel.'; return; fi
+      CL_DEL="$t"; CL_STATE=delconfirm; CL_TS=$(date +%s)
+      send_card "$1" "🗑 Удалить клиента <code>$(esc "$t")</code> со всеми протоколами? Это необратимо." "$(kb_yes_del)" ;;
+    *) send_txt "$1" 'кнопки: /menu' ;;
+  esac
+}
+kb_yes_del() { kb_cl_yes cl:delyes; }
 
 script_file() {
   if [ -n "${SCRIPT_PATH:-}" ] && [ -f "$SCRIPT_PATH" ]; then echo "$SCRIPT_PATH"; return; fi
@@ -5038,6 +5263,9 @@ $out"
         answer "$cbid" 'подтверждение истекло — запроси заново'
       fi
       ;;
+    cl:*)
+      cl_cb "$cid" "$cbid" "$data"
+      ;;
     *)
       answer "$cbid" 'неизвестно'
       ;;
@@ -5053,7 +5281,19 @@ handle() { # $1 chat_id, $2 text
   fi
   [ "$1" != "$CHAT_ID" ] && return
   case "$2" in
+    /cancel)
+      cl_reset
+      send_txt "$1" 'Отменено. /menu'
+      return
+      ;;
+  esac
+  if [ -n "$CL_STATE" ] && [ "$2" != '/start' ] && [ "$2" != '/menu' ] && [ "$2" != '/help' ]; then
+    cl_text "$1" "$2"
+    return
+  fi
+  case "$2" in
     /start|/help|/menu)
+      cl_reset
       show_home "$1"
       ;;
     *)
@@ -5063,7 +5303,9 @@ handle() { # $1 chat_id, $2 text
 }
 
 if [ "${1:-}" = selftest ]; then
-  kb_home | jq -e '.inline_keyboard | length == 5' >/dev/null && echo 'kb_home: ok' || echo 'kb_home: ПРОВАЛ'
+  kb_home | jq -e '.inline_keyboard | length >= 5' >/dev/null && echo 'kb_home: ok' || echo 'kb_home: ПРОВАЛ'
+  kb_cl_limit | jq -e '.inline_keyboard[0] | length == 5' >/dev/null && kb_cl_exp | jq -e '.inline_keyboard | length == 3' >/dev/null && kb_cl_yes cl:create | jq -e '.inline_keyboard[0] | length == 2' >/dev/null && echo 'kb_clients: ok' || echo 'kb_clients: ПРОВАЛ'
+  if cl_enabled; then echo 'клиенты: включено (PANEL_API_TOKEN задан)'; else echo 'клиенты: выключено (нет PANEL_API_TOKEN)'; fi
   kb_confirm restart_panel | jq -e '.inline_keyboard[0] | length == 2' >/dev/null && echo 'kb_confirm: ok' || echo 'kb_confirm: ПРОВАЛ'
   ok=1
   for c in status versions disk log backup restart_panel restart_xray update_panel; do
@@ -5121,19 +5363,20 @@ tgbot_sh_quote() { # значение для env: одиночные кавыч�
   printf "%s" "$1" | sed "s/'/'\\\\''/g"
 }
 
-tgbot_install_files() { # $1 token, $2 chat_id, $3 name, $4 script_path.
+tgbot_install_files() { # $1 token, $2 chat_id, $3 name, $4 script_path, $5 panel API token (опц.).
   # Пустой ввод сохраняет старое значение env (повторный add-bot с Enter
   # везде = безопасное обновление тела); непустой ввод ЗАМЕНЯЕТ значение.
-  local tok="$1" cid="$2" nm="$3" sp="$4" k v
+  local tok="$1" cid="$2" nm="$3" sp="$4" apit="${5:-}" k v
   mkdir -p "$(dirname "$TGBOT_ENV")"
   touch "$TGBOT_ENV"
   chmod 600 "$TGBOT_ENV"
-  for k in TOKEN CHAT_ID NODE_NAME SCRIPT_PATH; do
+  for k in TOKEN CHAT_ID NODE_NAME SCRIPT_PATH PANEL_API_TOKEN; do
     case "$k" in
       TOKEN) v="$tok" ;;
       CHAT_ID) v="$cid" ;;
       NODE_NAME) v="$nm" ;;
       SCRIPT_PATH) v="$sp" ;;
+      PANEL_API_TOKEN) v="$apit" ;;
     esac
     if [ -z "$v" ]; then
       continue
@@ -5151,7 +5394,7 @@ cmd_add_bot() {
   echo "=== Telegram-бот управления (один бот = эта нода) ==="
   echo "Понадобится токен от @BotFather (в Telegram: /newbot, займёт минуту)."
   echo
-  local tok cid nm sp ans
+  local tok cid nm sp ans apit
   read -rs -rp "Токен от @BotFather (пусто — вписать позже в $TGBOT_ENV; ввод скрыт): " tok || tok=""
   echo
   if [ -n "$tok" ] && ! printf '%s' "$tok" | grep -qE '^[0-9]+:[A-Za-z0-9_-]{30,}$'; then
@@ -5164,12 +5407,21 @@ cmd_add_bot() {
   fi
   read -rp "Твой Telegram ID — узнать у @userinfobot (пусто — режим обучения: бот сам пришлёт chat_id по /start): " cid || cid=""
   read -rp "Название ноды в боте (пусто — оставить текущее; при первой установке будет $(hostname)): " nm || nm=""
+  echo
+  echo "Управление клиентами из бота (создать/удалить/список) — опционально."
+  echo "Нужен API-токен панели со scope «admin» (панель → настройки → API-токены). Он хранится в $TGBOT_ENV (600)."
+  read -rs -rp "API-токен панели (пусто — не менять / не использовать; ввод скрыт): " apit || apit=""
+  echo
+  if [ -n "$apit" ] && ! printf '%s' "$apit" | grep -qE '^[A-Za-z0-9._~+/=-]{8,200}$'; then
+    echo "ВНИМАНИЕ: токен содержит недопустимые символы — не вписываю."
+    apit=""
+  fi
   sp=$(readlink -f "$0" 2>/dev/null || true)
   if ! command -v jq >/dev/null 2>&1; then
     echo "Ставлю jq (нужен боту)..."
     apt-get install -y jq >/dev/null 2>&1 || { echo "ОШИБКА: не поставить jq"; return 1; }
   fi
-  tgbot_install_files "$tok" "$cid" "$nm" "$sp"
+  tgbot_install_files "$tok" "$cid" "$nm" "$sp" "$apit"
   # фактические значения берём из env: пустой ввод сохранял старое
   local tok_eff cid_eff
   tok_eff=$(grep "^TOKEN=" "$TGBOT_ENV" 2>/dev/null | head -1 | sed "s/^TOKEN='//; s/'\$//" || true)
@@ -5217,6 +5469,137 @@ cmd_remove_bot() {
   echo "✓ Бот удалён."
 }
 
+# ================== РЕЖИМ: ADD-SWAP / REMOVE-SWAP (v0.5.1, опционально) ==================
+# Зачем: на VPS с 1 ГБ ОЗУ нет запаса на пики (сборка модуля AWG через DKMS,
+# обновление панели) — без swap ядро убивает процесс (x-ui/xray), ноду «роняет»
+# на минуты. Swap-файл — страховка от OOM, а не ускорение: при swappiness=10 он
+# используется только под давлением памяти. На ВМ с подвисающим диском (hc [13]
+# даёт WARN про io-давление) swap может ухудшить подвисания — там не включать.
+# Ставится ТОЛЬКО явной командой, из install не вызывается.
+SWAP_FILE="/swapfile"
+SWAP_MARK="# 3x-ui-dual-domain add-swap"
+SWAP_SYSCTL="/etc/sysctl.d/99-3x-ui-swap.conf"
+
+cmd_add_swap() {
+  local size_arg="1G" size_mb=0 arg
+  while [[ $# -gt 0 ]]; do
+    arg="$1"
+    case "$arg" in
+      --size) size_arg="${2:-}"; shift 2 || { echo "ОШИБКА: у --size нет значения (512M|1G|2G)"; return 1; } ;;
+      --size=*) size_arg="${arg#--size=}"; shift ;;
+      *) echo "ОШИБКА: неизвестный аргумент: $arg (допустимо: --size 512M|1G|2G)"; return 1 ;;
+    esac
+  done
+  if ! [[ "$size_arg" =~ ^[0-9]+[MG]$ ]]; then
+    echo "ОШИБКА: размер должен быть вида 512M, 1G, 2G (получено: '${size_arg}')"; return 1
+  fi
+  if [[ "$size_arg" == *G ]]; then size_mb=$(( ${size_arg%G} * 1024 )); else size_mb=${size_arg%M}; fi
+  if (( size_mb < 256 || size_mb > 4096 )); then
+    echo "ОШИБКА: допустимый размер от 256M до 4G (получено: ${size_arg})"; return 1
+  fi
+  [[ $EUID -eq 0 ]] || { echo "ОШИБКА: нужен root (sudo)"; return 1; }
+
+  echo "=== add-swap: swap-файл ${size_arg} ==="
+  echo "Зачем: страховка от OOM на ноде с малой памятью (пики при DKMS/обновлении панели)."
+  echo "Это не ускорение: при swappiness=10 swap используется только под давлением памяти."
+  echo
+
+  # уже есть swap — ничего не делаем
+  if [[ -n "$(swapon --show --noheadings 2>/dev/null)" ]]; then
+    echo "Swap уже подключён — ничего не делаю:"
+    swapon --show 2>/dev/null | sed 's/^/  /'
+    return 0
+  fi
+  # контейнерная виртуализация без прав на swap
+  local virt
+  virt=$(systemd-detect-virt -c 2>/dev/null || true)
+  if [[ -n "$virt" && "$virt" != "none" ]]; then
+    echo "ОТКАЗ: контейнер (${virt}) — swap-файл там обычно недоступен/управляется хостом."
+    return 1
+  fi
+  local fst
+  fst=$(stat -f -c %T / 2>/dev/null || echo unknown)
+  case "$fst" in
+    btrfs|zfs)
+      echo "ОТКАЗ: корневая ФС ${fst} — для swap-файла нужна особая подготовка, скрипт её не делает."
+      return 1 ;;
+  esac
+  if [[ -e "$SWAP_FILE" ]]; then
+    echo "ОТКАЗ: ${SWAP_FILE} уже существует (но не подключён). Не трогаю чужой файл — удали/переименуй сам."
+    return 1
+  fi
+  local avail_mb
+  avail_mb=$(df -Pm / | awk 'NR==2{print $4}')
+  if [[ -z "$avail_mb" ]] || (( avail_mb < size_mb * 3 )); then
+    echo "ОТКАЗ: мало места на / (свободно ${avail_mb:-?} МБ, нужно не меньше ${size_mb}*3 = $(( size_mb * 3 )) МБ)."
+    return 1
+  fi
+  # предупреждение про подвисания диска
+  if [[ -r /proc/pressure/io ]]; then
+    local psi
+    psi=$(awk '/^full/{for(i=1;i<=NF;i++) if($i ~ /^avg300=/){sub("avg300=","",$i); print $i}}' /proc/pressure/io 2>/dev/null | head -1)
+    if [[ -n "$psi" ]] && awk -v v="$psi" -v t="$PSI_WARN_PCT" 'BEGIN{exit !(v+0>=t+0)}'; then
+      echo "ВНИМАНИЕ: io-давление диска ${psi}% (порог ${PSI_WARN_PCT}%) — на ВМ с подвисающим диском swap может ухудшить ситуацию."
+      echo "         Продолжаю, т.к. команда запущена явно; откат: sudo bash $0 remove-swap"
+    fi
+  fi
+
+  if ! fallocate -l "${size_mb}M" "$SWAP_FILE" 2>/dev/null; then
+    echo "fallocate не поддерживается — создаю через dd (подожди)…"
+    if ! dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$size_mb" status=none; then
+      rm -f "$SWAP_FILE"; echo "ОШИБКА: не удалось создать ${SWAP_FILE}"; return 1
+    fi
+  fi
+  chmod 600 "$SWAP_FILE"
+  if ! mkswap "$SWAP_FILE" >/dev/null; then
+    rm -f "$SWAP_FILE"; echo "ОШИБКА: mkswap не удался"; return 1
+  fi
+  if ! swapon "$SWAP_FILE"; then
+    rm -f "$SWAP_FILE"; echo "ОШИБКА: swapon не удался (ядро/хостер не разрешает swap?)"; return 1
+  fi
+  if ! grep -qF "$SWAP_MARK" /etc/fstab 2>/dev/null; then
+    cp -a /etc/fstab "/etc/fstab.backup.$(date +%s)"
+    echo "${SWAP_FILE} none swap sw 0 0 ${SWAP_MARK}" >> /etc/fstab
+  fi
+  printf 'vm.swappiness=10\n' > "$SWAP_SYSCTL"
+  sysctl -q -p "$SWAP_SYSCTL" >/dev/null 2>&1 || sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
+  echo "Готово: swap ${size_arg} подключён, vm.swappiness=10, запись в /etc/fstab добавлена."
+  swapon --show 2>/dev/null | sed 's/^/  /'
+  echo "Откат: sudo bash $0 remove-swap"
+}
+
+cmd_remove_swap() {
+  [[ $EUID -eq 0 ]] || { echo "ОШИБКА: нужен root (sudo)"; return 1; }
+  echo "=== remove-swap: откат add-swap ==="
+  if ! grep -qF "$SWAP_MARK" /etc/fstab 2>/dev/null && [[ ! -f "$SWAP_SYSCTL" ]]; then
+    echo "Swap, созданный этим скриптом (метка '${SWAP_MARK}'), не найден — ничего не делаю."
+    return 0
+  fi
+  if swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$SWAP_FILE"; then
+    # swapoff при полном swap может загнать ноду в OOM — проверяем запас памяти
+    local used_kb avail_kb
+    used_kb=$(awk '/^SwapTotal:/{t=$2}/^SwapFree:/{f=$2}END{print t-f}' /proc/meminfo)
+    avail_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+    if [[ -n "$used_kb" && -n "$avail_kb" ]] && (( used_kb > avail_kb )); then
+      echo "ОТКАЗ: в swap лежит ${used_kb} КБ, а свободной памяти ${avail_kb} КБ — swapoff может вызвать OOM. Освободи память и повтори."
+      return 1
+    fi
+    if ! swapoff "$SWAP_FILE"; then echo "ОШИБКА: swapoff не удался"; return 1; fi
+  fi
+  if grep -qF "$SWAP_MARK" /etc/fstab 2>/dev/null; then
+    cp -a /etc/fstab "/etc/fstab.backup.$(date +%s)"
+    grep -vF "$SWAP_MARK" /etc/fstab > /etc/fstab.tmp.3xui && cat /etc/fstab.tmp.3xui > /etc/fstab
+    rm -f /etc/fstab.tmp.3xui
+  fi
+  rm -f "$SWAP_FILE"
+  if [[ -f "$SWAP_SYSCTL" ]]; then
+    rm -f "$SWAP_SYSCTL"
+    sysctl -w vm.swappiness=60 >/dev/null 2>&1 || true
+    echo "vm.swappiness возвращён к 60 (умолчание Ubuntu)."
+  fi
+  echo "Готово: swap-файл, запись в fstab и sysctl-файл удалены."
+}
+
 # ================== РАЗБОР АРГУМЕНТОВ ==================
 
 case "${1:-install}" in
@@ -5252,6 +5635,13 @@ case "${1:-install}" in
   upgrade|update-script)
     cmd_upgrade
     ;;
+  add-swap|swap)
+    shift
+    cmd_add_swap "$@"
+    ;;
+  remove-swap|unswap)
+    cmd_remove_swap
+    ;;
   *)
     echo "Использование:"
     echo "  sudo bash $0 install       — установить всё с нуля (чистый сервер;"
@@ -5268,6 +5658,9 @@ case "${1:-install}" in
     echo "  sudo bash $0 healthcheck   — проверить текущую связку"
     echo "  sudo bash $0 rebind-ip     — сменить IP в stream-роутере"
     echo "                               (после смены IP у провайдера)"
+    echo "  sudo bash $0 add-swap      — (опц.) swap-файл против OOM на нодах с 1 ГБ ОЗУ"
+    echo "                               (--size 512M|1G|2G; не включай на ВМ с подвисающим диском)"
+    echo "  sudo bash $0 remove-swap   — убрать swap-файл, созданный add-swap"
     exit 1
     ;;
 esac

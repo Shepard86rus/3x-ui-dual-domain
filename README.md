@@ -74,7 +74,7 @@ Reality — более сильная маскировка.
 
 | | TLS | Reality |
 |---|---|---|
-| Как работает | TLS терминирует nginx на 443, xray внутри на loopback, «чужие» подключения уходят на decoy №2 | xray сам терминирует Reality-протокол, «чужие» подключения — на decoy №2 |
+| Как работает | nginx на 443 только маршрутизирует по SNI (TLS не расшифровывает); TLS с вашим сертификатом терминирует сам xray на loopback, не-VLESS трафик после рукопожатия уходит на decoy №2 | xray сам терминирует Reality-протокол, «чужие» подключения — на decoy №2 |
 | Настройка клиента | vless+TLS, raw, fp=firefox, `flow=xtls-rprx-vision` | vless+Reality, fp=firefox |
 
 Передумать можно в любой момент: `add-vls` (→ TLS) или `add-reality` (→ Reality)

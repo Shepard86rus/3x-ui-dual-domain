@@ -787,7 +787,10 @@
 #   (4) hc [13]: порог PSI вынесен в переменную PSI_WARN_PCT (по умолчанию 3.0).
 #   (5) Новые команды add-swap / remove-swap (по явному запуску, не из install).
 #   (6) Тексты про маркер версии управления поясняют, что это версия при установке.
-VERSION="0.5.1"
+# v0.5.2: install не создаёт дубли строк webListen/webPort/webBasePath в settings
+#   (INSERT OR IGNORE без уникального индекса по key вставлял вторую строку; теперь
+#   INSERT ... SELECT ... WHERE NOT EXISTS, как в блоке подписок).
+VERSION="0.5.2"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
 # С v3.7.0-lucx.203 install-awg-module.sh качает исходники tarball'ом
@@ -1708,11 +1711,11 @@ cmd_install() {
   if [[ -f "$XUIDB" ]]; then
     sqlite3 "$XUIDB" <<SQL
 UPDATE settings SET value='127.0.0.1' WHERE key='webListen';
-INSERT OR IGNORE INTO settings (key,value) VALUES ('webListen','127.0.0.1');
+INSERT INTO settings (key,value) SELECT 'webListen','127.0.0.1' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='webListen');
 UPDATE settings SET value='${PANEL_PORT}' WHERE key='webPort';
-INSERT OR IGNORE INTO settings (key,value) VALUES ('webPort','${PANEL_PORT}');
+INSERT INTO settings (key,value) SELECT 'webPort','${PANEL_PORT}' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='webPort');
 UPDATE settings SET value='${PANEL_BASEPATH_NOSLASH}' WHERE key='webBasePath';
-INSERT OR IGNORE INTO settings (key,value) VALUES ('webBasePath','${PANEL_BASEPATH_NOSLASH}');
+INSERT INTO settings (key,value) SELECT 'webBasePath','${PANEL_BASEPATH_NOSLASH}' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='webBasePath');
 SQL
   fi
 

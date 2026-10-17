@@ -790,7 +790,24 @@
 # v0.5.2: install не создаёт дубли строк webListen/webPort/webBasePath в settings
 #   (INSERT OR IGNORE без уникального индекса по key вставлял вторую строку; теперь
 #   INSERT ... SELECT ... WHERE NOT EXISTS, как в блоке подписок).
-VERSION="0.5.2"
+# v0.5.3: install сам задаёт то, что раньше правилось руками в панели:
+#   (1) инбаунды VLESS (оба режима) и Hy2: «Стратегия адреса для ссылок» = custom,
+#       «Пользовательский адрес» = основной домен (колонки share_addr_strategy/share_addr;
+#       если колонок нет в этой версии панели — предупреждение, не ошибка);
+#   (2) TLS-режим VLESS и Hy2: uTLS fingerprint=firefox (tlsSettings.settings);
+#   (3) рекомендованные настройки подписок (вопрос при установке, Enter = да):
+#       Clash/Mihomo вкл + автоопределение + маршрутизация и правила clash-universal.yaml
+#       (скачиваются из репозитория: тег версии, затем main, затем dev-ветка), Happ и Incy: маршрутизация по профилям
+#       hydraponique, скрытие настроек/URL, DoH-резолв Incy; название подписки (по желанию).
+#   (4) после создания инбаундов install вызывает `x-ui migrate` (при остановленном x-ui):
+#       клиенты, записанные в settings инбаунда, попадают в таблицу панели — раньше страница
+#       «Клиенты» оставалась пустой (найдено на первой живой установке 0.5.3, lucx .302).
+#   (5) certbot вызывается с --keep-until-expiring: если сертификат домена уже лежит в
+#       /etc/letsencrypt (например, восстановлен из бэкапа при переустановке сервера) и ещё
+#       не пора обновлять, он сохраняется — новый выпуск не тратит лимит Let's Encrypt.
+#   Только для новой установки; существующие ноды не меняются. AWG-инбаунд по-прежнему
+#   создаётся в панели вручную. Исправлен текст про subClashAutoDetect (в lucx .302 по умолчанию false).
+VERSION="0.5.3"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
 # С v3.7.0-lucx.203 install-awg-module.sh качает исходники tarball'ом
@@ -853,6 +870,120 @@ read_domains() {
     read -rp "Домен-обложка Reality (напр. reality.example.com): " REALITY_DOMAIN
     echo
   fi
+}
+
+# ---- v0.5.3: настройки панели из install (адрес для ссылок, подписки) ----
+sqlite_has_column() { # table column
+  sqlite3 "$XUIDB" "SELECT 1 FROM pragma_table_info('$1') WHERE name='$2' LIMIT 1;" 2>/dev/null | grep -q 1
+}
+
+set_inbound_share_addr() { # tag — «Пользовательский адрес для ссылок» = основной домен
+  local tag="$1"
+  if ! sqlite_has_column inbounds share_addr_strategy || ! sqlite_has_column inbounds share_addr; then
+    echo "  WARN: в этой версии панели нет полей адреса для ссылок — задай его в панели вручную (инбаунд -> Основное)."
+    return 0
+  fi
+  if sqlite3 "$XUIDB" "UPDATE inbounds SET share_addr_strategy='custom', share_addr='${REALITY_DOMAIN}' WHERE tag='${tag}';"; then
+    echo "  Адрес для ссылок инбаунда ${tag}: custom -> ${REALITY_DOMAIN}"
+  else
+    echo "  WARN: не удалось записать адрес для ссылок (tag ${tag}) — задай его в панели вручную."
+  fi
+  return 0
+}
+
+sync_panel_clients() { # v0.5.3: клиенты из settings инбаундов -> таблица clients панели
+  # Панель (lucx .29x+) показывает клиентов из отдельной таблицы; клиенты, записанные
+  # в settings инбаунда напрямую (как делает install), попадают туда только при
+  # `x-ui migrate`. Вызывать при ОСТАНОВЛЕННОМ x-ui, до systemctl start.
+  local bin="/usr/local/x-ui/x-ui" out
+  if [[ ! -x "$bin" ]]; then
+    echo "  WARN: бинарник x-ui не найден — клиенты не появятся в списке панели. Вручную: systemctl stop x-ui && /usr/local/x-ui/x-ui migrate && systemctl start x-ui"
+    return 0
+  fi
+  out=$(mktemp)
+  if timeout 120 "$bin" migrate >"$out" 2>&1; then
+    echo "  Клиенты импортированы в таблицу панели (x-ui migrate)"
+  else
+    echo "  WARN: x-ui migrate завершился с ошибкой — клиентов может не быть в списке панели:"
+    tail -n 5 "$out" | sed 's/^/    /'
+  fi
+  rm -f "$out"
+  return 0
+}
+
+sub_set() { # key value — UPDATE + INSERT WHERE NOT EXISTS (в settings нет уникального индекса по key)
+  local k="$1" v="${2//\'/\'\'}"
+  if ! sqlite3 "$XUIDB" "UPDATE settings SET value='${v}' WHERE key='${k}'; INSERT INTO settings (key,value) SELECT '${k}','${v}' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='${k}');"; then
+    echo "    WARN: не записан ключ ${k}"
+  fi
+  return 0
+}
+
+sub_set_file() { # key file — значение берётся из файла (без экранирования), только фиксированные пути mktemp
+  local k="$1" f="$2"
+  if ! sqlite3 "$XUIDB" "UPDATE settings SET value=CAST(readfile('${f}') AS TEXT) WHERE key='${k}'; INSERT INTO settings (key,value) SELECT '${k}',CAST(readfile('${f}') AS TEXT) WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='${k}');"; then
+    echo "    WARN: не записан ключ ${k}"
+  fi
+  return 0
+}
+
+apply_sub_recommended() {
+  if [[ "${SUB_REC:-y}" =~ ^[Nn]$ ]]; then
+    echo "  Рекомендованные настройки подписок: пропущено (по выбору)."
+    return 0
+  fi
+  echo "  Рекомендованные настройки подписок:"
+  local happ_url="${SUB_HAPP_ROUTING_URL:-https://raw.githubusercontent.com/hydraponique/roscomvpn-routing/refs/heads/main/HAPP/DEFAULT.JSON}"
+  local incy_url="${SUB_INCY_ROUTING_URL:-https://raw.githubusercontent.com/hydraponique/roscomvpn-routing/refs/heads/main/INCY/DEFAULT.JSON}"
+  # Источники правил по порядку: свой адрес (CLASH_RULES_URL) | тег версии | main | dev-ветка версии
+  local raw_base="https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain"
+  local clash_urls=()
+  [[ -n "${CLASH_RULES_URL:-}" ]] && clash_urls+=("$CLASH_RULES_URL")
+  clash_urls+=("${raw_base}/v${VERSION}/clash-universal.yaml" "${raw_base}/main/clash-universal.yaml" "${raw_base}/v${VERSION}-dev/clash-universal.yaml")
+  local tmp ok=0 cu
+  tmp=$(mktemp)
+
+  # Clash/Mihomo: подписка + автоопределение по User-Agent; маршрутизация только если правила получены
+  sub_set subClashEnable true
+  sub_set subClashAutoDetect true
+  for cu in "${clash_urls[@]}"; do
+    if curl -fsSL --max-time 30 "$cu" -o "$tmp" 2>/dev/null \
+       && [[ "$(wc -c <"$tmp")" -gt 1000 ]] && grep -q '^proxy-groups:' "$tmp" && grep -q '^rules:' "$tmp" \
+       && sqlite3 :memory: "SELECT length(readfile('${tmp}'));" >/dev/null 2>&1; then
+      ok=1
+      echo "    правила Clash получены: ${cu}"
+      break
+    fi
+  done
+  if [[ "$ok" == "1" ]]; then
+    sub_set_file subClashRules "$tmp"
+    sub_set subClashEnableRouting true
+    echo "    Clash/Mihomo: подписка + автоопределение + правила ($(wc -c <"$tmp") байт) — включено (нужен Mihomo >= 1.19)"
+  else
+    echo "    WARN: правила Clash не получены/не прошли проверку — Clash-подписка включена без маршрутизации."
+  fi
+  rm -f "$tmp"
+
+  # Happ
+  sub_set subEnableRouting true
+  sub_set subRoutingSource custom
+  sub_set subRoutingRules "$happ_url"
+  sub_set subHideSettings true
+  echo "    Happ: маршрутизация (профиль hydraponique), настройки сервера скрыты"
+
+  # Incy
+  sub_set subIncyAppAutoDetect true
+  sub_set subIncyEnableRouting true
+  sub_set subIncyRoutingRules "$incy_url"
+  sub_set subIncyHideUrl 1
+  sub_set subIncyResolveEnable 1
+  echo "    Incy: автоопределение, маршрутизация (профиль hydraponique), URL скрыт, DoH-резолв"
+
+  if [[ -n "${SUB_TITLE:-}" ]]; then
+    sub_set subTitle "$SUB_TITLE"
+    echo "    Название подписки: ${SUB_TITLE}"
+  fi
+  return 0
 }
 
 get_server_ip() {
@@ -947,7 +1078,7 @@ create_hy2_inbound() {
 INSERT INTO "inbounds" ("user_id","up","down","total","remark","enable","expiry_time","listen","port","protocol","settings","stream_settings","tag","sniffing") VALUES (
   '1','0','0','0','Hy2-443','1','0','','${REALITY_XRAY_PORT:-443}','hysteria',
   '{"clients":[{"auth":"${HY2_AUTH}","comment":"","created_at":${NOW_MS_HY2},"email":"${HY2_EMAIL}","enable":true,"expiryTime":0,"limitIp":0,"reset":0,"subId":"${HY2_SUBID}","tgId":0,"totalGB":0,"updated_at":${NOW_MS_HY2}}],"version":2}',
-  '{"network":"hysteria","hysteriaSettings":{"version":2,"udpIdleTimeout":60,"masquerade":{"type":"proxy","dir":"","url":"https://${REALITY_DOMAIN}","rewriteHost":true,"insecure":false,"content":"","headers":{},"statusCode":0}},"security":"tls","tlsSettings":{"serverName":"${REALITY_DOMAIN}","minVersion":"1.2","maxVersion":"1.3","cipherSuites":"","rejectUnknownSni":false,"disableSystemRoot":false,"enableSessionResumption":false,"certificates":[{"ocspStapling":0,"oneTimeLoading":false,"usage":"encipherment","buildChain":false,"certificateFile":"/etc/letsencrypt/live/${REALITY_DOMAIN}/fullchain.pem","keyFile":"/etc/letsencrypt/live/${REALITY_DOMAIN}/privkey.pem"}],"alpn":["h3"],"echServerKeys":"","settings":{"echConfigList":"","pinnedPeerCertSha256":[],"verifyPeerCertByName":""}}}',
+  '{"network":"hysteria","hysteriaSettings":{"version":2,"udpIdleTimeout":60,"masquerade":{"type":"proxy","dir":"","url":"https://${REALITY_DOMAIN}","rewriteHost":true,"insecure":false,"content":"","headers":{},"statusCode":0}},"security":"tls","tlsSettings":{"serverName":"${REALITY_DOMAIN}","minVersion":"1.2","maxVersion":"1.3","cipherSuites":"","rejectUnknownSni":false,"disableSystemRoot":false,"enableSessionResumption":false,"certificates":[{"ocspStapling":0,"oneTimeLoading":false,"usage":"encipherment","buildChain":false,"certificateFile":"/etc/letsencrypt/live/${REALITY_DOMAIN}/fullchain.pem","keyFile":"/etc/letsencrypt/live/${REALITY_DOMAIN}/privkey.pem"}],"alpn":["h3"],"echServerKeys":"","settings":{"fingerprint":"firefox","echConfigList":"","pinnedPeerCertSha256":[],"verifyPeerCertByName":""}}}',
   '${HY2_TAG}',
   '{"enabled":false,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}'
 );
@@ -957,11 +1088,17 @@ SQL
     return 1
   }
 
+  # v0.5.3: адрес для ссылок = основной домен (раньше — вручную в панели)
+  set_inbound_share_addr "${HY2_TAG}"
+
   # client_traffics с email из JSON, иначе "Сбросить трафик" падает (как v0.0.3).
   # Явная проверка: функция вызывается под "||", set -e здесь не работает.
   if ! sqlite3 "$XUIDB" "INSERT INTO client_traffics (inbound_id, email, up, down, total, expiry_time, reset, enable) SELECT id, json_extract(settings, '$.clients[0].email'), 0, 0, 0, 0, 0, 1 FROM inbounds WHERE tag='${HY2_TAG}' ON CONFLICT DO NOTHING;"; then
     echo "WARN: client_traffics для hy2 не создан — кнопка 'Сбросить трафик' в панели будет падать."
   fi
+
+  # v0.5.3: клиент hy2 должен появиться в списке панели
+  sync_panel_clients
 
   if ! systemctl start x-ui; then
     echo "ОШИБКА: systemctl start x-ui не отработал. Смотри: journalctl -u x-ui -n 50"
@@ -1411,6 +1548,16 @@ cmd_install() {
   [[ "${PROTO_CHOICE:-}" == "2" ]] && VLESS_MODE="reality"
   echo "  Режим 443: ${VLESS_MODE}"
 
+  # v0.5.3: рекомендованные настройки подписок (Clash/Happ/Incy) — Enter = да
+  read -rp "Применить рекомендованные настройки подписок (Clash/Mihomo, Happ, Incy)? [Y/n]: " SUB_REC
+  SUB_REC="${SUB_REC:-y}"
+  SUB_TITLE=""
+  if [[ ! "$SUB_REC" =~ ^[Nn]$ ]]; then
+    read -rp "Название подписки в клиентах (Enter — не задавать): " SUB_TITLE
+    SUB_TITLE="${SUB_TITLE//[$'\r\n']/}"
+    SUB_TITLE="${SUB_TITLE:0:60}"
+  fi
+
   SERVER_IP=$(get_server_ip)
   if [[ -z "$SERVER_IP" ]]; then
     echo "Не удалось автоматически определить публичный IP сервера."
@@ -1427,6 +1574,11 @@ cmd_install() {
   echo "SubPath панели:        $PANEL_PATH"
   echo "SubPath подписок:      $SUB_SECRET_PATH"
   echo "Публичный IP:          $SERVER_IP"
+  if [[ "$SUB_REC" =~ ^[Nn]$ ]]; then
+    echo "Настройки подписок:    не применять (останутся значения панели)"
+  else
+    echo "Настройки подписок:    рекомендованные (Clash/Happ/Incy)${SUB_TITLE:+, название: ${SUB_TITLE}}"
+  fi
   echo "Ядро панели:           lucx-ui (AWG 3.1 нативно)"
   echo
   read -rp "Погнали? [y/N]: " CONFIRM
@@ -1744,7 +1896,8 @@ SQL
   # НЕ угаданы. В lucx-ui используется subClashURI (не subJsonURI).
   # v0.2.4: ПЕРЕПОДТВЕРЖДЕНЫ на живой БД v3.8.5-lucx.235 (prod-node-1,
   # 16 сен 2026): subEnable/subListen/subPort/subPath/subURI/subClashURI/
-  # subAwgEnable/subAwgURI все на месте, subClashAutoDetect=true по умолч.
+  # subAwgEnable/subAwgURI все на месте. (v0.5.3: в lucx .302 subClashEnable и
+  # subClashAutoDetect по умолчанию false — включаются в apply_sub_recommended.)
   # Новые ключи 3.8.x (subJsonPath/subClashPath/...) на нашу запись не влияют.
   if [[ -f "$XUIDB" ]]; then
     cp "$XUIDB" "${XUIDB}.backup.$(date +%s)"
@@ -1780,8 +1933,9 @@ SQL
     echo "  subPort      = ${SUB_PORT}"
     echo "  subPath      = ${SUB_SECRET_PATH}"
     echo "  subURI       = ${sub_uri}"
-    echo "  subClashURI  = ${sub_uri}  (panel различает Clash по User-Agent, subClashAutoDetect=true по умолч.)"
+    echo "  subClashURI  = ${sub_uri}  (Clash определяется по User-Agent при subClashAutoDetect=true — см. ниже)"
     echo "  subAwgEnable = true"
+    apply_sub_recommended
   fi
 
   systemctl restart x-ui
@@ -1820,7 +1974,7 @@ EOF
   certbot_ok=1
   for d in "$DOMAIN" "$REALITY_DOMAIN"; do
     if ! certbot certonly --webroot -w "$WEBROOT" -d "$d" \
-      --cert-name "$d" \
+      --cert-name "$d" --keep-until-expiring \
       --non-interactive --agree-tos --register-unsafely-without-email; then
       echo "ОШИБКА: certbot не получил сертификат для $d"
       certbot_ok=0
@@ -3679,7 +3833,7 @@ EOF
           exit 1
         fi
         SETTINGS_JSON='{"clients":[{"id":"'"${CLIENT_UUID}"'","flow":"xtls-rprx-vision","email":"client1","limitIp":0,"totalGB":0,"expiryTime":0,"enable":true,"tgId":0,"subId":"primary","reset":0,"created_at":'"${NOW_MS}"',"updated_at":'"${NOW_MS}"'}],"decryption":"none","fallbacks":[{"dest":"127.0.0.1:8080","xver":0}]}'
-        STREAM_JSON='{"network":"tcp","security":"tls","tlsSettings":{"serverName":"'"${REALITY_DOMAIN}"'","minVersion":"1.2","maxVersion":"1.3","cipherSuites":"","rejectUnknownSni":false,"disableSystemRoot":false,"enableSessionResumption":false,"certificates":[{"ocspStapling":0,"oneTimeLoading":false,"usage":"encipherment","buildChain":false,"certificateFile":"/etc/letsencrypt/live/'"${REALITY_DOMAIN}"'/fullchain.pem","keyFile":"/etc/letsencrypt/live/'"${REALITY_DOMAIN}"'/privkey.pem"}],"alpn":["http/1.1"],"echServerKeys":"","settings":{"echConfigList":"","pinnedPeerCertSha256":[],"verifyPeerCertByName":""}},"tcpSettings":{"acceptProxyProtocol":true,"header":{"type":"none"}}}'
+        STREAM_JSON='{"network":"tcp","security":"tls","tlsSettings":{"serverName":"'"${REALITY_DOMAIN}"'","minVersion":"1.2","maxVersion":"1.3","cipherSuites":"","rejectUnknownSni":false,"disableSystemRoot":false,"enableSessionResumption":false,"certificates":[{"ocspStapling":0,"oneTimeLoading":false,"usage":"encipherment","buildChain":false,"certificateFile":"/etc/letsencrypt/live/'"${REALITY_DOMAIN}"'/fullchain.pem","keyFile":"/etc/letsencrypt/live/'"${REALITY_DOMAIN}"'/privkey.pem"}],"alpn":["http/1.1"],"echServerKeys":"","settings":{"fingerprint":"firefox","echConfigList":"","pinnedPeerCertSha256":[],"verifyPeerCertByName":""}},"tcpSettings":{"acceptProxyProtocol":true,"header":{"type":"none"}}}'
       fi
 
       # note: не отдельным `if [[ $? -ne 0 ]]` после — под `set -e` такая
@@ -3693,8 +3847,14 @@ EOF
         exit 1
       }
 
+      # v0.5.3: адрес для ссылок = основной домен (раньше — вручную в панели)
+      set_inbound_share_addr "${REALITY_TAG}"
+
       # Создаём запись в client_traffics с email из JSON, иначе "Сбросить трафик" падает с nil pointer
       sqlite3 "$XUIDB" "INSERT INTO client_traffics (inbound_id, email, up, down, total, expiry_time, reset, enable) SELECT id, json_extract(settings, '$.clients[0].email'), 0, 0, 0, 0, 0, 1 FROM inbounds WHERE remark='${REALITY_REMARK}' ON CONFLICT DO NOTHING;"
+
+      # v0.5.3: клиент должен появиться в списке панели (иначе страница «Клиенты» пуста)
+      sync_panel_clients
 
       systemctl start x-ui
       sleep 2
@@ -3824,34 +3984,34 @@ EOF
   echo "Креды сохранены в: ${CREDS_FILE}"
   echo
 
-  echo "ЧТО НУЖНО СДЕЛАТЬ РУКАМИ В ПАНЕЛИ (1 раз):"
+  echo "УЖЕ СДЕЛАНО УСТАНОВЩИКОМ (v0.5.3):"
+  echo "  - у инбаундов VLESS и Hysteria 2 адрес для ссылок = ${REALITY_DOMAIN} (Пользовательская);"
+  echo "  - в режиме TLS у них стоит uTLS firefox;"
+  if [[ ! "${SUB_REC:-y}" =~ ^[Nn]$ ]]; then
+    echo "  - рекомендованные настройки подписок (Clash/Mihomo, Happ, Incy) — см. блок [5a] выше."
+  fi
+  echo "  Подписки (subURI/subClashURI/subAwgURI) настроены автоматически."
+  echo
+  echo "ЧТО ОСТАЛОСЬ СДЕЛАТЬ РУКАМИ В ПАНЕЛИ:"
   echo "  1. Открой https://${DOMAIN}${PANEL_PATH}"
-  echo "  2. Войди в Inbounds -> '${REALITY_REMARK}' -> вкладка 'Основное'"
-  echo "  3. Найди 'Стратегия адреса для ссылок' -> выбери 'Пользовательская'"
-  echo "  4. Впиши адрес: ${REALITY_DOMAIN}"
-  echo "  5. Сохрани (Save)"
-  echo "  6. AmneziaWG: страница AmneziaWG -> Enable -> порт ${AWG_PORT} (udp) -> Save"
-  echo "     (443/udp занят Hysteria 2, AWG живёт на своём порте)"
-  echo "  7. Если планируешь Telegram WEB proxy (tproxy):"
+  echo "  2. AmneziaWG: страница AmneziaWG -> Enable -> порт ${AWG_PORT} (udp) -> Save"
+  echo "     (443/udp занят Hysteria 2, AWG живёт на своём порте)."
+  echo "     В созданном AWG-инбаунде (Inbounds -> 'Основное') выбери"
+  echo "     'Стратегия адреса для ссылок' = 'Пользовательская' и впиши адрес: ${REALITY_DOMAIN}"
+  echo "  3. Если планируешь Telegram WEB proxy (tproxy):"
   echo "     в форме инбаунда включи 'externalTLS', иначе Caddy/mtproxy"
   echo "     попытаются занять порт 443 и конфликтуют с nginx."
-  echo "  8. НЕ создавай инбаунд 'Cover site' (новое в lucx-ui .215+):"
+  echo "  4. НЕ создавай инбаунд 'Cover site' (новое в lucx-ui .215+):"
   echo "     он жёстко занимает :80 и :443 на хосте — конфликт с nginx"
   echo "     (webroot certbot на 80, SNI-роутер на 443). Сам разработчик"
   echo "     помечает его как несовместимый с REALITY/AWG — твоим стеком."
-  echo "  9. НЕ нажимай 'Apply' на странице Masking / 'SNI gateway'"
+  echo "  5. НЕ нажимай 'Apply' на странице Masking / 'SNI gateway'"
   echo "     (новое в lucx-ui v3.8.5-lucx.245+): она поднимает СВОЙ"
   echo "     bundled SNI-шлюз (nginx в .245, Caddy L4 в .246+) на"
   echo "     публичном :443 и перехватывает роутинг, ломая нашу схему"
   echo "     (decoy-сайты, location подписок, certbot webroot)."
   echo "     Этот сервер уже имеет SNI-роутер от скрипта — gateway"
   echo "     не нужен."
-  echo
-  echo " ПОЧЕМУ ШАГ 3-4 ВАЖЕН:"
-  echo "   Это отдельная настройка от подписок (влияет на прямую vless-ссылку"
-  echo "   конкретного клиента). Точное имя колонки в БД не подтверждено,"
-  echo "   поэтому я не трогаю её через SQL — только через UI."
-  echo "   Подписки (subURI/subClashURI/subAwgURI) уже настроены автоматически."
   echo
   echo " ПРИ СМЕНЕ IP У ПРОВАЙДЕРА (блокировка и т.п.):"
   echo "   1. Обнови A-записи обоих доменов на новый IP"

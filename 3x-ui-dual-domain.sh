@@ -802,6 +802,9 @@
 #   (4) после создания инбаундов install вызывает `x-ui migrate` (при остановленном x-ui):
 #       клиенты, записанные в settings инбаунда, попадают в таблицу панели — раньше страница
 #       «Клиенты» оставалась пустой (найдено на первой живой установке 0.5.3, lucx .302).
+#   (5) certbot вызывается с --keep-until-expiring: если сертификат домена уже лежит в
+#       /etc/letsencrypt (например, восстановлен из бэкапа при переустановке сервера) и ещё
+#       не пора обновлять, он сохраняется — новый выпуск не тратит лимит Let's Encrypt.
 #   Только для новой установки; существующие ноды не меняются. AWG-инбаунд по-прежнему
 #   создаётся в панели вручную. Исправлен текст про subClashAutoDetect (в lucx .302 по умолчанию false).
 VERSION="0.5.3"
@@ -1971,7 +1974,7 @@ EOF
   certbot_ok=1
   for d in "$DOMAIN" "$REALITY_DOMAIN"; do
     if ! certbot certonly --webroot -w "$WEBROOT" -d "$d" \
-      --cert-name "$d" \
+      --cert-name "$d" --keep-until-expiring \
       --non-interactive --agree-tos --register-unsafely-without-email; then
       echo "ОШИБКА: certbot не получил сертификат для $d"
       certbot_ok=0

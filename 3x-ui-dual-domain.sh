@@ -797,7 +797,7 @@
 #   (2) TLS-режим VLESS и Hy2: uTLS fingerprint=firefox (tlsSettings.settings);
 #   (3) рекомендованные настройки подписок (вопрос при установке, Enter = да):
 #       Clash/Mihomo вкл + автоопределение + маршрутизация и правила clash-universal.yaml
-#       (скачиваются из репозитория по тегу версии), Happ и Incy: маршрутизация по профилям
+#       (скачиваются из репозитория: тег версии, затем main, затем dev-ветка), Happ и Incy: маршрутизация по профилям
 #       hydraponique, скрытие настроек/URL, DoH-резолв Incy; название подписки (по желанию).
 #   Только для новой установки; существующие ноды не меняются. AWG-инбаунд по-прежнему
 #   создаётся в панели вручную. Исправлен текст про subClashAutoDetect (в lucx .302 по умолчанию false).
@@ -909,20 +909,26 @@ apply_sub_recommended() {
   echo "  Рекомендованные настройки подписок:"
   local happ_url="${SUB_HAPP_ROUTING_URL:-https://raw.githubusercontent.com/hydraponique/roscomvpn-routing/refs/heads/main/HAPP/DEFAULT.JSON}"
   local incy_url="${SUB_INCY_ROUTING_URL:-https://raw.githubusercontent.com/hydraponique/roscomvpn-routing/refs/heads/main/INCY/DEFAULT.JSON}"
-  local clash_url="${CLASH_RULES_URL:-https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/v${VERSION}/clash-universal.yaml}"
-  local clash_fb="https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/clash-universal.yaml"
-  local tmp ok=0
+  # Источники правил по порядку: свой адрес (CLASH_RULES_URL) | тег версии | main | dev-ветка версии
+  local raw_base="https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain"
+  local clash_urls=()
+  [[ -n "${CLASH_RULES_URL:-}" ]] && clash_urls+=("$CLASH_RULES_URL")
+  clash_urls+=("${raw_base}/v${VERSION}/clash-universal.yaml" "${raw_base}/main/clash-universal.yaml" "${raw_base}/v${VERSION}-dev/clash-universal.yaml")
+  local tmp ok=0 cu
   tmp=$(mktemp)
 
   # Clash/Mihomo: подписка + автоопределение по User-Agent; маршрутизация только если правила получены
   sub_set subClashEnable true
   sub_set subClashAutoDetect true
-  if curl -fsSL --max-time 30 "$clash_url" -o "$tmp" 2>/dev/null || curl -fsSL --max-time 30 "$clash_fb" -o "$tmp" 2>/dev/null; then
-    if [[ "$(wc -c <"$tmp")" -gt 1000 ]] && grep -q '^proxy-groups:' "$tmp" && grep -q '^rules:' "$tmp" \
+  for cu in "${clash_urls[@]}"; do
+    if curl -fsSL --max-time 30 "$cu" -o "$tmp" 2>/dev/null \
+       && [[ "$(wc -c <"$tmp")" -gt 1000 ]] && grep -q '^proxy-groups:' "$tmp" && grep -q '^rules:' "$tmp" \
        && sqlite3 :memory: "SELECT length(readfile('${tmp}'));" >/dev/null 2>&1; then
       ok=1
+      echo "    правила Clash получены: ${cu}"
+      break
     fi
-  fi
+  done
   if [[ "$ok" == "1" ]]; then
     sub_set_file subClashRules "$tmp"
     sub_set subClashEnableRouting true

@@ -799,6 +799,9 @@
 #       Clash/Mihomo вкл + автоопределение + маршрутизация и правила clash-universal.yaml
 #       (скачиваются из репозитория: тег версии, затем main, затем dev-ветка), Happ и Incy: маршрутизация по профилям
 #       hydraponique, скрытие настроек/URL, DoH-резолв Incy; название подписки (по желанию).
+#   (4) после создания инбаундов install вызывает `x-ui migrate` (при остановленном x-ui):
+#       клиенты, записанные в settings инбаунда, попадают в таблицу панели — раньше страница
+#       «Клиенты» оставалась пустой (найдено на первой живой установке 0.5.3, lucx .302).
 #   Только для новой установки; существующие ноды не меняются. AWG-инбаунд по-прежнему
 #   создаётся в панели вручную. Исправлен текст про subClashAutoDetect (в lucx .302 по умолчанию false).
 VERSION="0.5.3"
@@ -882,6 +885,26 @@ set_inbound_share_addr() { # tag — «Пользовательский адре
   else
     echo "  WARN: не удалось записать адрес для ссылок (tag ${tag}) — задай его в панели вручную."
   fi
+  return 0
+}
+
+sync_panel_clients() { # v0.5.3: клиенты из settings инбаундов -> таблица clients панели
+  # Панель (lucx .29x+) показывает клиентов из отдельной таблицы; клиенты, записанные
+  # в settings инбаунда напрямую (как делает install), попадают туда только при
+  # `x-ui migrate`. Вызывать при ОСТАНОВЛЕННОМ x-ui, до systemctl start.
+  local bin="/usr/local/x-ui/x-ui" out
+  if [[ ! -x "$bin" ]]; then
+    echo "  WARN: бинарник x-ui не найден — клиенты не появятся в списке панели. Вручную: systemctl stop x-ui && /usr/local/x-ui/x-ui migrate && systemctl start x-ui"
+    return 0
+  fi
+  out=$(mktemp)
+  if timeout 120 "$bin" migrate >"$out" 2>&1; then
+    echo "  Клиенты импортированы в таблицу панели (x-ui migrate)"
+  else
+    echo "  WARN: x-ui migrate завершился с ошибкой — клиентов может не быть в списке панели:"
+    tail -n 5 "$out" | sed 's/^/    /'
+  fi
+  rm -f "$out"
   return 0
 }
 
@@ -1070,6 +1093,9 @@ SQL
   if ! sqlite3 "$XUIDB" "INSERT INTO client_traffics (inbound_id, email, up, down, total, expiry_time, reset, enable) SELECT id, json_extract(settings, '$.clients[0].email'), 0, 0, 0, 0, 0, 1 FROM inbounds WHERE tag='${HY2_TAG}' ON CONFLICT DO NOTHING;"; then
     echo "WARN: client_traffics для hy2 не создан — кнопка 'Сбросить трафик' в панели будет падать."
   fi
+
+  # v0.5.3: клиент hy2 должен появиться в списке панели
+  sync_panel_clients
 
   if ! systemctl start x-ui; then
     echo "ОШИБКА: systemctl start x-ui не отработал. Смотри: journalctl -u x-ui -n 50"
@@ -3823,6 +3849,9 @@ EOF
 
       # Создаём запись в client_traffics с email из JSON, иначе "Сбросить трафик" падает с nil pointer
       sqlite3 "$XUIDB" "INSERT INTO client_traffics (inbound_id, email, up, down, total, expiry_time, reset, enable) SELECT id, json_extract(settings, '$.clients[0].email'), 0, 0, 0, 0, 0, 1 FROM inbounds WHERE remark='${REALITY_REMARK}' ON CONFLICT DO NOTHING;"
+
+      # v0.5.3: клиент должен появиться в списке панели (иначе страница «Клиенты» пуста)
+      sync_panel_clients
 
       systemctl start x-ui
       sleep 2

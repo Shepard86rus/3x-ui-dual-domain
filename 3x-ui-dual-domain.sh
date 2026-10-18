@@ -807,7 +807,21 @@
 #       не пора обновлять, он сохраняется — новый выпуск не тратит лимит Let's Encrypt.
 #   Только для новой установки; существующие ноды не меняются. AWG-инбаунд по-прежнему
 #   создаётся в панели вручную. Исправлен текст про subClashAutoDetect (в lucx .302 по умолчанию false).
-VERSION="0.5.3"
+# v0.5.4 (2026-10-18) — h2 и «Reality перед TLS» на одном домене и порту 443:
+#   (1) h2: TLS-инбаунд получает tlsSettings.alpn [h2,http/1.1] и ALPN-fallback h2 -> h2c-слушатель
+#       nginx 127.0.0.1:8081 (decoy-h2c.conf); http/1.1 по-прежнему -> :8080. Нужно, чтобы браузерная
+#       проба видела h2, как у обычного сайта (Mihomo/fp firefox и так предлагает h2,http/1.1).
+#   (2) Reality перед TLS (без третьего домена и серта): nginx reality_backend -> 127.0.0.1:8446
+#       (Reality-инбаунд in-8446-tcp, target=127.0.0.1:443, xver=1, serverNames=[основной домен],
+#       acceptProxyProtocol, External Proxy = домен:443); всё, что не Reality-клиент (браузеры, сканеры,
+#       VLESS+TLS клиенты), Reality пересылает на неизменный TLS-инбаунд 127.0.0.1:443. Схема проверена
+#       живьём на 7 нодах. ЗАВИСИМОСТЬ ДВУСТОРОННЯЯ: упал TLS-инбаунд — Reality тоже не работает;
+#       упал Reality — TLS-клиенты теряют вход. Не отключать/не удалять инбаунды по отдельности.
+#   (3) install БЕЗ вопроса о режиме 443: всегда TLS + h2 + Reality перед TLS (отключить: env H2=0, REALITY_FRONT=0);
+#       новые команды для существующих серверов: add-h2, add-reality-front (бэкапы, самотест через
+#       публичный IP, автооткат при провале); healthcheck: блок [7a], reality_backend -> 8446 больше не WARN;
+#       add-reality (смена режима 443) блокируется, пока включён Reality перед TLS.
+VERSION="0.5.4"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
 # С v3.7.0-lucx.203 install-awg-module.sh качает исходники tarball'ом
@@ -1259,6 +1273,358 @@ EOF
   systemctl reload nginx
 }
 
+# ================== v0.5.4: h2 и «Reality перед TLS» (общие функции) ==================
+# Схема (проверена живьём на 7 нодах 2026-10-18; подробности — changelog 0.5.4):
+#   nginx stream: reality_backend -> 127.0.0.1:8446 = Reality-инбаунд (target=127.0.0.1:443,
+#   xver=1). Клиент Reality (ключ/shortId верны) обслуживается Reality-инбаундом; всё остальное
+#   (браузеры, сканеры, обычные VLESS+TLS клиенты) Reality пересылает на TLS-инбаунд
+#   127.0.0.1:443, а он отдаёт decoy (fallback :8080 http/1.1; по ALPN h2 -> :8081 h2c).
+#   ВАЖНО: зависимость двусторонняя (проверено): упал TLS-инбаунд — Reality тоже не
+#   работает (он при каждом соединении сначала идёт на target); упал Reality-инбаунд —
+#   TLS-клиенты теряют вход (nginx шлёт домен только в 8446).
+REALITY_FRONT_PORT=8446
+REALITY_FRONT_TAG="in-8446-tcp"
+H2C_PORT=8081
+TLS_ALPN_JSON_H2='["h2","http/1.1"]'
+TLS_ALPN_JSON_H1='["http/1.1"]'
+TLS_FB_JSON_H2='[{"dest":"127.0.0.1:8080","xver":0},{"alpn":"h2","dest":"127.0.0.1:8081","xver":0}]'
+TLS_FB_JSON_H1='[{"dest":"127.0.0.1:8080","xver":0}]'
+
+# h2c-фасад decoy №2 (:8081, loopback) — цель alpn-fallback'а TLS-инбаунда (по докам Xray
+# h2c-слушатель nginx не обслуживает http/1.1, поэтому http/1.1 остаётся на :8080).
+ensure_decoy2_h2c_vhost() {
+  if grep -rqF "listen 127.0.0.1:${H2C_PORT}" /etc/nginx/sites-enabled/ 2>/dev/null; then
+    return 0
+  fi
+  cat > /etc/nginx/sites-available/decoy-h2c.conf <<EOF
+server {
+    listen 127.0.0.1:${H2C_PORT} http2;
+    server_name ${REALITY_DOMAIN};
+    server_tokens off;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    root /var/www/decoy-reality;
+    index index.html;
+    error_page 404 /404.html;
+    location / { try_files \$uri \$uri/ =404; }
+}
+EOF
+  ln -sf /etc/nginx/sites-available/decoy-h2c.conf /etc/nginx/sites-enabled/decoy-h2c.conf
+  if ! nginx -t >/dev/null 2>&1; then
+    echo "ОШИБКА: nginx -t не прошёл после создания decoy-h2c.conf"
+    rm -f /etc/nginx/sites-enabled/decoy-h2c.conf /etc/nginx/sites-available/decoy-h2c.conf
+    return 1
+  fi
+  systemctl reload nginx
+}
+
+# true, если nginx stream направляет reality_backend на Reality-инбаунд перед TLS (8446)
+reality_front_active() {
+  local p
+  p=$(awk '/upstream reality_backend/,/}/' /etc/nginx/stream-sni-router.conf 2>/dev/null | grep -oP "server 127\.0\.0\.1:\K[0-9]+" | head -n1 || true)
+  [[ "$p" == "$REALITY_FRONT_PORT" ]]
+}
+
+# Ждёт, пока на 127.0.0.1:$1 слушает xray (ретраи на медленный старт ядра, приём v0.3.7)
+wait_xray_listener() { # port
+  local port="$1" pid="" i
+  for i in 1 2 3 4 5; do
+    pid=$(ss -tlnp 2>/dev/null | grep -E "127\.0\.0\.1:${port}\b" | grep -oP 'pid=\K[0-9]+' | head -n1 || true)
+    if [[ -n "$pid" ]] && tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -qi xray; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+# Создаёт Reality-инбаунд перед TLS (127.0.0.1:8446). Нужны: REALITY_DOMAIN, XUIDB, TLS-инбаунд
+# на 127.0.0.1:443 с acceptProxyProtocol. Сам останавливает/запускает x-ui и делает бэкап БД;
+# при неудаче возвращает БД и поднимает x-ui. Выставляет FRONT_UUID/FRONT_PBK/FRONT_SID/FRONT_EXISTS.
+create_reality_front_inbound() {
+  local xray_bin keys priv pub sid uuid subid now set_json str_json bak
+  FRONT_EXISTS=0
+  xray_bin=$(find /usr/local/x-ui -maxdepth 3 -name "xray-linux-*" -type f 2>/dev/null | head -n1 || true)
+  if [[ -z "$xray_bin" || ! -f "$XUIDB" ]]; then
+    echo "  ОШИБКА: xray или x-ui.db не найдены — Reality-инбаунд перед TLS не создан."
+    return 1
+  fi
+  if sqlite3 "$XUIDB" "SELECT 1 FROM inbounds WHERE protocol='vless' AND port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null | grep -q 1; then
+    echo "  vless-инбаунд на 127.0.0.1:${REALITY_FRONT_PORT} уже существует — переиспользую."
+    FRONT_EXISTS=1
+    return 0
+  fi
+  if ss -ltn 2>/dev/null | grep -qE "[:.]${REALITY_FRONT_PORT} "; then
+    echo "  ОШИБКА: порт ${REALITY_FRONT_PORT} занят — Reality-инбаунд перед TLS не создан."
+    return 1
+  fi
+  keys=$("$xray_bin" x25519 2>/dev/null || true)
+  priv=$(echo "$keys" | awk -F': *' 'tolower($1) ~ /^private ?key$/ {print $2; exit}')
+  pub=$(echo "$keys" | awk -F': *' 'tolower($1) ~ /public ?key|^password/ {print $2; exit}')
+  if [[ -z "$priv" || -z "$pub" ]]; then
+    echo "  ОШИБКА: не удалось сгенерировать Reality-ключи."
+    return 1
+  fi
+  sid=$(openssl rand -hex 8)
+  uuid=$(cat /proc/sys/kernel/random/uuid)
+  subid=$(openssl rand -hex 8)
+  now=$(( $(date +%s) * 1000 ))
+  set_json='{"clients":[{"id":"'"${uuid}"'","flow":"xtls-rprx-vision","email":"client1-reality","limitIp":0,"totalGB":0,"expiryTime":0,"enable":true,"tgId":0,"subId":"'"${subid}"'","reset":0,"created_at":'"${now}"',"updated_at":'"${now}"'}],"decryption":"none","fallbacks":[]}'
+  str_json='{"network":"tcp","security":"reality","externalProxy":[{"forceTls":"same","dest":"'"${REALITY_DOMAIN}"'","port":443,"remark":""}],"realitySettings":{"show":false,"xver":1,"target":"127.0.0.1:443","serverNames":["'"${REALITY_DOMAIN}"'"],"privateKey":"'"${priv}"'","minClientVer":"","maxClientVer":"","maxTimediff":0,"shortIds":["'"${sid}"'"],"settings":{"publicKey":"'"${pub}"'","fingerprint":"firefox","serverName":"","spiderX":"/","mldsa65Verify":""}},"tcpSettings":{"acceptProxyProtocol":true,"header":{"type":"none"}}}'
+  systemctl stop x-ui
+  sleep 1
+  bak="${XUIDB}.backup.$(date +%s)"
+  cp -a "$XUIDB" "$bak"
+  if ! sqlite3 "$XUIDB" "INSERT INTO inbounds (\"user_id\",\"up\",\"down\",\"total\",\"remark\",\"enable\",\"expiry_time\",\"listen\",\"port\",\"protocol\",\"settings\",\"stream_settings\",\"tag\",\"sniffing\") VALUES ('1','0','0','0','reality-front','1','0','127.0.0.1','${REALITY_FRONT_PORT}','vless','${set_json}','${str_json}','${REALITY_FRONT_TAG}','{\"enabled\":false,\"destOverride\":[\"http\",\"tls\",\"quic\",\"fakedns\"],\"metadataOnly\":false,\"routeOnly\":false}');"; then
+    echo "  ОШИБКА: SQLite INSERT Reality-инбаунда не удался. Бэкап: ${bak}"
+    systemctl start x-ui
+    return 1
+  fi
+  set_inbound_share_addr "${REALITY_FRONT_TAG}"
+  sqlite3 "$XUIDB" "INSERT INTO client_traffics (inbound_id, email, up, down, total, expiry_time, reset, enable) SELECT id, 'client1-reality', 0, 0, 0, 0, 0, 1 FROM inbounds WHERE tag='${REALITY_FRONT_TAG}' ON CONFLICT DO NOTHING;" || true
+  sync_panel_clients
+  systemctl start x-ui
+  sleep 3
+  if ! systemctl is-active --quiet x-ui || ! wait_xray_listener "${REALITY_FRONT_PORT}"; then
+    echo "  ОШИБКА: Reality-инбаунд не поднялся (x-ui не active или xray не слушает 127.0.0.1:${REALITY_FRONT_PORT}) — возвращаю БД из ${bak}"
+    systemctl stop x-ui
+    sleep 1
+    cp -a "$bak" "$XUIDB"
+    systemctl start x-ui
+    return 1
+  fi
+  FRONT_UUID="$uuid"
+  FRONT_PBK="$pub"
+  FRONT_SID="$sid"
+  echo "  Reality-инбаунд перед TLS создан: 127.0.0.1:${REALITY_FRONT_PORT}, клиент client1-reality, ссылки на порт 443 (External Proxy)."
+  return 0
+}
+
+# Временный xray-клиент -> публичный IP:443; печатает выходной IP (пусто = не сработало).
+# $1 = JSON streamSettings, $2 = uuid, $3 = flow, $4 = адрес сервера, $5 = локальный socks-порт
+xray_probe_client() {
+  local stream="$1" uuid="$2" flow="$3" addr="$4" port="$5" xray_bin w p r="" url
+  xray_bin=$(find /usr/local/x-ui -maxdepth 3 -name "xray-linux-*" -type f 2>/dev/null | head -n1 || true)
+  [[ -n "$xray_bin" ]] || return 0
+  w=$(mktemp -d /root/lucx-probe.XXXXXX)
+  cat > "$w/c.json" <<EOF
+{"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":${port},"protocol":"socks","settings":{"udp":false}}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"${addr}","port":443,"users":[{"id":"${uuid}","encryption":"none","flow":"${flow}"}]}]},"streamSettings":${stream}}]}
+EOF
+  "$xray_bin" run -c "$w/c.json" >"$w/c.log" 2>&1 &
+  p=$!
+  sleep 2
+  for url in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+    r=$(timeout 15 curl -s --socks5-hostname "127.0.0.1:${port}" "$url" 2>/dev/null | tr -d '[:space:]' || true)
+    [[ -n "$r" ]] && break
+  done
+  kill "$p" 2>/dev/null || true
+  wait "$p" 2>/dev/null || true
+  rm -rf "$w"
+  echo "$r"
+}
+
+# Самотест после изменений: сайт по https (200), ALPN, клиенты TLS (и Reality, если передан).
+# $1=h2check(0|1) $2=front uuid (необяз.) $3=pbk $4=sid. Возврат 0 = всё прошло.
+selftest_443() {
+  local h2check="$1" fuuid="${2:-}" fpbk="${3:-}" fsid="${4:-}"
+  local ok=0 site h2 h1 a2 a1 tu tf ttip rrip
+  site=$(curl -sk -m 10 -o /dev/null -w "%{http_code}" --resolve "${REALITY_DOMAIN}:443:${SERVER_IP}" "https://${REALITY_DOMAIN}/" 2>/dev/null || echo 000)
+  echo "  сайт https://${REALITY_DOMAIN}/ -> ${site}"
+  [[ "$site" == "200" ]] || ok=1
+  if [[ "$h2check" == "1" ]]; then
+    a2=$(echo | timeout 8 openssl s_client -connect "${SERVER_IP}:443" -servername "${REALITY_DOMAIN}" -alpn h2 2>/dev/null | grep -a -o 'ALPN protocol: [a-z0-9/.]*' || true)
+    a1=$(echo | timeout 8 openssl s_client -connect "${SERVER_IP}:443" -servername "${REALITY_DOMAIN}" -alpn http/1.1 2>/dev/null | grep -a -o 'ALPN protocol: [a-z0-9/.]*' || true)
+    h2=$(curl -sk -m 10 --http2 -o /dev/null -w "%{http_code}/%{http_version}" --resolve "${REALITY_DOMAIN}:443:${SERVER_IP}" "https://${REALITY_DOMAIN}/" 2>/dev/null || echo 000/0)
+    h1=$(curl -sk -m 10 --http1.1 -o /dev/null -w "%{http_code}/%{http_version}" --resolve "${REALITY_DOMAIN}:443:${SERVER_IP}" "https://${REALITY_DOMAIN}/" 2>/dev/null || echo 000/0)
+    echo "  ALPN: просим h2 -> [${a2:-нет}], просим http/1.1 -> [${a1:-нет}]; сайт по h2 -> ${h2}, по http/1.1 -> ${h1}"
+    [[ "$a2" == *h2 && "$a1" == *http/1.1 && "$h2" == "200/2" && "$h1" == "200/1.1" ]] || ok=1
+  fi
+  local now_ms2 trow
+  now_ms2=$(( $(date +%s) * 1000 ))
+  # первый ВКЛЮЧЁННЫЙ клиент с неистёкшим сроком (clients[0] мог истечь/быть выключен)
+  trow=$(sqlite3 "$XUIDB" "SELECT json_extract(c.value,'\$.id')||'|'||COALESCE(json_extract(c.value,'\$.flow'),'') FROM (SELECT settings FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1) i, json_each(i.settings,'\$.clients') c WHERE COALESCE(json_extract(c.value,'\$.enable'),1) IN (1,'true') AND (COALESCE(json_extract(c.value,'\$.expiryTime'),0)=0 OR json_extract(c.value,'\$.expiryTime')>${now_ms2}) LIMIT 1;" 2>/dev/null || true)
+  tu="${trow%%|*}"
+  tf="${trow#*|}"
+  [[ -n "$trow" ]] || tu=""
+  if [[ -n "$tu" ]]; then
+    ttip=$(xray_probe_client '{"network":"tcp","security":"tls","tlsSettings":{"serverName":"'"${REALITY_DOMAIN}"'","fingerprint":"firefox"}}' "$tu" "$tf" "$SERVER_IP" 10861)
+    echo "  TLS-клиент (первый клиент TLS-инбаунда) -> выходной IP '${ttip:-нет}'"
+    [[ -n "$ttip" ]] || ok=1
+  fi
+  if [[ -n "$fuuid" ]]; then
+    rrip=$(xray_probe_client '{"network":"tcp","security":"reality","realitySettings":{"serverName":"'"${REALITY_DOMAIN}"'","fingerprint":"firefox","publicKey":"'"${fpbk}"'","shortId":"'"${fsid}"'","spiderX":"/"}}' "$fuuid" "xtls-rprx-vision" "$SERVER_IP" 10862)
+    echo "  Reality-клиент (client1-reality) -> выходной IP '${rrip:-нет}'"
+    [[ -n "$rrip" ]] || ok=1
+  fi
+  return $ok
+}
+
+# ================== РЕЖИМ: ADD-REALITY-FRONT (Reality перед TLS на существующем сервере) ==================
+# v0.5.4: ретрофит схемы «Reality перед TLS». Бэкапы БД и nginx-конфига; при провале самотеста
+# nginx-конфиг возвращается автоматически (созданный инбаунд на 127.0.0.1:8446 остаётся, он
+# слушает только loopback и безвреден). Клиенты и подписки TLS-инбаунда не меняются.
+cmd_add_reality_front() {
+  if [[ $EUID -ne 0 ]]; then
+    echo "Запусти от root: sudo bash $0 add-reality-front"
+    exit 1
+  fi
+  REALITY_XRAY_PORT=443
+  read_domains
+  if [[ -z "${DOMAIN:-}" || -z "${REALITY_DOMAIN:-}" ]]; then
+    echo "ОШИБКА: не удалось определить домены из ${CREDS_FILE}."
+    exit 1
+  fi
+  local stream_conf="/etc/nginx/stream-sni-router.conf" stamp sec pp
+  SERVER_IP=$(get_server_ip)
+  if [[ ! -f "$XUIDB" || ! -f "$stream_conf" ]]; then
+    echo "ОШИБКА: ${XUIDB} или ${stream_conf} не найдены — схема скрипта не развёрнута."
+    exit 1
+  fi
+  if reality_front_active; then
+    echo "Reality перед TLS уже включён (reality_backend -> 127.0.0.1:${REALITY_FRONT_PORT}) — ничего не делаю."
+    exit 0
+  fi
+  if ! grep -q "upstream reality_backend { server 127.0.0.1:443; }" "$stream_conf"; then
+    echo "ОШИБКА: upstream reality_backend не в штатном виде (127.0.0.1:443) — ручная правка? Остановился."
+    exit 1
+  fi
+  sec=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.security') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  pp=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.tcpSettings.acceptProxyProtocol') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  if [[ "$sec" != "tls" ]]; then
+    echo "ОШИБКА: инбаунд 127.0.0.1:443 в режиме '${sec:-?}', нужен tls (сначала: sudo bash $0 add-vls)."
+    exit 1
+  fi
+  if [[ "$pp" != "1" && "$pp" != "true" ]]; then
+    echo "ОШИБКА: у TLS-инбаунда нет acceptProxyProtocol — схема не получится."
+    exit 1
+  fi
+  if [[ ! -f "/etc/letsencrypt/live/${REALITY_DOMAIN}/fullchain.pem" ]]; then
+    echo "ОШИБКА: серт ${REALITY_DOMAIN} не найден."
+    exit 1
+  fi
+  if ! systemctl is-active --quiet x-ui || ! systemctl is-active --quiet nginx; then
+    echo "ОШИБКА: x-ui или nginx не active — сначала почини (healthcheck)."
+    exit 1
+  fi
+  echo "Ретрофит «Reality перед TLS» на ${REALITY_DOMAIN}. x-ui будет перезапущен на несколько секунд."
+  stamp=$(date +%Y%m%d-%H%M%S)
+  cp -a "$stream_conf" "/root/stream-sni-router.conf.pre-reality-front-${stamp}"
+  echo "Бэкап nginx-конфига: /root/stream-sni-router.conf.pre-reality-front-${stamp}"
+  create_reality_front_inbound || exit 1
+  sed -i "s#upstream reality_backend { server 127.0.0.1:443; }#upstream reality_backend { server 127.0.0.1:${REALITY_FRONT_PORT}; }#" "$stream_conf"
+  if ! nginx -t >/dev/null 2>&1; then
+    cp -a "/root/stream-sni-router.conf.pre-reality-front-${stamp}" "$stream_conf"
+    echo "ОШИБКА: nginx -t не прошёл — nginx-конфиг возвращён."
+    exit 1
+  fi
+  systemctl reload nginx
+  sleep 1
+  echo "Самотест через публичный IP ${SERVER_IP}:"
+  if selftest_443 0 "${FRONT_UUID:-}" "${FRONT_PBK:-}" "${FRONT_SID:-}"; then
+    echo "$VERSION" > /root/.lucx-script-version
+    if [[ -n "${FRONT_UUID:-}" && -f "$CREDS_FILE" ]]; then
+      {
+        echo "Reality-front UUID: ${FRONT_UUID}"
+        echo "Reality-front Public Key: ${FRONT_PBK}"
+        echo "Reality-front Short ID: ${FRONT_SID}"
+        echo "Reality-front Link: vless://${FRONT_UUID}@${REALITY_DOMAIN}:443?type=tcp&security=reality&pbk=${FRONT_PBK}&fp=firefox&sni=${REALITY_DOMAIN}&sid=${FRONT_SID}&flow=xtls-rprx-vision&spx=%2F#client1-reality"
+      } >> "$CREDS_FILE"
+    fi
+    echo
+    echo "================= ГОТОВО ================="
+    echo "Reality перед TLS включён: nginx -> 127.0.0.1:${REALITY_FRONT_PORT} (Reality) -> target 127.0.0.1:443 (TLS)."
+    [[ -n "${FRONT_UUID:-}" ]] && echo "Ссылка Reality: vless://${FRONT_UUID}@${REALITY_DOMAIN}:443?type=tcp&security=reality&pbk=${FRONT_PBK}&fp=firefox&sni=${REALITY_DOMAIN}&sid=${FRONT_SID}&flow=xtls-rprx-vision&spx=%2F#client1-reality"
+    echo "TLS-клиенты и подписки не менялись. Не отключай и не удаляй TLS-инбаунд (127.0.0.1:443) и Reality (127.0.0.1:${REALITY_FRONT_PORT}) по отдельности — они зависят друг от друга."
+    echo "Откат: cp /root/stream-sni-router.conf.pre-reality-front-${stamp} ${stream_conf} && nginx -t && systemctl reload nginx"
+    echo "Проверка: bash $0 healthcheck (блок [7a])."
+    echo "=========================================="
+  else
+    cp -a "/root/stream-sni-router.conf.pre-reality-front-${stamp}" "$stream_conf"
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx
+    echo "ОШИБКА: самотест не прошёл — nginx-конфиг возвращён из бэкапа (схема как была)."
+    echo "Созданный Reality-инбаунд на 127.0.0.1:${REALITY_FRONT_PORT} оставлен (loopback, безвреден); смотри: journalctl -u x-ui -n 50"
+    exit 1
+  fi
+}
+
+# ================== РЕЖИМ: ADD-H2 (h2 в TLS-инбаунде) ==================
+# v0.5.4: alpn TLS-инбаунда [h2,http/1.1] + alpn-fallback h2 -> h2c-слушатель nginx 127.0.0.1:8081.
+# Бэкап БД; при провале самотеста БД возвращается автоматически. Работает и с Reality перед TLS, и без.
+cmd_add_h2() {
+  if [[ $EUID -ne 0 ]]; then
+    echo "Запусти от root: sudo bash $0 add-h2"
+    exit 1
+  fi
+  REALITY_XRAY_PORT=443
+  read_domains
+  if [[ -z "${DOMAIN:-}" || -z "${REALITY_DOMAIN:-}" ]]; then
+    echo "ОШИБКА: не удалось определить домены из ${CREDS_FILE}."
+    exit 1
+  fi
+  local sec alpn bak front_uuid="" front_pbk="" front_sid="" h2c_ok
+  SERVER_IP=$(get_server_ip)
+  if [[ ! -f "$XUIDB" ]]; then
+    echo "ОШИБКА: ${XUIDB} не найден — схема не развёрнута."
+    exit 1
+  fi
+  sec=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.security') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  if [[ "$sec" != "tls" ]]; then
+    echo "ОШИБКА: инбаунд 127.0.0.1:443 в режиме '${sec:-?}', h2 включается только в TLS-режиме."
+    exit 1
+  fi
+  alpn=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.tlsSettings.alpn') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  if [[ "$alpn" == *h2* ]]; then
+    echo "h2 уже включён (alpn ${alpn}) — ничего не делаю."
+    exit 0
+  fi
+  if ! systemctl is-active --quiet x-ui || ! systemctl is-active --quiet nginx; then
+    echo "ОШИБКА: x-ui или nginx не active — сначала почини (healthcheck)."
+    exit 1
+  fi
+  ensure_decoy2_h2c_vhost || { echo "ОШИБКА: не создать h2c-слушатель nginx."; exit 1; }
+  h2c_ok=$(curl -s -m 5 --http2-prior-knowledge -o /dev/null -w "%{http_code}" "http://127.0.0.1:${H2C_PORT}/" 2>/dev/null || echo 000)
+  if [[ "$h2c_ok" != "200" ]]; then
+    echo "ОШИБКА: h2c-слушатель 127.0.0.1:${H2C_PORT} не отвечает 200 (код ${h2c_ok}) — h2 не включаю."
+    exit 1
+  fi
+  echo "Включаю h2 в TLS-инбаунде. x-ui будет перезапущен на несколько секунд."
+  systemctl stop x-ui
+  sleep 1
+  bak="${XUIDB}.backup.$(date +%s)"
+  cp -a "$XUIDB" "$bak"
+  echo "Бэкап БД: ${bak}"
+  if ! sqlite3 "$XUIDB" "UPDATE inbounds SET stream_settings=json_set(stream_settings,'\$.tlsSettings.alpn',json('${TLS_ALPN_JSON_H2}')), settings=json_set(settings,'\$.fallbacks',json('${TLS_FB_JSON_H2}')) WHERE protocol='vless' AND port=443 AND listen='127.0.0.1';"; then
+    echo "ОШИБКА: UPDATE не удался. Бэкап БД: ${bak}"
+    systemctl start x-ui
+    exit 1
+  fi
+  systemctl start x-ui
+  sleep 3
+  if reality_front_active; then
+    front_uuid=$(sqlite3 "$XUIDB" "SELECT json_extract(settings,'\$.clients[0].id') FROM inbounds WHERE protocol='vless' AND port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+    front_pbk=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.realitySettings.settings.publicKey') FROM inbounds WHERE protocol='vless' AND port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+    front_sid=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.realitySettings.shortIds[0]') FROM inbounds WHERE protocol='vless' AND port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  fi
+  echo "Самотест через публичный IP ${SERVER_IP}:"
+  if systemctl is-active --quiet x-ui && wait_xray_listener 443 && selftest_443 1 "$front_uuid" "$front_pbk" "$front_sid"; then
+    echo "$VERSION" > /root/.lucx-script-version
+    echo
+    echo "================= ГОТОВО ================="
+    echo "h2 включён: alpn [h2, http/1.1], fallback по ALPN h2 -> 127.0.0.1:${H2C_PORT} (h2c), http/1.1 -> 127.0.0.1:8080."
+    echo "Клиентские ссылки подписки получат alpn=h2,http/1.1 сами (панель берёт из инбаунда)."
+    echo "Откат: systemctl stop x-ui && cp ${bak} ${XUIDB} && systemctl start x-ui"
+    echo "=========================================="
+  else
+    echo "ОШИБКА: самотест не прошёл — возвращаю БД из ${bak}"
+    systemctl stop x-ui
+    sleep 1
+    cp -a "$bak" "$XUIDB"
+    systemctl start x-ui
+    sleep 2
+    systemctl is-active --quiet x-ui && echo "БД возвращена, x-ui active (схема как была)." || echo "ВНИМАНИЕ: x-ui не active после отката — journalctl -u x-ui -n 50"
+    exit 1
+  fi
+}
+
 # ================== РЕЖИМ: ADD-VLS / ADD-REALITY (переключение режима 443) ==================
 # v0.3.9: перевод существующего сервера между vless+TLS и Reality без
 # переустановки. UUID/subId/клиенты НЕ меняются — обновляются только
@@ -1289,6 +1655,11 @@ cmd_switch_mode() {
   echo "Текущий security инбаунда 127.0.0.1:443: ${cur_sec:-<не найден>}"
   if [[ -z "$cur_sec" ]]; then
     echo "ОШИБКА: vless-инбаунд на 127.0.0.1:443 не найден — переключать нечего."
+    exit 1
+  fi
+  if [[ "$target" == "reality" ]] && reality_front_active; then
+    echo "ОШИБКА: включён Reality перед TLS (nginx -> 127.0.0.1:${REALITY_FRONT_PORT}); инбаунд 127.0.0.1:443 — его target."
+    echo "Перевод 443 в Reality сломал бы схему. Сначала верни nginx reality_backend на 127.0.0.1:443 (откат add-reality-front) и отключи инбаунд ${REALITY_FRONT_TAG}."
     exit 1
   fi
   if [[ "$cur_sec" == "$target" ]]; then
@@ -1543,10 +1914,12 @@ cmd_install() {
   # fp=firefox не работает, а chrome/остальные отпечатки режутся на
   # RU-маршрутах; plain-TLS работает. Reality остаётся вариантом для
   # не-RU клиентов и на случай послаблений.
-  read -rp "Протокол vless на 443: [1] VLESS+TLS (RU-совместимо; Enter) / [2] Reality: " PROTO_CHOICE
+  # v0.5.4: вопрос убран. Всегда VLESS+TLS (+h2) с Reality перед ним на том же домене
+  # (схема из changelog 0.5.4): Reality-клиенты и TLS-клиенты живут на одном домене и 443.
+  # Отдельный «чисто Reality» режим установки больше не предлагается (ветка кода оставлена,
+  # старые версии скрипта лежат в релизах — откат установщика = взять прежнюю версию).
   VLESS_MODE="tls"
-  [[ "${PROTO_CHOICE:-}" == "2" ]] && VLESS_MODE="reality"
-  echo "  Режим 443: ${VLESS_MODE}"
+  echo "  Режим 443: VLESS+TLS + Reality перед ним (без выбора, v0.5.4)"
 
   # v0.5.3: рекомендованные настройки подписок (Clash/Happ/Incy) — Enter = да
   read -rp "Применить рекомендованные настройки подписок (Clash/Mihomo, Happ, Incy)? [Y/n]: " SUB_REC
@@ -3740,6 +4113,11 @@ EOF
 
   # v0.4.0: plain-HTTP фасад decoy №2 (:8080, loopback) — цель fallback'а TLS-режима
   ensure_decoy2_http_vhost || exit 1
+  # v0.5.4: h2c-фасад (:8081) — цель ALPN-fallback'а h2 (TLS-режим, H2 != 0)
+  INST_H2="${H2:-1}"
+  if [[ "$VLESS_MODE" == "tls" && "$INST_H2" != "0" ]]; then
+    ensure_decoy2_h2c_vhost || { echo "WARN: h2c-фасад не создан — h2 отключён, TLS-инбаунд будет только с http/1.1."; INST_H2=0; }
+  fi
 
   ln -sf "/etc/nginx/sites-available/80-redirect.conf" "/etc/nginx/sites-enabled/80-redirect.conf"
   ln -sf "/etc/nginx/sites-available/${DOMAIN}.conf" "/etc/nginx/sites-enabled/${DOMAIN}.conf"
@@ -3832,8 +4210,10 @@ EOF
           systemctl start x-ui
           exit 1
         fi
-        SETTINGS_JSON='{"clients":[{"id":"'"${CLIENT_UUID}"'","flow":"xtls-rprx-vision","email":"client1","limitIp":0,"totalGB":0,"expiryTime":0,"enable":true,"tgId":0,"subId":"primary","reset":0,"created_at":'"${NOW_MS}"',"updated_at":'"${NOW_MS}"'}],"decryption":"none","fallbacks":[{"dest":"127.0.0.1:8080","xver":0}]}'
-        STREAM_JSON='{"network":"tcp","security":"tls","tlsSettings":{"serverName":"'"${REALITY_DOMAIN}"'","minVersion":"1.2","maxVersion":"1.3","cipherSuites":"","rejectUnknownSni":false,"disableSystemRoot":false,"enableSessionResumption":false,"certificates":[{"ocspStapling":0,"oneTimeLoading":false,"usage":"encipherment","buildChain":false,"certificateFile":"/etc/letsencrypt/live/'"${REALITY_DOMAIN}"'/fullchain.pem","keyFile":"/etc/letsencrypt/live/'"${REALITY_DOMAIN}"'/privkey.pem"}],"alpn":["http/1.1"],"echServerKeys":"","settings":{"fingerprint":"firefox","echConfigList":"","pinnedPeerCertSha256":[],"verifyPeerCertByName":""}},"tcpSettings":{"acceptProxyProtocol":true,"header":{"type":"none"}}}'
+        INST_FB_JSON="$TLS_FB_JSON_H1"; INST_ALPN_JSON="$TLS_ALPN_JSON_H1"
+        if [[ "${INST_H2:-1}" != "0" ]]; then INST_FB_JSON="$TLS_FB_JSON_H2"; INST_ALPN_JSON="$TLS_ALPN_JSON_H2"; fi
+        SETTINGS_JSON='{"clients":[{"id":"'"${CLIENT_UUID}"'","flow":"xtls-rprx-vision","email":"client1","limitIp":0,"totalGB":0,"expiryTime":0,"enable":true,"tgId":0,"subId":"primary","reset":0,"created_at":'"${NOW_MS}"',"updated_at":'"${NOW_MS}"'}],"decryption":"none","fallbacks":'"${INST_FB_JSON}"'}'
+        STREAM_JSON='{"network":"tcp","security":"tls","tlsSettings":{"serverName":"'"${REALITY_DOMAIN}"'","minVersion":"1.2","maxVersion":"1.3","cipherSuites":"","rejectUnknownSni":false,"disableSystemRoot":false,"enableSessionResumption":false,"certificates":[{"ocspStapling":0,"oneTimeLoading":false,"usage":"encipherment","buildChain":false,"certificateFile":"/etc/letsencrypt/live/'"${REALITY_DOMAIN}"'/fullchain.pem","keyFile":"/etc/letsencrypt/live/'"${REALITY_DOMAIN}"'/privkey.pem"}],"alpn":'"${INST_ALPN_JSON}"',"echServerKeys":"","settings":{"fingerprint":"firefox","echConfigList":"","pinnedPeerCertSha256":[],"verifyPeerCertByName":""}},"tcpSettings":{"acceptProxyProtocol":true,"header":{"type":"none"}}}'
       fi
 
       # note: не отдельным `if [[ $? -ne 0 ]]` после — под `set -e` такая
@@ -3883,6 +4263,54 @@ EOF
     fi
   fi
 
+  # --- [10/10+] v0.5.4: Reality перед TLS (127.0.0.1:8446) — только TLS-режим, REALITY_FRONT != 0 ---
+  FRONT_ACTIVE=0
+  INST_SEC_NOW=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.security') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  if [[ "${REALITY_OK:-0}" == "1" && "$VLESS_MODE" == "tls" && "$INST_SEC_NOW" == "tls" && "${REALITY_FRONT:-1}" != "0" ]]; then
+    echo "=== [10/10+] Reality перед TLS (127.0.0.1:${REALITY_FRONT_PORT}, без третьего домена) ==="
+    if create_reality_front_inbound; then
+      if [[ "${FRONT_EXISTS:-0}" == "1" ]]; then
+        echo "  Reality-инбаунд уже был — nginx не переключаю (схему включай командой add-reality-front)."
+      else
+        cp -a "$STREAM_CONF" "${STREAM_CONF}.pre-reality-front"
+        INST_PP_NOW=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.tcpSettings.acceptProxyProtocol') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+        INST_ALPN_NOW=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.tlsSettings.alpn') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+        INST_H2_NOW=0
+        [[ "$INST_ALPN_NOW" == *h2* ]] && INST_H2_NOW=1
+        if [[ "$INST_PP_NOW" != "1" && "$INST_PP_NOW" != "true" ]]; then
+          # переиспользованный инбаунд без acceptProxyProtocol: nginx шлёт PROXY — TLS-клиенты оборвались бы
+          echo "  WARN: у существующего инбаунда 127.0.0.1:443 нет acceptProxyProtocol — Reality перед TLS пропущен, nginx не переключаю."
+          echo "        Reality-инбаунд ${REALITY_FRONT_TAG} создан (loopback, безвреден). Проверь инбаунд и повтори: sudo bash $0 add-reality-front"
+        else
+          if [[ "$INST_H2" != "0" && "$INST_H2_NOW" != "1" ]]; then
+            echo "  INFO: на переиспользованном TLS-инбаунде h2 не включён — включи: sudo bash $0 add-h2"
+          fi
+          sed -i "s#upstream reality_backend { server 127.0.0.1:${REALITY_XRAY_PORT}; }#upstream reality_backend { server 127.0.0.1:${REALITY_FRONT_PORT}; }#" "$STREAM_CONF"
+        fi
+        if [[ "$INST_PP_NOW" != "1" && "$INST_PP_NOW" != "true" ]]; then
+          :
+        elif nginx -t >/dev/null 2>&1; then
+          systemctl reload nginx
+          sleep 1
+          if selftest_443 "$INST_H2_NOW" "$FRONT_UUID" "$FRONT_PBK" "$FRONT_SID"; then
+            FRONT_ACTIVE=1
+          else
+            echo "  WARN: самотест Reality перед TLS не прошёл — возвращаю nginx на 127.0.0.1:443 (TLS работает как раньше)."
+          fi
+        else
+          echo "  WARN: nginx -t не прошёл после смены upstream — возвращаю конфиг."
+        fi
+        if [[ "$FRONT_ACTIVE" != "1" ]]; then
+          cp -a "${STREAM_CONF}.pre-reality-front" "$STREAM_CONF"
+          nginx -t >/dev/null 2>&1 && systemctl reload nginx
+        fi
+        rm -f "${STREAM_CONF}.pre-reality-front"
+      fi
+    else
+      echo "  WARN: Reality перед TLS не создан — установка продолжается без него (позже: sudo bash $0 add-reality-front)."
+    fi
+  fi
+
   # --- [10a] Hysteria 2 inbound на UDP/443 (SQLite) ---
   echo "=== [10a] Hysteria 2 inbound на UDP/443 (SQLite) ==="
   create_hy2_inbound || exit 1
@@ -3921,13 +4349,19 @@ EOF
       echo "  Public key:         ${REALITY_PUBLIC:-(см. панель)}"
       echo "  ServerName:         ${REALITY_DOMAIN}"
     else
-      echo "VLESS+TLS inbound:   готов (remark: ${REALITY_REMARK}, fallback -> 127.0.0.1:8080)"
+      echo "VLESS+TLS inbound:   готов (remark: ${REALITY_REMARK}, fallback -> 127.0.0.1:8080$([[ "${INST_H2:-1}" != "0" ]] && echo ", ALPN h2 -> 127.0.0.1:${H2C_PORT}"))"
       echo "  Client UUID:       ${CLIENT_UUID:-(см. панель)}"
       echo "  ServerName/SNI:     ${REALITY_DOMAIN}"
       echo "  Ссылка для клиента (raw + fp=firefox + Vision):"
       echo "  vless://${CLIENT_UUID:-(UUID)}@${REALITY_DOMAIN}:443?type=tcp&security=tls&sni=${REALITY_DOMAIN}&fp=firefox&flow=xtls-rprx-vision#${REALITY_REMARK}"
       echo "  (v0.5.1: Vision включён по умолчанию — убирает отпечаток вложенного TLS."
       echo "   Клиент должен поддерживать flow xtls-rprx-vision; старый клиент без flow подключиться не сможет.)"
+      if [[ "${FRONT_ACTIVE:-0}" == "1" ]]; then
+        echo "Reality перед TLS:   включён (nginx -> 127.0.0.1:${REALITY_FRONT_PORT} -> target 127.0.0.1:443), клиент client1-reality"
+        echo "  Ссылка Reality:"
+        echo "  vless://${FRONT_UUID}@${REALITY_DOMAIN}:443?type=tcp&security=reality&pbk=${FRONT_PBK}&fp=firefox&sni=${REALITY_DOMAIN}&sid=${FRONT_SID}&flow=xtls-rprx-vision&spx=%2F#client1-reality"
+        echo "  (TLS-инбаунд и Reality-инбаунд зависят друг от друга — не отключай и не удаляй по отдельности.)"
+      fi
     fi
   else
     echo "vless inbound:       НЕ создан — создай вручную через панель."
@@ -3972,6 +4406,14 @@ EOF
       echo "Short IDs: ${SHORT_ID_1}, ${SHORT_ID_2}" >> "$CREDS_FILE"
     else
       echo "VLESS Link: vless://${CLIENT_UUID}@${REALITY_DOMAIN}:443?type=tcp&security=tls&sni=${REALITY_DOMAIN}&fp=firefox&flow=xtls-rprx-vision#${REALITY_REMARK}" >> "$CREDS_FILE"
+      if [[ "${FRONT_ACTIVE:-0}" == "1" ]]; then
+        {
+          echo "Reality-front UUID: ${FRONT_UUID}"
+          echo "Reality-front Public Key: ${FRONT_PBK}"
+          echo "Reality-front Short ID: ${FRONT_SID}"
+          echo "Reality-front Link: vless://${FRONT_UUID}@${REALITY_DOMAIN}:443?type=tcp&security=reality&pbk=${FRONT_PBK}&fp=firefox&sni=${REALITY_DOMAIN}&sid=${FRONT_SID}&flow=xtls-rprx-vision&spx=%2F#client1-reality"
+        } >> "$CREDS_FILE"
+      fi
     fi
   fi
   if [[ -n "${HY2_AUTH:-}" ]]; then
@@ -3984,7 +4426,7 @@ EOF
   echo "Креды сохранены в: ${CREDS_FILE}"
   echo
 
-  echo "УЖЕ СДЕЛАНО УСТАНОВЩИКОМ (v0.5.3):"
+  echo "УЖЕ СДЕЛАНО УСТАНОВЩИКОМ (v0.5.4):"
   echo "  - у инбаундов VLESS и Hysteria 2 адрес для ссылок = ${REALITY_DOMAIN} (Пользовательская);"
   echo "  - в режиме TLS у них стоит uTLS firefox;"
   if [[ ! "${SUB_REC:-y}" =~ ^[Nn]$ ]]; then
@@ -4302,6 +4744,8 @@ cmd_healthcheck() {
       reality_port=$(awk '/upstream reality_backend/,/}/' "$STREAM_CONF" | grep -oP "server 127\.0\.0\.1:\K[0-9]+" | head -n1 || true)
       if [[ "$reality_port" == "443" ]]; then
         check "stream: reality_backend -> 127.0.0.1:443" ok
+      elif [[ "$reality_port" == "$REALITY_FRONT_PORT" ]] && sqlite3 "$XUIDB" "SELECT 1 FROM inbounds WHERE protocol='vless' AND port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' AND enable=1 LIMIT 1;" 2>/dev/null | grep -q 1; then
+        check "stream: reality_backend -> 127.0.0.1:${REALITY_FRONT_PORT} (Reality перед TLS, v0.5.4)" ok
       else
         check "stream: reality_backend -> 127.0.0.1:${reality_port} (не 443!)" warn
       fi
@@ -4541,10 +4985,10 @@ cmd_healthcheck() {
       # эксперименты пользователя валидны. Но если такой инбаунд слушает
       # НЕ loopback — это открытый порт мимо nginx SNI-роутера, и тут
       # уже FAIL.
-      extra=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbounds WHERE protocol='vless' AND port!=443;" 2>/dev/null || echo 0)
+      extra=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbounds WHERE protocol='vless' AND port!=443 AND NOT (port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' AND tag='${REALITY_FRONT_TAG}');" 2>/dev/null || echo 0)
       if [[ "$extra" -gt 0 ]]; then
-        extra_list=$(sqlite3 "$XUIDB" "SELECT remark||':'||COALESCE(listen,'<все>')||':'||port FROM inbounds WHERE protocol='vless' AND port!=443;" 2>/dev/null | paste -sd', ' - || true)
-        extra_open=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbounds WHERE protocol='vless' AND port!=443 AND (listen IS NULL OR listen='' OR listen NOT LIKE '127.%');" 2>/dev/null || echo 0)
+        extra_list=$(sqlite3 "$XUIDB" "SELECT remark||':'||COALESCE(listen,'<все>')||':'||port FROM inbounds WHERE protocol='vless' AND port!=443 AND NOT (port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' AND tag='${REALITY_FRONT_TAG}');" 2>/dev/null | paste -sd', ' - || true)
+        extra_open=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbounds WHERE protocol='vless' AND port!=443 AND NOT (port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' AND tag='${REALITY_FRONT_TAG}') AND (listen IS NULL OR listen='' OR listen NOT LIKE '127.%');" 2>/dev/null || echo 0)
         if [[ "$extra_open" -gt 0 ]]; then
           check "Доп. vless-инбаунды НЕ на loopback (${extra_list}) — риск открытого порта мимо nginx" fail
         else
@@ -4630,6 +5074,66 @@ cmd_healthcheck() {
     fi
   else
     check "x-ui.db не найден" fail
+  fi
+  echo
+
+  echo "=== [7a] h2 и Reality перед TLS (v0.5.4) ==="
+  if [[ -f "$XUIDB" && "${VLESS_SEC:-}" == "tls" ]]; then
+    hc_ip=$(get_server_ip 2>/dev/null || true)
+    hc_alpn=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.tlsSettings.alpn') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+    if [[ "$hc_alpn" == *h2* ]]; then
+      check "TLS-инбаунд: alpn содержит h2 (${hc_alpn})" ok
+      hc_fb=$(sqlite3 "$XUIDB" "SELECT json_extract(settings,'\$.fallbacks') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+      if [[ "$hc_fb" == *'"alpn":"h2"'* && "$hc_fb" == *"127.0.0.1:${H2C_PORT}"* ]]; then
+        check "TLS-инбаунд: alpn-fallback h2 -> 127.0.0.1:${H2C_PORT}" ok
+      else
+        check "TLS-инбаунд: alpn h2 включён, но нет fallback h2 -> 127.0.0.1:${H2C_PORT} — h2-клиенты получат обрыв. Фикс: добавить fallback в панели (инбаунд -> Fallbacks) или вернуть БД из бэкапа" fail
+      fi
+      hc_h2c=$(curl -s -m 5 --http2-prior-knowledge -o /dev/null -w "%{http_code}" "http://127.0.0.1:${H2C_PORT}/" 2>/dev/null || echo 000)
+      if [[ "$hc_h2c" == "200" ]]; then
+        check "h2c-слушатель nginx 127.0.0.1:${H2C_PORT} отвечает 200" ok
+      else
+        check "h2c-слушатель nginx 127.0.0.1:${H2C_PORT} не отвечает 200 (код ${hc_h2c}) — h2 сломан для сканеров/клиентов" fail
+      fi
+      if [[ -n "$hc_ip" && -n "${REALITY_DOMAIN:-}" ]]; then
+        hc_a2=$(echo | timeout 8 openssl s_client -connect "${hc_ip}:443" -servername "${REALITY_DOMAIN}" -alpn h2 2>/dev/null | grep -a -o 'ALPN protocol: [a-z0-9/.]*' || true)
+        hc_s2=$(curl -sk -m 10 --http2 -o /dev/null -w "%{http_code}/%{http_version}" --resolve "${REALITY_DOMAIN}:443:${hc_ip}" "https://${REALITY_DOMAIN}/" 2>/dev/null || echo 000/0)
+        if [[ "$hc_a2" == *h2 && "$hc_s2" == "200/2" ]]; then
+          check "Снаружи: ALPN h2 согласуется, сайт ${REALITY_DOMAIN} по h2 -> 200" ok
+        else
+          check "Снаружи: h2 не работает (ALPN '${hc_a2:-нет}', сайт по h2 -> ${hc_s2})" fail
+        fi
+      fi
+    else
+      check "h2 в TLS-инбаунде не включён (alpn ${hc_alpn:-?}) — INFO: пробы видят только http/1.1; включить: sudo bash $0 add-h2" warn
+    fi
+    if reality_front_active; then
+      hc_row="SELECT %s FROM inbounds WHERE protocol='vless' AND port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' LIMIT 1;"
+      # shellcheck disable=SC2059
+      hc_sec=$(sqlite3 "$XUIDB" "$(printf "$hc_row" "json_extract(stream_settings,'\$.security')")" 2>/dev/null || true)
+      hc_tgt=$(sqlite3 "$XUIDB" "$(printf "$hc_row" "COALESCE(json_extract(stream_settings,'\$.realitySettings.target'),json_extract(stream_settings,'\$.realitySettings.dest'))")" 2>/dev/null || true)
+      hc_xver=$(sqlite3 "$XUIDB" "$(printf "$hc_row" "json_extract(stream_settings,'\$.realitySettings.xver')")" 2>/dev/null || true)
+      hc_pp=$(sqlite3 "$XUIDB" "$(printf "$hc_row" "json_extract(stream_settings,'\$.tcpSettings.acceptProxyProtocol')")" 2>/dev/null || true)
+      hc_sn=$(sqlite3 "$XUIDB" "$(printf "$hc_row" "json_extract(stream_settings,'\$.realitySettings.serverNames[0]')")" 2>/dev/null || true)
+      hc_ep=$(sqlite3 "$XUIDB" "$(printf "$hc_row" "json_extract(stream_settings,'\$.externalProxy[0].port')")" 2>/dev/null || true)
+      [[ "$hc_sec" == "reality" ]] && check "Reality перед TLS: инбаунд ${REALITY_FRONT_TAG} security=reality" ok || check "Reality перед TLS: security '${hc_sec:-?}' вместо reality" fail
+      [[ "$hc_tgt" == "127.0.0.1:443" ]] && check "Reality перед TLS: target = 127.0.0.1:443 (TLS-инбаунд)" ok || check "Reality перед TLS: target '${hc_tgt:-?}' != 127.0.0.1:443 — не-Reality трафик не дойдёт до TLS-инбаунда" fail
+      [[ "$hc_xver" == "1" ]] && check "Reality перед TLS: xver=1 (реальный IP клиента доходит до TLS-инбаунда)" ok || check "Reality перед TLS: xver '${hc_xver:-?}' (нужен 1 — иначе IP клиентов в TLS-инбаунде = 127.0.0.1, ломаются limitIp/онлайн)" fail
+      [[ "$hc_pp" == "1" || "$hc_pp" == "true" ]] && check "Reality перед TLS: acceptProxyProtocol включён" ok || check "Reality перед TLS: нет acceptProxyProtocol — nginx шлёт PROXY, соединения оборвутся" fail
+      [[ "$hc_sn" == "${REALITY_DOMAIN:-}" ]] && check "Reality перед TLS: serverNames[0] = ${REALITY_DOMAIN}" ok || check "Reality перед TLS: serverNames[0] '${hc_sn:-?}' != '${REALITY_DOMAIN:-?}'" fail
+      [[ "$hc_ep" == "443" ]] && check "Reality перед TLS: External Proxy порт 443 (ссылки подписки на 443, не 8446)" ok || check "Reality перед TLS: External Proxy порт '${hc_ep:-нет}' — ссылки подписки получат порт ${REALITY_FRONT_PORT}, клиенты не подключатся. Панель: инбаунд -> Внешний прокси -> домен:443" fail
+      hc_pid=$(ss -tlnp 2>/dev/null | grep -E "127\.0\.0\.1:${REALITY_FRONT_PORT}\b" | grep -oP 'pid=\K[0-9]+' | head -n1 || true)
+      if [[ -n "$hc_pid" ]] && tr '\0' ' ' < "/proc/${hc_pid}/cmdline" 2>/dev/null | grep -qi xray; then
+        check "Reality перед TLS: xray слушает 127.0.0.1:${REALITY_FRONT_PORT}" ok
+      else
+        check "Reality перед TLS: на 127.0.0.1:${REALITY_FRONT_PORT} нет xray — Reality и вход всех клиентов домена мертвы" fail
+      fi
+      check "INFO: TLS-инбаунд (127.0.0.1:443) и Reality (127.0.0.1:${REALITY_FRONT_PORT}) зависят друг от друга — не отключать по отдельности" warn
+    else
+      check "Reality перед TLS не включён — INFO: включить: sudo bash $0 add-reality-front" warn
+    fi
+  else
+    check "Блок пропущен: режим 443 не TLS или x-ui.db не найден" warn
   fi
   echo
 
@@ -5775,6 +6279,12 @@ case "${1:-install}" in
   add-hy2|hy2|retrofit)
     cmd_add_hy2
     ;;
+  add-reality-front|reality-front)
+    cmd_add_reality_front
+    ;;
+  add-h2|h2)
+    cmd_add_h2
+    ;;
   add-bot|bot)
     cmd_add_bot
     ;;
@@ -5808,13 +6318,17 @@ case "${1:-install}" in
   *)
     echo "Использование:"
     echo "  sudo bash $0 install       — установить всё с нуля (чистый сервер;"
-    echo "                               спросит режим 443: VLESS+TLS или Reality)"
+    echo "                               ставит TLS + h2 + Reality перед TLS без вопросов)"
     echo "  sudo bash $0 upgrade       — обновить сам этот скрипт до новейшей версии"
     echo "                               с GitHub (патч без переустановки)"
     echo "  sudo bash $0 add-vls       — переключить 443 на vless+TLS (с Reality-"
     echo "                               сервера; ключи сохраняются в /root/.lucx-mode-backup/)"
     echo "  sudo bash $0 add-reality   — вернуть Reality (из бэкапа ключей)"
     echo "  sudo bash $0 add-hy2       — добавить Hysteria 2 на существующий сервер"
+    echo "  sudo bash $0 add-h2        — включить h2 в TLS-инбаунде (alpn + fallback на h2c :8081;"
+    echo "                               бэкап БД, самотест, автооткат)"
+    echo "  sudo bash $0 add-reality-front — Reality перед TLS на том же домене/443 (без 3-го домена;"
+    echo "                               nginx -> 127.0.0.1:8446; бэкап, самотест, автооткат)"
     echo "  sudo bash $0 add-bot       — поставить/обновить Telegram-бота управления"
     echo "                               (спросит токен @BotFather; env не затирает)"
     echo "  sudo bash $0 remove-bot    — удалить Telegram-бота"

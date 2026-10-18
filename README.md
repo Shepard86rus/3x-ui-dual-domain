@@ -68,8 +68,13 @@ decoy-сайты, ufw + fail2ban. Опционально — Telegram-бот у�
 
 ### Режим 443: TLS или Reality
 
-При `install` скрипт спросит режим работы порта 443: **[1] VLESS+TLS** (по
-умолчанию, Enter) или **[2] Reality**. Если сомневаетесь — берите TLS.
+С версии 0.5.4 `install` **не спрашивает** режим 443: всегда ставится
+**VLESS+TLS с h2 и Reality перед ним** на том же домене и порту 443 (без третьего
+домена и сертификата): nginx → Reality-инбаунд `127.0.0.1:8446` → всё, что не
+Reality-клиент, уходит на TLS-инбаунд `127.0.0.1:443`. Отключить части при установке:
+переменные `H2=0` и `REALITY_FRONT=0`. **TLS-инбаунд и Reality-инбаунд зависят друг от
+друга — не отключайте и не удаляйте их по отдельности.** Для уже установленных серверов:
+`add-h2` и `add-reality-front`. Описание ниже про выбор режима относится к версиям до 0.5.4.
 
 > [!WARNING]
 > **На клиенте Clash/Mihomo Reality из России работает только с отпечатком
@@ -139,7 +144,7 @@ decoy-сайты, ufw + fail2ban. Опционально — Telegram-бот у�
    bash 3x-ui-dual-domain.sh install
    ```
 
-   Он спросит домены и режим 443, предложит выбор версии панели (Enter =
+   Он спросит домены, предложит выбор версии панели (Enter =
    последняя стабильная), сохранит креды в `/root/.lucx-credentials` (mode 600)
    и напечатает итог. База данных — SQLite (скрипт выставляет и проверяет это
    сам; PostgreSQL не поддерживается). В конце предложит опционального
@@ -311,6 +316,8 @@ AmneziaWG** — всё остальное добавляй по правилам
 | `bash 3x-ui-dual-domain.sh upgrade` | обновить сам этот скрипт до новейшей версии с репозитория |
 | `bash 3x-ui-dual-domain.sh add-vls` | перевод схемы на TLS (из Reality), с fallback-вхостом |
 | `bash 3x-ui-dual-domain.sh add-reality` | перевод схемы на Reality (из TLS) |
+| `bash 3x-ui-dual-domain.sh add-h2` | включить h2 в TLS-инбаунде (alpn + fallback на h2c, бэкап БД, самотест, автооткат) |
+| `bash 3x-ui-dual-domain.sh add-reality-front` | Reality перед TLS на том же домене/443 (бэкап nginx-конфига, самотест, автооткат) |
 | `bash 3x-ui-dual-domain.sh add-hy2` | добавление Hysteria2-инбаунда (с preflight-проверкой порта) |
 | `bash 3x-ui-dual-domain.sh add-bot` | поставить/обновить Telegram-бота управления (env не затирает) |
 | `bash 3x-ui-dual-domain.sh remove-bot` | удалить Telegram-бота |

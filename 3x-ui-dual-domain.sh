@@ -1438,8 +1438,13 @@ selftest_443() {
     echo "  ALPN: просим h2 -> [${a2:-нет}], просим http/1.1 -> [${a1:-нет}]; сайт по h2 -> ${h2}, по http/1.1 -> ${h1}"
     [[ "$a2" == *h2 && "$a1" == *http/1.1 && "$h2" == "200/2" && "$h1" == "200/1.1" ]] || ok=1
   fi
-  tu=$(sqlite3 "$XUIDB" "SELECT json_extract(settings,'\$.clients[0].id') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
-  tf=$(sqlite3 "$XUIDB" "SELECT COALESCE(json_extract(settings,'\$.clients[0].flow'),'') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  local now_ms2 trow
+  now_ms2=$(( $(date +%s) * 1000 ))
+  # первый ВКЛЮЧЁННЫЙ клиент с неистёкшим сроком (clients[0] мог истечь/быть выключен)
+  trow=$(sqlite3 "$XUIDB" "SELECT json_extract(c.value,'\$.id')||'|'||COALESCE(json_extract(c.value,'\$.flow'),'') FROM (SELECT settings FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1) i, json_each(i.settings,'\$.clients') c WHERE COALESCE(json_extract(c.value,'\$.enable'),1) IN (1,'true') AND (COALESCE(json_extract(c.value,'\$.expiryTime'),0)=0 OR json_extract(c.value,'\$.expiryTime')>${now_ms2}) LIMIT 1;" 2>/dev/null || true)
+  tu="${trow%%|*}"
+  tf="${trow#*|}"
+  [[ -n "$trow" ]] || tu=""
   if [[ -n "$tu" ]]; then
     ttip=$(xray_probe_client '{"network":"tcp","security":"tls","tlsSettings":{"serverName":"'"${REALITY_DOMAIN}"'","fingerprint":"firefox"}}' "$tu" "$tf" "$SERVER_IP" 10861)
     echo "  TLS-клиент (первый клиент TLS-инбаунда) -> выходной IP '${ttip:-нет}'"
@@ -4268,11 +4273,26 @@ EOF
         echo "  Reality-инбаунд уже был — nginx не переключаю (схему включай командой add-reality-front)."
       else
         cp -a "$STREAM_CONF" "${STREAM_CONF}.pre-reality-front"
-        sed -i "s#upstream reality_backend { server 127.0.0.1:${REALITY_XRAY_PORT}; }#upstream reality_backend { server 127.0.0.1:${REALITY_FRONT_PORT}; }#" "$STREAM_CONF"
-        if nginx -t >/dev/null 2>&1; then
+        INST_PP_NOW=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.tcpSettings.acceptProxyProtocol') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+        INST_ALPN_NOW=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.tlsSettings.alpn') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+        INST_H2_NOW=0
+        [[ "$INST_ALPN_NOW" == *h2* ]] && INST_H2_NOW=1
+        if [[ "$INST_PP_NOW" != "1" && "$INST_PP_NOW" != "true" ]]; then
+          # переиспользованный инбаунд без acceptProxyProtocol: nginx шлёт PROXY — TLS-клиенты оборвались бы
+          echo "  WARN: у существующего инбаунда 127.0.0.1:443 нет acceptProxyProtocol — Reality перед TLS пропущен, nginx не переключаю."
+          echo "        Reality-инбаунд ${REALITY_FRONT_TAG} создан (loopback, безвреден). Проверь инбаунд и повтори: sudo bash $0 add-reality-front"
+        else
+          if [[ "$INST_H2" != "0" && "$INST_H2_NOW" != "1" ]]; then
+            echo "  INFO: на переиспользованном TLS-инбаунде h2 не включён — включи: sudo bash $0 add-h2"
+          fi
+          sed -i "s#upstream reality_backend { server 127.0.0.1:${REALITY_XRAY_PORT}; }#upstream reality_backend { server 127.0.0.1:${REALITY_FRONT_PORT}; }#" "$STREAM_CONF"
+        fi
+        if [[ "$INST_PP_NOW" != "1" && "$INST_PP_NOW" != "true" ]]; then
+          :
+        elif nginx -t >/dev/null 2>&1; then
           systemctl reload nginx
           sleep 1
-          if selftest_443 "$([[ "${INST_H2:-1}" != "0" ]] && echo 1 || echo 0)" "$FRONT_UUID" "$FRONT_PBK" "$FRONT_SID"; then
+          if selftest_443 "$INST_H2_NOW" "$FRONT_UUID" "$FRONT_PBK" "$FRONT_SID"; then
             FRONT_ACTIVE=1
           else
             echo "  WARN: самотест Reality перед TLS не прошёл — возвращаю nginx на 127.0.0.1:443 (TLS работает как раньше)."

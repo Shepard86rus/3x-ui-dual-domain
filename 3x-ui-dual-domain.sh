@@ -837,9 +837,11 @@
 #   (Z2) при провале фронта в install копия nginx-конфига сохраняется (reality-front-failed-*).
 #   (Z3) h2c-фасад: проверка по своему файлу decoy-h2c.conf. (Z5) убран HSTS с plain-h2c :8081.
 #   (Z6) wait_xray_listener видит 0.0.0.0/[::]/*:порт. (Z7) add-h2 «уже включён» проверяет fallback.
-#   (С6/Z8) кнопка бота «⬆ Панель»: бэкап БД перед обновлением; тело бота v0.5.5 (add-bot на ноде с ботом).
+#   (С6/Z8) из бота убрана кнопка «⬆ Панель (update)» (слепой ввод в меню x-ui update под root); панель
+#        обновляется вручную/флот-инструментами. (Н5) бот проверяет from.id (автора), а не только chat.id.
+#        Тело бота v0.5.5 — на ноде с ботом выполнить add-bot (env сохранится).
 #   НЕ менялось: С4 (самотест идёт ключом реального клиента — это отражено в тексте вывода),
-#   Н5 (бот сверяет chat.id: CHAT_ID должен быть личным id), Н7, мёртвая Reality-only ветка install.
+#   Н7, мёртвая Reality-only ветка install (отложены).
 VERSION="0.5.5"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -5726,7 +5728,7 @@ cmd_upgrade() {
 # (add-bot перезаписывает тело, env не трогает).
 TGBOT_DIR="/opt/tgbot"
 TGBOT_ENV="/etc/tgbot/env"
-TGBOT_BODY_VERSION="0.5.5"   # v0.5.5: update_panel делает бэкап БД до обновления
+TGBOT_BODY_VERSION="0.5.5"   # v0.5.5: убрана кнопка «Панель (update)»; проверка from.id
 
 tgbot_write_body() { # тело бота (правки — только через новую версию скрипта)
   mkdir -p "$TGBOT_DIR"
@@ -5773,7 +5775,7 @@ kb_home() {
     [{text:"💾 Диск",callback_data:"cmd:disk"},{text:"📜 Лог x-ui",callback_data:"cmd:log"}],
     [{text:"🩺 Healthcheck",callback_data:"cmd:hc"},{text:"🔐 Бэкап БД",callback_data:"cmd:backup"}],
     [{text:"♻ Рестарт панели",callback_data:"ask:restart_panel"},{text:"♻ Рестарт xray",callback_data:"ask:restart_xray"}],
-    [{text:"⬆ Скрипт (upgrade)",callback_data:"ask:upgrade"},{text:"⬆ Панель (update)",callback_data:"ask:update_panel"}]
+    [{text:"⬆ Скрипт (upgrade)",callback_data:"ask:upgrade"}]
   ]}')
   if cl_enabled; then
     row='[{"text":"➕ Клиент","callback_data":"cl:add"},{"text":"🗑 Удалить клиента","callback_data":"cl:del"},{"text":"📋 Список","callback_data":"cl:list"}]'
@@ -5977,9 +5979,6 @@ EOS
     backup)  echo 'f="/root/x-ui-backup-$(date +%F-%H%M).db"; sqlite3 /etc/x-ui/x-ui.db ".backup $f" && [ -s "$f" ] && echo "бэкап: $f" || echo "ОШИБКА бэкапа"' ;;
     restart_panel) echo 'systemctl restart x-ui && echo "панель перезапущена" || echo "ОШИБКА рестарта"' ;;
     restart_xray)  echo 'pkill -f "[x]ray-linux-"; sleep 3; n=$(pgrep -c -f "[x]ray-linux-" 2>/dev/null); n=${n:-0}; if [ "$n" -eq 0 ]; then sleep 5; n=$(pgrep -c -f "[x]ray-linux-" 2>/dev/null); n=${n:-0}; fi; echo "xray процессов: $n"' ;;
-    update_panel)
-      echo 'f="/root/x-ui-backup-preupdate-$(date +%F-%H%M).db"; sqlite3 /etc/x-ui/x-ui.db ".backup $f" 2>/dev/null; printf "y\n4\n" | timeout 300 x-ui update >/dev/null 2>&1; sleep 30; echo "бэкап до обновления: $f"; echo "сервис: $(systemctl is-active x-ui); версия: $(/usr/local/x-ui/x-ui -v 2>/dev/null | head -1)"'
-      ;;
     *)
       echo ''
       ;;
@@ -6013,12 +6012,13 @@ run_cmd() { # $1 cmd — словарь проверен вызывающим
 }
 
 on_callback() { # $1 = callback_query json
-  local cbid data mid cid c t out
+  local cbid data mid cid fid c t out
   cbid=$(jq -r '.id' <<<"$1")
   cid=$(jq -r '.message.chat.id // .from.id // empty' <<<"$1")
+  fid=$(jq -r '.from.id // empty' <<<"$1")
   mid=$(jq -r '.message.message_id // empty' <<<"$1")
   data=$(jq -r '.data // empty' <<<"$1")
-  if [ -z "$cid" ] || [ "$cid" != "${CHAT_ID:-}" ]; then answer "$cbid" 'нет доступа'; return; fi
+  if [ -z "$cid" ] || [ "$cid" != "${CHAT_ID:-}" ] || [ "$fid" != "${CHAT_ID:-}" ]; then answer "$cbid" 'нет доступа'; return; fi
   case "$data" in
     home)
       answer "$cbid" ''
@@ -6036,13 +6036,12 @@ $out"
       ;;
     ask:*)
       c=${data#ask:}
-      case "$c" in restart_panel|restart_xray|upgrade|update_panel) ;; *) answer "$cbid" 'неизвестная команда'; return ;; esac
+      case "$c" in restart_panel|restart_xray|upgrade) ;; *) answer "$cbid" 'неизвестная команда'; return ;; esac
       ASK_CMD="$c"; ASK_TS=$(date +%s)
       case "$c" in
         restart_panel) t='рестарт панели' ;;
         restart_xray)  t='рестарт xray (клиенты переподключатся)' ;;
         upgrade)       t='обновление скрипта (до новейшей + hc)' ;;
-        update_panel)  t='обновление панели (~1-2 мин, панель кратко недоступна)' ;;
       esac
       answer "$cbid" ''
       edit_card "$cid" "$mid" "⚠ <b>$(esc "$NODE_NAME")</b>: $t. Выполнять?" "$(kb_confirm "$c")"
@@ -6106,7 +6105,7 @@ if [ "${1:-}" = selftest ]; then
   if cl_enabled; then echo 'клиенты: включено (PANEL_API_TOKEN задан)'; else echo 'клиенты: выключено (нет PANEL_API_TOKEN)'; fi
   kb_confirm restart_panel | jq -e '.inline_keyboard[0] | length == 2' >/dev/null && echo 'kb_confirm: ok' || echo 'kb_confirm: ПРОВАЛ'
   ok=1
-  for c in status versions disk log backup restart_panel restart_xray update_panel; do
+  for c in status versions disk log backup restart_panel restart_xray; do
     [ -n "$(snippet "$c")" ] || { echo "snippet $c: ПУСТОЙ"; ok=0; }
   done
   [ -n "$(snippet_hc /root/3x-ui-dual-domain.sh)" ] || { echo 'snippet hc: ПУСТОЙ'; ok=0; }
@@ -6126,6 +6125,9 @@ while true; do
       on_callback "$(jq -c '.callback_query' <<<"$upd")"
     else
       cid=$(jq -r '.message.chat.id // empty' <<<"$upd" 2>/dev/null)
+      fid=$(jq -r '.message.from.id // empty' <<<"$upd" 2>/dev/null)
+      # v0.5.5 (Н5): при заданном CHAT_ID команды принимаются только от него самого (не от любого в группе)
+      if [ -n "${CHAT_ID:-}" ] && [ "$fid" != "${CHAT_ID}" ]; then cid=""; fi
       text=$(jq -r '.message.text // empty' <<<"$upd" 2>/dev/null)
       [ -n "$cid" ] && [ -n "$text" ] && handle "$cid" "$text"
     fi

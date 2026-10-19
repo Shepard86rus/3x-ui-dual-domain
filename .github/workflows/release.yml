@@ -1,0 +1,37 @@
+# Прикрепляет к релизу скрипт и его sha256 (их требует `upgrade` начиная с 0.5.5).
+# Срабатывает при пуше тега v* (создаёт релиз, если его нет) и вручную (workflow_dispatch) для готового тега.
+name: release-assets
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Тег релиза (например v0.5.5)'
+        required: true
+permissions:
+  contents: write
+jobs:
+  assets:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - name: Проверка версии и синтаксиса
+        run: |
+          V=$(grep -m1 '^VERSION=' 3x-ui-dual-domain.sh | cut -d'"' -f2)
+          [ "v$V" = "$TAG" ] || { echo "VERSION в скрипте ($V) не совпадает с тегом ($TAG)"; exit 1; }
+          bash -n 3x-ui-dual-domain.sh
+          sha256sum 3x-ui-dual-domain.sh > 3x-ui-dual-domain.sh.sha256
+          cat 3x-ui-dual-domain.sh.sha256
+      - name: Прикрепить файлы к релизу
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" 3x-ui-dual-domain.sh 3x-ui-dual-domain.sh.sha256 --clobber
+          else
+            gh release create "$TAG" 3x-ui-dual-domain.sh 3x-ui-dual-domain.sh.sha256 --title "$TAG" --generate-notes
+          fi

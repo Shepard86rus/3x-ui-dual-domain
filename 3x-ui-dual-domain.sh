@@ -821,7 +821,28 @@
 #       новые команды для существующих серверов: add-h2, add-reality-front (бэкапы, самотест через
 #       публичный IP, автооткат при провале); healthcheck: блок [7a], reality_backend -> 8446 больше не WARN;
 #       add-reality (смена режима 443) блокируется, пока включён Reality перед TLS.
-VERSION="0.5.4"
+# v0.5.5 (2026-10-19) — по итогам перекрёстного аудита v0.5.4 (Claude + ZCode):
+#   (В1) upgrade: качает ассет ПОСЛЕДНЕГО РЕЛИЗА (не raw main) и сверяет sha256 с файлом
+#        3x-ui-dual-domain.sh.sha256 из того же релиза; нет файла/не сошлось — отказ. Релиз ОБЯЗАН
+#        содержать оба файла. Кнопка бота «⬆ Скрипт» идёт тем же путём. Ветка main защищена (PR-only).
+#   (С1) AAAA-проверка (install и healthcheck): dig +time=3 +tries=2, только строки-адреса, три резолвера;
+#        если никто не ответил — WARN, а не ложный FAIL; CNAME больше не даёт ложной «AAAA».
+#   (С3) x-ui, остановленный add-h2/add-reality-front, при любом выходе скрипта запускается обратно (trap).
+#   (Z1) нет xray-бинаря для пробы = «не проверено», а не провал самотеста (был ложный автооткат).
+#   (С2) повторный add-reality-front читает параметры Reality-пробы из БД (первый включённый неистёкший
+#        клиент); если пробы не было — «ГОТОВО» с явным ВНИМАНИЕМ. add-h2 берёт тоже неистёкшего клиента.
+#   (С5) add-h2 не затирает нештатные fallbacks (отказ; принудительно: LUCX_FORCE_FALLBACKS=1).
+#   (Н1) hc: whitelist UDP — все включённые AWG-порты. (Н2) get_server_ip: + IP из stream-конфига и
+#        src маршрута. (Н3) порты проб — свободные. (Н4) upgrade пишет /root/.lucx-script-version.
+#   (Z2) при провале фронта в install копия nginx-конфига сохраняется (reality-front-failed-*).
+#   (Z3) h2c-фасад: проверка по своему файлу decoy-h2c.conf. (Z5) убран HSTS с plain-h2c :8081.
+#   (Z6) wait_xray_listener видит 0.0.0.0/[::]/*:порт. (Z7) add-h2 «уже включён» проверяет fallback.
+#   (С6/Z8) из бота убрана кнопка «⬆ Панель (update)» (слепой ввод в меню x-ui update под root); панель
+#        обновляется вручную/флот-инструментами. (Н5) бот проверяет from.id (автора), а не только chat.id.
+#        Тело бота v0.5.5 — только для нод со встроенным ботом (add-bot). Хаб-бот (отдельный tgbot-hub) этим не затрагивается; add-bot на хаб-ноде НЕ запускать (перезапишет юнит tgbot).
+#   НЕ менялось: С4 (самотест идёт ключом реального клиента — это отражено в тексте вывода),
+#   Н7, мёртвая Reality-only ветка install (отложены).
+VERSION="0.5.5"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
 # С v3.7.0-lucx.203 install-awg-module.sh качает исходники tarball'ом
@@ -1001,7 +1022,68 @@ apply_sub_recommended() {
 }
 
 get_server_ip() {
-  curl -4s --max-time 5 https://api4.ipify.org || curl -4s --max-time 5 ifconfig.me || true
+  # v0.5.5 (Н2): внешние сервисы + локальные источники (IP из stream-конфига, затем
+  # src маршрута по умолчанию) — пустой SERVER_IP больше не даёт ложный откат схемы
+  local ip="" re='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+  ip=$(curl -4s --max-time 5 https://api4.ipify.org 2>/dev/null || true)
+  [[ "$ip" =~ $re ]] || ip=$(curl -4s --max-time 5 ifconfig.me 2>/dev/null || true)
+  [[ "$ip" =~ $re ]] || ip=$(grep -oP '^\s*listen\s+\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(?=:443;)' /etc/nginx/stream-sni-router.conf 2>/dev/null | grep -v '^0\.0\.0\.0$' | head -n1 || true)
+  [[ "$ip" =~ $re ]] || ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' | head -n1 || true)
+  if [[ "$ip" =~ $re ]]; then echo "$ip"; fi
+  return 0
+}
+
+# v0.5.5 (С1): AAAA-запрос без ложных срабатываний. Печатает найденные IPv6-адреса;
+# пусто = записи нет; "UNKNOWN" = ни один резолвер не ответил (это WARN, не FAIL).
+# dig при таймауте пишет «communications error» в stdout, а при CNAME первой строкой
+# идёт имя цели — поэтому берём только строки-адреса и смотрим код возврата dig.
+lucx_aaaa_lookup() {
+  local d="$1" r out rc
+  for r in 1.1.1.1 8.8.8.8 9.9.9.9; do
+    rc=0
+    out=$(dig +short +time=3 +tries=2 AAAA "$d" @"$r" 2>/dev/null) || rc=$?
+    if [[ $rc -eq 0 ]]; then
+      echo "$out" | grep -E '^[0-9a-fA-F:]+$' | grep ':' | head -n1 || true
+      return 0
+    fi
+  done
+  echo "UNKNOWN"
+}
+
+# v0.5.5 (Н3): свободный loopback-порт для пробы, начиная с $1
+lucx_free_port() {
+  local p="$1" n=0
+  while (( n < 30 )); do
+    ss -ltn 2>/dev/null | grep -qE "[:.]${p} " || { echo "$p"; return 0; }
+    p=$((p+1)); n=$((n+1))
+  done
+  echo "$1"
+}
+
+# v0.5.5 (С3): страховка «x-ui остановлен нами» — при любом выходе скрипта
+# (в т.ч. неожиданном сбое между stop и start под set -e) панель запускается обратно
+LUCX_XUI_STOPPED=0
+lucx_xui_guard_fire() {
+  if [[ "${LUCX_XUI_STOPPED:-0}" == "1" ]]; then
+    LUCX_XUI_STOPPED=0
+    echo "ВНИМАНИЕ: скрипт завершился при остановленном x-ui — запускаю его обратно (бэкап БД: ${XUIDB}.backup.*)"
+    systemctl start x-ui 2>/dev/null || true
+  fi
+}
+trap lucx_xui_guard_fire EXIT
+lucx_xui_stop()  { LUCX_XUI_STOPPED=1; systemctl stop x-ui; }
+lucx_xui_start() { local rc=0; systemctl start x-ui || rc=$?; LUCX_XUI_STOPPED=0; return $rc; }
+
+# v0.5.5 (С2): параметры Reality-пробы из БД — первый ВКЛЮЧЁННЫЙ неистёкший клиент инбаунда 8446.
+# Возврат 1 (и пустые FRONT_*) = проба невозможна (нет подходящих клиентов).
+lucx_load_front_params() {
+  local now row
+  now=$(( $(date +%s) * 1000 ))
+  FRONT_UUID=""; FRONT_PBK=""; FRONT_SID=""
+  row=$(sqlite3 "$XUIDB" "SELECT json_extract(c.value,'\$.id')||'|'||COALESCE(json_extract(i.stream_settings,'\$.realitySettings.settings.publicKey'),'')||'|'||COALESCE(json_extract(i.stream_settings,'\$.realitySettings.shortIds[0]'),'') FROM (SELECT settings, stream_settings FROM inbounds WHERE protocol='vless' AND port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' LIMIT 1) i, json_each(i.settings,'\$.clients') c WHERE COALESCE(json_extract(c.value,'\$.enable'),1) IN (1,'true') AND (COALESCE(json_extract(c.value,'\$.expiryTime'),0)=0 OR json_extract(c.value,'\$.expiryTime')>${now}) LIMIT 1;" 2>/dev/null || true)
+  [[ -n "$row" ]] || return 1
+  IFS='|' read -r FRONT_UUID FRONT_PBK FRONT_SID <<<"$row"
+  [[ -n "$FRONT_UUID" ]]
 }
 
 # ================== ГЕО-СТРАЖ (v0.4.2) ==================
@@ -1293,7 +1375,12 @@ TLS_FB_JSON_H1='[{"dest":"127.0.0.1:8080","xver":0}]'
 # h2c-фасад decoy №2 (:8081, loopback) — цель alpn-fallback'а TLS-инбаунда (по докам Xray
 # h2c-слушатель nginx не обслуживает http/1.1, поэтому http/1.1 остаётся на :8080).
 ensure_decoy2_h2c_vhost() {
+  # v0.5.5 (Z3): ищем именно наш файл, а не любой вхост на 8081
+  if [[ -e /etc/nginx/sites-enabled/decoy-h2c.conf ]]; then
+    return 0
+  fi
   if grep -rqF "listen 127.0.0.1:${H2C_PORT}" /etc/nginx/sites-enabled/ 2>/dev/null; then
+    echo "  ВНИМАНИЕ: 127.0.0.1:${H2C_PORT} уже занят чужим вхостом — проверь, что он отдаёт decoy ${REALITY_DOMAIN}"
     return 0
   fi
   cat > /etc/nginx/sites-available/decoy-h2c.conf <<EOF
@@ -1301,7 +1388,6 @@ server {
     listen 127.0.0.1:${H2C_PORT} http2;
     server_name ${REALITY_DOMAIN};
     server_tokens off;
-    add_header Strict-Transport-Security "max-age=31536000" always;
     root /var/www/decoy-reality;
     index index.html;
     error_page 404 /404.html;
@@ -1328,7 +1414,7 @@ reality_front_active() {
 wait_xray_listener() { # port
   local port="$1" pid="" i
   for i in 1 2 3 4 5; do
-    pid=$(ss -tlnp 2>/dev/null | grep -E "127\.0\.0\.1:${port}\b" | grep -oP 'pid=\K[0-9]+' | head -n1 || true)
+    pid=$(ss -tlnp 2>/dev/null | grep -E "(127\.0\.0\.1|0\.0\.0\.0|\[::\]|\*):${port}\b" | grep -oP 'pid=\K[0-9]+' | head -n1 || true)
     if [[ -n "$pid" ]] && tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -qi xray; then
       return 0
     fi
@@ -1351,6 +1437,7 @@ create_reality_front_inbound() {
   if sqlite3 "$XUIDB" "SELECT 1 FROM inbounds WHERE protocol='vless' AND port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null | grep -q 1; then
     echo "  vless-инбаунд на 127.0.0.1:${REALITY_FRONT_PORT} уже существует — переиспользую."
     FRONT_EXISTS=1
+    lucx_load_front_params || echo "  ВНИМАНИЕ: в инбаунде нет включённого неистёкшего клиента — Reality-проба будет пропущена."
     return 0
   fi
   if ss -ltn 2>/dev/null | grep -qE "[:.]${REALITY_FRONT_PORT} "; then
@@ -1370,26 +1457,26 @@ create_reality_front_inbound() {
   now=$(( $(date +%s) * 1000 ))
   set_json='{"clients":[{"id":"'"${uuid}"'","flow":"xtls-rprx-vision","email":"client1-reality","limitIp":0,"totalGB":0,"expiryTime":0,"enable":true,"tgId":0,"subId":"'"${subid}"'","reset":0,"created_at":'"${now}"',"updated_at":'"${now}"'}],"decryption":"none","fallbacks":[]}'
   str_json='{"network":"tcp","security":"reality","externalProxy":[{"forceTls":"same","dest":"'"${REALITY_DOMAIN}"'","port":443,"remark":""}],"realitySettings":{"show":false,"xver":1,"target":"127.0.0.1:443","serverNames":["'"${REALITY_DOMAIN}"'"],"privateKey":"'"${priv}"'","minClientVer":"","maxClientVer":"","maxTimediff":0,"shortIds":["'"${sid}"'"],"settings":{"publicKey":"'"${pub}"'","fingerprint":"firefox","serverName":"","spiderX":"/","mldsa65Verify":""}},"tcpSettings":{"acceptProxyProtocol":true,"header":{"type":"none"}}}'
-  systemctl stop x-ui
+  lucx_xui_stop
   sleep 1
   bak="${XUIDB}.backup.$(date +%s)"
   cp -a "$XUIDB" "$bak"
   if ! sqlite3 "$XUIDB" "INSERT INTO inbounds (\"user_id\",\"up\",\"down\",\"total\",\"remark\",\"enable\",\"expiry_time\",\"listen\",\"port\",\"protocol\",\"settings\",\"stream_settings\",\"tag\",\"sniffing\") VALUES ('1','0','0','0','reality-front','1','0','127.0.0.1','${REALITY_FRONT_PORT}','vless','${set_json}','${str_json}','${REALITY_FRONT_TAG}','{\"enabled\":false,\"destOverride\":[\"http\",\"tls\",\"quic\",\"fakedns\"],\"metadataOnly\":false,\"routeOnly\":false}');"; then
     echo "  ОШИБКА: SQLite INSERT Reality-инбаунда не удался. Бэкап: ${bak}"
-    systemctl start x-ui
+    lucx_xui_start
     return 1
   fi
   set_inbound_share_addr "${REALITY_FRONT_TAG}"
   sqlite3 "$XUIDB" "INSERT INTO client_traffics (inbound_id, email, up, down, total, expiry_time, reset, enable) SELECT id, 'client1-reality', 0, 0, 0, 0, 0, 1 FROM inbounds WHERE tag='${REALITY_FRONT_TAG}' ON CONFLICT DO NOTHING;" || true
   sync_panel_clients
-  systemctl start x-ui
+  lucx_xui_start
   sleep 3
   if ! systemctl is-active --quiet x-ui || ! wait_xray_listener "${REALITY_FRONT_PORT}"; then
     echo "  ОШИБКА: Reality-инбаунд не поднялся (x-ui не active или xray не слушает 127.0.0.1:${REALITY_FRONT_PORT}) — возвращаю БД из ${bak}"
-    systemctl stop x-ui
+    lucx_xui_stop
     sleep 1
     cp -a "$bak" "$XUIDB"
-    systemctl start x-ui
+    lucx_xui_start
     return 1
   fi
   FRONT_UUID="$uuid"
@@ -1404,7 +1491,7 @@ create_reality_front_inbound() {
 xray_probe_client() {
   local stream="$1" uuid="$2" flow="$3" addr="$4" port="$5" xray_bin w p r="" url
   xray_bin=$(find /usr/local/x-ui -maxdepth 3 -name "xray-linux-*" -type f 2>/dev/null | head -n1 || true)
-  [[ -n "$xray_bin" ]] || return 0
+  [[ -n "$xray_bin" ]] || { echo "NOXRAY"; return 0; }   # v0.5.5: нет инструмента ≠ провал схемы
   w=$(mktemp -d /root/lucx-probe.XXXXXX)
   cat > "$w/c.json" <<EOF
 {"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":${port},"protocol":"socks","settings":{"udp":false}}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"${addr}","port":443,"users":[{"id":"${uuid}","encryption":"none","flow":"${flow}"}]}]},"streamSettings":${stream}}]}
@@ -1446,14 +1533,22 @@ selftest_443() {
   tf="${trow#*|}"
   [[ -n "$trow" ]] || tu=""
   if [[ -n "$tu" ]]; then
-    ttip=$(xray_probe_client '{"network":"tcp","security":"tls","tlsSettings":{"serverName":"'"${REALITY_DOMAIN}"'","fingerprint":"firefox"}}' "$tu" "$tf" "$SERVER_IP" 10861)
-    echo "  TLS-клиент (первый клиент TLS-инбаунда) -> выходной IP '${ttip:-нет}'"
-    [[ -n "$ttip" ]] || ok=1
+    ttip=$(xray_probe_client '{"network":"tcp","security":"tls","tlsSettings":{"serverName":"'"${REALITY_DOMAIN}"'","fingerprint":"firefox"}}' "$tu" "$tf" "$SERVER_IP" "$(lucx_free_port 10861)")
+    if [[ "$ttip" == "NOXRAY" ]]; then
+      echo "  TLS-клиент: НЕ проверен (xray-бинарь не найден) — это не провал схемы"
+    else
+      echo "  TLS-клиент (первый включённый клиент TLS-инбаунда) -> выходной IP '${ttip:-нет}'"
+      [[ -n "$ttip" ]] || ok=1
+    fi
   fi
   if [[ -n "$fuuid" ]]; then
-    rrip=$(xray_probe_client '{"network":"tcp","security":"reality","realitySettings":{"serverName":"'"${REALITY_DOMAIN}"'","fingerprint":"firefox","publicKey":"'"${fpbk}"'","shortId":"'"${fsid}"'","spiderX":"/"}}' "$fuuid" "xtls-rprx-vision" "$SERVER_IP" 10862)
-    echo "  Reality-клиент (client1-reality) -> выходной IP '${rrip:-нет}'"
-    [[ -n "$rrip" ]] || ok=1
+    rrip=$(xray_probe_client '{"network":"tcp","security":"reality","realitySettings":{"serverName":"'"${REALITY_DOMAIN}"'","fingerprint":"firefox","publicKey":"'"${fpbk}"'","shortId":"'"${fsid}"'","spiderX":"/"}}' "$fuuid" "xtls-rprx-vision" "$SERVER_IP" "$(lucx_free_port 10862)")
+    if [[ "$rrip" == "NOXRAY" ]]; then
+      echo "  Reality-клиент: НЕ проверен (xray-бинарь не найден) — это не провал схемы"
+    else
+      echo "  Reality-клиент (первый включённый клиент Reality-инбаунда) -> выходной IP '${rrip:-нет}'"
+      [[ -n "$rrip" ]] || ok=1
+    fi
   fi
   return $ok
 }
@@ -1521,7 +1616,7 @@ cmd_add_reality_front() {
   echo "Самотест через публичный IP ${SERVER_IP}:"
   if selftest_443 0 "${FRONT_UUID:-}" "${FRONT_PBK:-}" "${FRONT_SID:-}"; then
     echo "$VERSION" > /root/.lucx-script-version
-    if [[ -n "${FRONT_UUID:-}" && -f "$CREDS_FILE" ]]; then
+    if [[ -n "${FRONT_UUID:-}" && "${FRONT_EXISTS:-0}" != "1" && -f "$CREDS_FILE" ]]; then
       {
         echo "Reality-front UUID: ${FRONT_UUID}"
         echo "Reality-front Public Key: ${FRONT_PBK}"
@@ -1536,6 +1631,7 @@ cmd_add_reality_front() {
     echo "TLS-клиенты и подписки не менялись. Не отключай и не удаляй TLS-инбаунд (127.0.0.1:443) и Reality (127.0.0.1:${REALITY_FRONT_PORT}) по отдельности — они зависят друг от друга."
     echo "Откат: cp /root/stream-sni-router.conf.pre-reality-front-${stamp} ${stream_conf} && nginx -t && systemctl reload nginx"
     echo "Проверка: bash $0 healthcheck (блок [7a])."
+    [[ -z "${FRONT_UUID:-}" ]] && echo "ВНИМАНИЕ: Reality-проба НЕ выполнялась (нет подходящего клиента) — проверь вход клиентом вручную."
     echo "=========================================="
   else
     cp -a "/root/stream-sni-router.conf.pre-reality-front-${stamp}" "$stream_conf"
@@ -1574,6 +1670,9 @@ cmd_add_h2() {
   alpn=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.tlsSettings.alpn') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
   if [[ "$alpn" == *h2* ]]; then
     echo "h2 уже включён (alpn ${alpn}) — ничего не делаю."
+    if ! sqlite3 "$XUIDB" "SELECT json_extract(settings,'\$.fallbacks') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null | grep -q "127.0.0.1:${H2C_PORT}"; then
+      echo "ВНИМАНИЕ: alpn с h2 есть, но fallback по ALPN h2 -> 127.0.0.1:${H2C_PORT} не найден — проверь: bash $0 healthcheck (блок [7a])."
+    fi
     exit 0
   fi
   if ! systemctl is-active --quiet x-ui || ! systemctl is-active --quiet nginx; then
@@ -1586,23 +1685,32 @@ cmd_add_h2() {
     echo "ОШИБКА: h2c-слушатель 127.0.0.1:${H2C_PORT} не отвечает 200 (код ${h2c_ok}) — h2 не включаю."
     exit 1
   fi
+  # v0.5.5 (С5): штатные fallbacks заменяем, ручные (path/name/иной dest) не затираем молча
+  local custom_fb
+  custom_fb=$(sqlite3 "$XUIDB" "SELECT count(*) FROM inbounds i, json_each(i.settings,'\$.fallbacks') f WHERE i.protocol='vless' AND i.port=443 AND i.listen='127.0.0.1' AND NOT (json_extract(f.value,'\$.dest')='127.0.0.1:8080' AND json_extract(f.value,'\$.path') IS NULL AND json_extract(f.value,'\$.name') IS NULL AND json_extract(f.value,'\$.alpn') IS NULL);" 2>/dev/null || echo 0)
+  if [[ "${custom_fb:-0}" != "0" && "${LUCX_FORCE_FALLBACKS:-0}" != "1" ]]; then
+    echo "ОТКАЗ: в TLS-инбаунде есть нештатные fallbacks (${custom_fb} шт.) — add-h2 заменил бы их штатными."
+    echo "Текущие: $(sqlite3 "$XUIDB" "SELECT json(json_extract(settings,'\$.fallbacks')) FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)"
+    echo "Если замена нужна: LUCX_FORCE_FALLBACKS=1 sudo bash $0 add-h2 (бэкап БД будет сделан)."
+    exit 1
+  fi
   echo "Включаю h2 в TLS-инбаунде. x-ui будет перезапущен на несколько секунд."
-  systemctl stop x-ui
+  lucx_xui_stop
   sleep 1
   bak="${XUIDB}.backup.$(date +%s)"
   cp -a "$XUIDB" "$bak"
   echo "Бэкап БД: ${bak}"
   if ! sqlite3 "$XUIDB" "UPDATE inbounds SET stream_settings=json_set(stream_settings,'\$.tlsSettings.alpn',json('${TLS_ALPN_JSON_H2}')), settings=json_set(settings,'\$.fallbacks',json('${TLS_FB_JSON_H2}')) WHERE protocol='vless' AND port=443 AND listen='127.0.0.1';"; then
     echo "ОШИБКА: UPDATE не удался. Бэкап БД: ${bak}"
-    systemctl start x-ui
+    lucx_xui_start
     exit 1
   fi
-  systemctl start x-ui
+  lucx_xui_start
   sleep 3
-  if reality_front_active; then
-    front_uuid=$(sqlite3 "$XUIDB" "SELECT json_extract(settings,'\$.clients[0].id') FROM inbounds WHERE protocol='vless' AND port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
-    front_pbk=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.realitySettings.settings.publicKey') FROM inbounds WHERE protocol='vless' AND port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
-    front_sid=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.realitySettings.shortIds[0]') FROM inbounds WHERE protocol='vless' AND port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  if reality_front_active && lucx_load_front_params; then
+    front_uuid="$FRONT_UUID"; front_pbk="$FRONT_PBK"; front_sid="$FRONT_SID"
+  elif reality_front_active; then
+    echo "  ВНИМАНИЕ: нет включённого неистёкшего клиента в Reality-инбаунде — Reality-проба пропущена."
   fi
   echo "Самотест через публичный IP ${SERVER_IP}:"
   if systemctl is-active --quiet x-ui && wait_xray_listener 443 && selftest_443 1 "$front_uuid" "$front_pbk" "$front_sid"; then
@@ -1615,10 +1723,10 @@ cmd_add_h2() {
     echo "=========================================="
   else
     echo "ОШИБКА: самотест не прошёл — возвращаю БД из ${bak}"
-    systemctl stop x-ui
+    lucx_xui_stop
     sleep 1
     cp -a "$bak" "$XUIDB"
-    systemctl start x-ui
+    lucx_xui_start
     sleep 2
     systemctl is-active --quiet x-ui && echo "БД возвращена, x-ui active (схема как была)." || echo "ВНИМАНИЕ: x-ui не active после отката — journalctl -u x-ui -n 50"
     exit 1
@@ -1986,7 +2094,11 @@ cmd_install() {
   # громкий стоп с внятной причиной, а не загадочное падение certbot на [6/10].
   # К этому моменту dig уже доказанно работает (A-проверка выше прошла).
   for d in "$DOMAIN" "$REALITY_DOMAIN"; do
-    aaaa=$(dig +short AAAA "$d" @1.1.1.1 | head -n1 || true)
+    aaaa=$(lucx_aaaa_lookup "$d")
+    if [[ "$aaaa" == "UNKNOWN" ]]; then
+      echo "  ВНИМАНИЕ: не удалось проверить AAAA у $d (резолверы не ответили) — продолжаю; убедись сам, что AAAA нет"
+      continue
+    fi
     if [[ -n "$aaaa" ]]; then
       echo "ОШИБКА: у $d есть AAAA-запись (${aaaa})."
       echo "Схема IPv4-only: nginx и stream-роутер слушают только IPv4 — Let's Encrypt"
@@ -4303,8 +4415,11 @@ EOF
         if [[ "$FRONT_ACTIVE" != "1" ]]; then
           cp -a "${STREAM_CONF}.pre-reality-front" "$STREAM_CONF"
           nginx -t >/dev/null 2>&1 && systemctl reload nginx
+          # v0.5.5 (Z2): копию состояния до отката оставляем для разбора
+          mv -f "${STREAM_CONF}.pre-reality-front" "/root/stream-sni-router.conf.reality-front-failed-$(date +%Y%m%d-%H%M%S)" 2>/dev/null || true
+        else
+          rm -f "${STREAM_CONF}.pre-reality-front"
         fi
-        rm -f "${STREAM_CONF}.pre-reality-front"
       fi
     else
       echo "  WARN: Reality перед TLS не создан — установка продолжается без него (позже: sudo bash $0 add-reality-front)."
@@ -4914,8 +5029,10 @@ cmd_healthcheck() {
   # уводит Let's Encrypt в IPv6 (nginx слушает только v4) и тихо ломает
   # продление. Здесь это FAIL с адресом проблемы.
   for d in "$DOMAIN" "$REALITY_DOMAIN"; do
-    aaaa_hc=$(dig +short AAAA "$d" @1.1.1.1 | head -n1 || true)
-    if [[ -n "$aaaa_hc" ]]; then
+    aaaa_hc=$(lucx_aaaa_lookup "$d")
+    if [[ "$aaaa_hc" == "UNKNOWN" ]]; then
+      check "AAAA у ${d}: не удалось проверить (резолверы не ответили) — повтори healthcheck" warn
+    elif [[ -n "$aaaa_hc" ]]; then
       check "У ${d} есть AAAA-запись (${aaaa_hc}) — LE пойдёт по IPv6, продление сертов упадёт. Убери AAAA у регистратора" fail
     else
       check "AAAA-записей у ${d} нет (схема IPv4-only)" ok
@@ -5244,6 +5361,9 @@ cmd_healthcheck() {
   fi
   HC11_ALLOW_UDP=" 443 "
   if [[ -n "${AWG_PORT_HC:-}" ]]; then HC11_ALLOW_UDP+="${AWG_PORT_HC} "; fi
+  # v0.5.5 (Н1): все включённые AWG-инбаунды, а не только первый (второй/третий порт на нодах с несколькими AWG)
+  HC11_AWG_ALL=$(sqlite3 "$XUIDB" "SELECT group_concat(port,' ') FROM inbounds WHERE protocol='awg' AND enable=1;" 2>/dev/null || true)
+  if [[ -n "$HC11_AWG_ALL" ]]; then HC11_ALLOW_UDP+="${HC11_AWG_ALL} "; fi
   if [[ -f "$HC11_EXC_TCP" ]]; then
     while IFS= read -r HC11_LINE || [[ -n "$HC11_LINE" ]]; do
       HC11_LINE="${HC11_LINE%%#*}"
@@ -5542,17 +5662,29 @@ cmd_rebind_ip() {
 # ================== UPGRADE (v0.4.7): патч скрипта без переустановки ==================
 
 cmd_upgrade() {
-  local raw_url="https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/3x-ui-dual-domain.sh"
-  local tmp self_dir
+  # v0.5.5 (В1): качаем АССЕТ ПОСЛЕДНЕГО РЕЛИЗА и сверяем sha256 из релизного
+  # файла .sha256 (а не raw main: пуш в main больше не превращается в root на нодах).
+  local raw_url="https://github.com/Shepard86rus/3x-ui-dual-domain/releases/latest/download/3x-ui-dual-domain.sh"
+  local sha_url="${raw_url}.sha256"
+  local tmp self_dir want got
   # v0.4.7-fix (ревью Клоуда): tmp в каталоге скрипта (та же ФС) — mv = rename(2),
   # а не copy+unlink с обрезкой inode под работающим bash
   self_dir=$(dirname -- "$0")
   [[ -d "$self_dir" && -w "$self_dir" ]] || self_dir="/tmp"
   tmp=$(mktemp "$self_dir/lucx-upgrade.XXXXXX") || { echo "ОШИБКА: не создать временный файл"; return 1; }
-  echo "Скачиваю новейшую версию скрипта с GitHub..."
+  echo "Скачиваю последний РЕЛИЗ скрипта с GitHub (с проверкой sha256)..."
   if ! curl -fsSL --max-time 120 "$raw_url" -o "$tmp"; then
     rm -f "$tmp"; echo "ОШИБКА: скачивание не удалось ($raw_url)"; return 1
   fi
+  want=$(curl -fsSL --max-time 30 "$sha_url" 2>/dev/null | awk '{print tolower($1)}' | head -n1 || true)
+  if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
+    rm -f "$tmp"; echo "ОТКАЗ: у релиза нет файла контрольной суммы (${sha_url##*/}) — обновление не выполняю"; return 1
+  fi
+  got=$(sha256sum "$tmp" | awk '{print $1}')
+  if [[ "$got" != "$want" ]]; then
+    rm -f "$tmp"; echo "ОТКАЗ: sha256 не совпал (ожидали ${want:0:16}…, получили ${got:0:16}…) — обновление не выполняю"; return 1
+  fi
+  echo "  sha256 релиза сошёлся: ${got:0:16}…"
   if ! bash -n "$tmp"; then
     rm -f "$tmp"; echo "ОШИБКА: новый файл не проходит bash -n — откат"; return 1
   fi
@@ -5582,6 +5714,7 @@ cmd_upgrade() {
   cp -p "$self" "${self}.upgrade-old" || { rm -f "$tmp"; echo "ОШИБКА: не создать бэкап"; return 1; }
   mv -f "$tmp" "$self" || { rm -f "$tmp"; echo "ОШИБКА: замена не удалась"; return 1; }
   chmod --reference="${self}.upgrade-old" "$self" 2>/dev/null || chmod +x "$self"
+  echo "$new_ver" > /root/.lucx-script-version 2>/dev/null || true   # v0.5.5 (Н4)
   echo "Обновлено: v$VERSION -> v$new_ver (бэкап предыдущей: ${self}.upgrade-old)"
   echo "Запускаю healthcheck новой версией..."
   exec bash "$self" healthcheck
@@ -5595,7 +5728,7 @@ cmd_upgrade() {
 # (add-bot перезаписывает тело, env не трогает).
 TGBOT_DIR="/opt/tgbot"
 TGBOT_ENV="/etc/tgbot/env"
-TGBOT_BODY_VERSION="0.5.1"
+TGBOT_BODY_VERSION="0.5.5"   # v0.5.5: убрана кнопка «Панель (update)»; проверка from.id
 
 tgbot_write_body() { # тело бота (правки — только через новую версию скрипта)
   mkdir -p "$TGBOT_DIR"
@@ -5642,7 +5775,7 @@ kb_home() {
     [{text:"💾 Диск",callback_data:"cmd:disk"},{text:"📜 Лог x-ui",callback_data:"cmd:log"}],
     [{text:"🩺 Healthcheck",callback_data:"cmd:hc"},{text:"🔐 Бэкап БД",callback_data:"cmd:backup"}],
     [{text:"♻ Рестарт панели",callback_data:"ask:restart_panel"},{text:"♻ Рестарт xray",callback_data:"ask:restart_xray"}],
-    [{text:"⬆ Скрипт (upgrade)",callback_data:"ask:upgrade"},{text:"⬆ Панель (update)",callback_data:"ask:update_panel"}]
+    [{text:"⬆ Скрипт (upgrade)",callback_data:"ask:upgrade"}]
   ]}')
   if cl_enabled; then
     row='[{"text":"➕ Клиент","callback_data":"cl:add"},{"text":"🗑 Удалить клиента","callback_data":"cl:del"},{"text":"📋 Список","callback_data":"cl:list"}]'
@@ -5846,9 +5979,6 @@ EOS
     backup)  echo 'f="/root/x-ui-backup-$(date +%F-%H%M).db"; sqlite3 /etc/x-ui/x-ui.db ".backup $f" && [ -s "$f" ] && echo "бэкап: $f" || echo "ОШИБКА бэкапа"' ;;
     restart_panel) echo 'systemctl restart x-ui && echo "панель перезапущена" || echo "ОШИБКА рестарта"' ;;
     restart_xray)  echo 'pkill -f "[x]ray-linux-"; sleep 3; n=$(pgrep -c -f "[x]ray-linux-" 2>/dev/null); n=${n:-0}; if [ "$n" -eq 0 ]; then sleep 5; n=$(pgrep -c -f "[x]ray-linux-" 2>/dev/null); n=${n:-0}; fi; echo "xray процессов: $n"' ;;
-    update_panel)
-      echo 'printf "y\n4\n" | timeout 300 x-ui update >/dev/null 2>&1; sleep 30; echo "сервис: $(systemctl is-active x-ui); версия: $(/usr/local/x-ui/x-ui -v 2>/dev/null | head -1)"'
-      ;;
     *)
       echo ''
       ;;
@@ -5882,12 +6012,13 @@ run_cmd() { # $1 cmd — словарь проверен вызывающим
 }
 
 on_callback() { # $1 = callback_query json
-  local cbid data mid cid c t out
+  local cbid data mid cid fid c t out
   cbid=$(jq -r '.id' <<<"$1")
   cid=$(jq -r '.message.chat.id // .from.id // empty' <<<"$1")
+  fid=$(jq -r '.from.id // empty' <<<"$1")
   mid=$(jq -r '.message.message_id // empty' <<<"$1")
   data=$(jq -r '.data // empty' <<<"$1")
-  if [ -z "$cid" ] || [ "$cid" != "${CHAT_ID:-}" ]; then answer "$cbid" 'нет доступа'; return; fi
+  if [ -z "$cid" ] || [ "$cid" != "${CHAT_ID:-}" ] || [ "$fid" != "${CHAT_ID:-}" ]; then answer "$cbid" 'нет доступа'; return; fi
   case "$data" in
     home)
       answer "$cbid" ''
@@ -5905,13 +6036,12 @@ $out"
       ;;
     ask:*)
       c=${data#ask:}
-      case "$c" in restart_panel|restart_xray|upgrade|update_panel) ;; *) answer "$cbid" 'неизвестная команда'; return ;; esac
+      case "$c" in restart_panel|restart_xray|upgrade) ;; *) answer "$cbid" 'неизвестная команда'; return ;; esac
       ASK_CMD="$c"; ASK_TS=$(date +%s)
       case "$c" in
         restart_panel) t='рестарт панели' ;;
         restart_xray)  t='рестарт xray (клиенты переподключатся)' ;;
         upgrade)       t='обновление скрипта (до новейшей + hc)' ;;
-        update_panel)  t='обновление панели (~1-2 мин, панель кратко недоступна)' ;;
       esac
       answer "$cbid" ''
       edit_card "$cid" "$mid" "⚠ <b>$(esc "$NODE_NAME")</b>: $t. Выполнять?" "$(kb_confirm "$c")"
@@ -5975,7 +6105,7 @@ if [ "${1:-}" = selftest ]; then
   if cl_enabled; then echo 'клиенты: включено (PANEL_API_TOKEN задан)'; else echo 'клиенты: выключено (нет PANEL_API_TOKEN)'; fi
   kb_confirm restart_panel | jq -e '.inline_keyboard[0] | length == 2' >/dev/null && echo 'kb_confirm: ok' || echo 'kb_confirm: ПРОВАЛ'
   ok=1
-  for c in status versions disk log backup restart_panel restart_xray update_panel; do
+  for c in status versions disk log backup restart_panel restart_xray; do
     [ -n "$(snippet "$c")" ] || { echo "snippet $c: ПУСТОЙ"; ok=0; }
   done
   [ -n "$(snippet_hc /root/3x-ui-dual-domain.sh)" ] || { echo 'snippet hc: ПУСТОЙ'; ok=0; }
@@ -5995,6 +6125,9 @@ while true; do
       on_callback "$(jq -c '.callback_query' <<<"$upd")"
     else
       cid=$(jq -r '.message.chat.id // empty' <<<"$upd" 2>/dev/null)
+      fid=$(jq -r '.message.from.id // empty' <<<"$upd" 2>/dev/null)
+      # v0.5.5 (Н5): при заданном CHAT_ID команды принимаются только от него самого (не от любого в группе)
+      if [ -n "${CHAT_ID:-}" ] && [ "$fid" != "${CHAT_ID}" ]; then cid=""; fi
       text=$(jq -r '.message.text // empty' <<<"$upd" 2>/dev/null)
       [ -n "$cid" ] && [ -n "$text" ] && handle "$cid" "$text"
     fi

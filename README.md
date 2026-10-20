@@ -63,6 +63,7 @@ bash 3x-ui-dual-domain.sh healthcheck
 | `bash 3x-ui-dual-domain.sh add-h2` | включить h2 в TLS-инбаунде (бэкап БД, самотест, автооткат) |
 | `bash 3x-ui-dual-domain.sh add-reality-front` | Reality перед TLS на том же домене/443 (бэкап, самотест, автооткат) |
 | `bash 3x-ui-dual-domain.sh add-hy2` | добавить Hysteria2-инбаунд |
+| `bash 3x-ui-dual-domain.sh add-xhttp <имя>` / `remove-xhttp` | третий вход XHTTP+Reality на отдельном имени (необязательно, см. [docs/xhttp.md](docs/xhttp.md)) |
 | `bash 3x-ui-dual-domain.sh add-bot` / `remove-bot` | поставить или удалить Telegram-бота |
 | `bash 3x-ui-dual-domain.sh add-swap` / `remove-swap` | опционально: swap-файл на ноде с малой памятью |
 | `bash 3x-ui-dual-domain.sh rebind-ip` | сервер сменил IP — перепрописать конфиги |
@@ -83,6 +84,7 @@ bash 3x-ui-dual-domain.sh healthcheck
 |---|---|
 | [docs/scheme.md](docs/scheme.md) | как устроена схема, зачем два домена, TLS + h2 + Reality на 443, режим «только Reality» |
 | [docs/install.md](docs/install.md) | установка по шагам, ручная настройка панели |
+| [docs/xhttp.md](docs/xhttp.md) | необязательный третий вход XHTTP+Reality (`add-xhttp`) |
 | [docs/panel-rules.md](docs/panel-rules.md) | что можно и нельзя в панели, как добавлять новые протоколы |
 | [docs/telegram-bot.md](docs/telegram-bot.md) | Telegram-бот, управление клиентами, безопасность |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | если что-то не так |

@@ -842,7 +842,21 @@
 #        Тело бота v0.5.5 — только для нод со встроенным ботом (add-bot). Хаб-бот (отдельный tgbot-hub) этим не затрагивается; add-bot на хаб-ноде НЕ запускать (перезапишет юнит tgbot).
 #   НЕ менялось: С4 (самотест идёт ключом реального клиента — это отражено в тексте вывода),
 #   Н7, мёртвая Reality-only ветка install (отложены).
-VERSION="0.5.5"
+# v0.5.6 (2026-10-20) — третий вход: VLESS + XHTTP + Reality на отдельном имени, без CDN (команды
+#   add-xhttp / remove-xhttp). Схема: nginx stream <имя> -> xhttp_backend -> 127.0.0.1:8447 (xray,
+#   acceptProxyProtocol); Reality target = 127.0.0.1:8445 — свой nginx-вхост с СОБСТВЕННЫМ серт.
+#   Let's Encrypt и той же заглушкой, поэтому непрошенный гость видит сайт с валидным сертификатом
+#   именно на это имя. TLS и Reality перед TLS не меняются. Проверка живьём на тестовой ноде (2026-10-20):
+#   (1) lucx .30x берёт клиентов из таблиц clients/client_inbounds, запись только в settings инбаунда
+#   даёт clients=[] в конфиге xray — используется x-ui migrate + страховка прямой вставкой;
+#   (2) через nginx XHTTP-инбаунду нужен sockopt.acceptProxyProtocol; (3) на ноде старый nginx: «listen … ssl http2»,
+#   а не «http2 on;». Самотест: клиент xray (xhttp+reality) через публичный IP + гость без ключа (200 и
+#   валидный сертификат) + существующие TLS/Reality; провал — откат nginx/БД/вхостов (серт остаётся).
+#   healthcheck: блок [7b]; доп. loopback-инбаунд XHTTP больше не даёт WARN «эксперимент». ПОВЕДЕНИЕ:
+#   повторный install перегенерирует stream-конфиг без XHTTP — после него add-xhttp запустить заново.
+#   minClientVer инбаунда XHTTP = 1.8.0 (при пустом значении Xray 26.x применяет минимум 26.3.27 и
+#   отсекает клиентов с иным отпечатком версии — проверено предупреждением в журнале xray).
+VERSION="0.5.6"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
 # С v3.7.0-lucx.203 install-awg-module.sh качает исходники tarball'ом
@@ -912,14 +926,14 @@ sqlite_has_column() { # table column
   sqlite3 "$XUIDB" "SELECT 1 FROM pragma_table_info('$1') WHERE name='$2' LIMIT 1;" 2>/dev/null | grep -q 1
 }
 
-set_inbound_share_addr() { # tag — «Пользовательский адрес для ссылок» = основной домен
-  local tag="$1"
+set_inbound_share_addr() { # tag [домен] — «Пользовательский адрес для ссылок» (по умолчанию основной домен)
+  local tag="$1" dom="${2:-${REALITY_DOMAIN}}"
   if ! sqlite_has_column inbounds share_addr_strategy || ! sqlite_has_column inbounds share_addr; then
     echo "  WARN: в этой версии панели нет полей адреса для ссылок — задай его в панели вручную (инбаунд -> Основное)."
     return 0
   fi
-  if sqlite3 "$XUIDB" "UPDATE inbounds SET share_addr_strategy='custom', share_addr='${REALITY_DOMAIN}' WHERE tag='${tag}';"; then
-    echo "  Адрес для ссылок инбаунда ${tag}: custom -> ${REALITY_DOMAIN}"
+  if sqlite3 "$XUIDB" "UPDATE inbounds SET share_addr_strategy='custom', share_addr='${dom}' WHERE tag='${tag}';"; then
+    echo "  Адрес для ссылок инбаунда ${tag}: custom -> ${dom}"
   else
     echo "  WARN: не удалось записать адрес для ссылок (tag ${tag}) — задай его в панели вручную."
   fi
@@ -1371,6 +1385,12 @@ TLS_ALPN_JSON_H2='["h2","http/1.1"]'
 TLS_ALPN_JSON_H1='["http/1.1"]'
 TLS_FB_JSON_H2='[{"dest":"127.0.0.1:8080","xver":0},{"alpn":"h2","dest":"127.0.0.1:8081","xver":0}]'
 TLS_FB_JSON_H1='[{"dest":"127.0.0.1:8080","xver":0}]'
+
+# v0.5.6: XHTTP+Reality (add-xhttp)
+XHTTP_PORT=8447
+XHTTP_TARGET_PORT=8445
+XHTTP_TAG="in-8447-xhttp"
+XHTTP_MIN_CLIENT="1.8.0"
 
 # h2c-фасад decoy №2 (:8081, loopback) — цель alpn-fallback'а TLS-инбаунда (по докам Xray
 # h2c-слушатель nginx не обслуживает http/1.1, поэтому http/1.1 остаётся на :8080).
@@ -5102,10 +5122,10 @@ cmd_healthcheck() {
       # эксперименты пользователя валидны. Но если такой инбаунд слушает
       # НЕ loopback — это открытый порт мимо nginx SNI-роутера, и тут
       # уже FAIL.
-      extra=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbounds WHERE protocol='vless' AND port!=443 AND NOT (port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' AND tag='${REALITY_FRONT_TAG}');" 2>/dev/null || echo 0)
+      extra=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbounds WHERE protocol='vless' AND port!=443 AND NOT (port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' AND tag='${REALITY_FRONT_TAG}') AND NOT (port=${XHTTP_PORT} AND listen='127.0.0.1' AND tag='${XHTTP_TAG}');" 2>/dev/null || echo 0)
       if [[ "$extra" -gt 0 ]]; then
-        extra_list=$(sqlite3 "$XUIDB" "SELECT remark||':'||COALESCE(listen,'<все>')||':'||port FROM inbounds WHERE protocol='vless' AND port!=443 AND NOT (port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' AND tag='${REALITY_FRONT_TAG}');" 2>/dev/null | paste -sd', ' - || true)
-        extra_open=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbounds WHERE protocol='vless' AND port!=443 AND NOT (port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' AND tag='${REALITY_FRONT_TAG}') AND (listen IS NULL OR listen='' OR listen NOT LIKE '127.%');" 2>/dev/null || echo 0)
+        extra_list=$(sqlite3 "$XUIDB" "SELECT remark||':'||COALESCE(listen,'<все>')||':'||port FROM inbounds WHERE protocol='vless' AND port!=443 AND NOT (port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' AND tag='${REALITY_FRONT_TAG}') AND NOT (port=${XHTTP_PORT} AND listen='127.0.0.1' AND tag='${XHTTP_TAG}');" 2>/dev/null | paste -sd', ' - || true)
+        extra_open=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbounds WHERE protocol='vless' AND port!=443 AND NOT (port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' AND tag='${REALITY_FRONT_TAG}') AND NOT (port=${XHTTP_PORT} AND listen='127.0.0.1' AND tag='${XHTTP_TAG}') AND (listen IS NULL OR listen='' OR listen NOT LIKE '127.%');" 2>/dev/null || echo 0)
         if [[ "$extra_open" -gt 0 ]]; then
           check "Доп. vless-инбаунды НЕ на loopback (${extra_list}) — риск открытого порта мимо nginx" fail
         else
@@ -5251,6 +5271,80 @@ cmd_healthcheck() {
     fi
   else
     check "Блок пропущен: режим 443 не TLS или x-ui.db не найден" warn
+  fi
+  echo
+
+  echo "=== [7b] XHTTP+Reality (v0.5.6) ==="
+  if [[ -f "$XUIDB" ]] && xhttp_active; then
+    hcx_dom=$(xhttp_domain_cfg)
+    hcx_ip=$(get_server_ip 2>/dev/null || true)
+    hcx_row="SELECT %s FROM inbounds WHERE tag='${XHTTP_TAG}' LIMIT 1;"
+    # shellcheck disable=SC2059
+    hcx_en=$(sqlite3 "$XUIDB" "$(printf "$hcx_row" "enable")" 2>/dev/null || true)
+    # shellcheck disable=SC2059
+    hcx_net=$(sqlite3 "$XUIDB" "$(printf "$hcx_row" "json_extract(stream_settings,'\$.network')")" 2>/dev/null || true)
+    # shellcheck disable=SC2059
+    hcx_sec=$(sqlite3 "$XUIDB" "$(printf "$hcx_row" "json_extract(stream_settings,'\$.security')")" 2>/dev/null || true)
+    # shellcheck disable=SC2059
+    hcx_tgt=$(sqlite3 "$XUIDB" "$(printf "$hcx_row" "COALESCE(json_extract(stream_settings,'\$.realitySettings.target'),json_extract(stream_settings,'\$.realitySettings.dest'))")" 2>/dev/null || true)
+    # shellcheck disable=SC2059
+    hcx_sn=$(sqlite3 "$XUIDB" "$(printf "$hcx_row" "json_extract(stream_settings,'\$.realitySettings.serverNames[0]')")" 2>/dev/null || true)
+    # shellcheck disable=SC2059
+    hcx_pp=$(sqlite3 "$XUIDB" "$(printf "$hcx_row" "json_extract(stream_settings,'\$.sockopt.acceptProxyProtocol')")" 2>/dev/null || true)
+    # shellcheck disable=SC2059
+    hcx_ep=$(sqlite3 "$XUIDB" "$(printf "$hcx_row" "json_extract(stream_settings,'\$.externalProxy[0].port')")" 2>/dev/null || true)
+    if [[ -z "$hcx_en" ]]; then
+      check "XHTTP: в stream-конфиге есть xhttp_backend (${hcx_dom:-?}), но инбаунда ${XHTTP_TAG} нет в БД — вход мёртв. Убрать хвост: sudo bash $0 remove-xhttp" fail
+    else
+      [[ "$hcx_en" == "1" ]] && check "XHTTP: инбаунд ${XHTTP_TAG} включён" ok || check "XHTTP: инбаунд ${XHTTP_TAG} выключен — вход мёртв" fail
+      [[ "$hcx_net" == "xhttp" && "$hcx_sec" == "reality" ]] && check "XHTTP: network=xhttp, security=reality" ok || check "XHTTP: network '${hcx_net:-?}', security '${hcx_sec:-?}' (нужно xhttp+reality)" fail
+      [[ "$hcx_tgt" == "127.0.0.1:${XHTTP_TARGET_PORT}" ]] && check "XHTTP: Reality target = 127.0.0.1:${XHTTP_TARGET_PORT} (вхост со своим сертификатом)" ok || check "XHTTP: target '${hcx_tgt:-?}' != 127.0.0.1:${XHTTP_TARGET_PORT} — непрошенный гость увидит не ту заглушку/сертификат" fail
+      [[ "$hcx_sn" == "$hcx_dom" ]] && check "XHTTP: serverNames[0] = ${hcx_dom}" ok || check "XHTTP: serverNames[0] '${hcx_sn:-?}' != '${hcx_dom:-?}' (имя в nginx)" fail
+      [[ "$hcx_pp" == "1" || "$hcx_pp" == "true" ]] && check "XHTTP: sockopt.acceptProxyProtocol включён" ok || check "XHTTP: нет acceptProxyProtocol — nginx шлёт PROXY, соединения оборвутся" fail
+      [[ "$hcx_ep" == "443" ]] && check "XHTTP: External Proxy порт 443 (ссылки на 443, не ${XHTTP_PORT})" ok || check "XHTTP: External Proxy порт '${hcx_ep:-нет}' — ссылки подписки получат порт ${XHTTP_PORT}" fail
+      hcx_pid=$(ss -tlnp 2>/dev/null | grep -E "127\.0\.0\.1:${XHTTP_PORT}\b" | grep -oP 'pid=\K[0-9]+' | head -n1 || true)
+      if [[ -n "$hcx_pid" ]] && tr '\0' ' ' < "/proc/${hcx_pid}/cmdline" 2>/dev/null | grep -qi xray; then
+        check "XHTTP: xray слушает 127.0.0.1:${XHTTP_PORT}" ok
+      else
+        check "XHTTP: на 127.0.0.1:${XHTTP_PORT} нет xray — вход ${hcx_dom} мёртв" fail
+      fi
+      hcx_cl=$(sqlite3 "$XUIDB" "SELECT count(*) FROM client_inbounds ci JOIN inbounds i ON i.id=ci.inbound_id WHERE i.tag='${XHTTP_TAG}';" 2>/dev/null || echo 0)
+      if [[ "${hcx_cl:-0}" -gt 0 ]]; then
+        check "XHTTP: к инбаунду привязано клиентов: ${hcx_cl}" ok
+      else
+        check "XHTTP: к инбаунду не привязан ни один клиент в таблице панели — xray получит clients=[], войти нельзя" fail
+      fi
+    fi
+    if grep -qE "^\s*upstream xhttp_backend\s*\{\s*server 127\.0\.0\.1:${XHTTP_PORT};" /etc/nginx/stream-sni-router.conf 2>/dev/null; then
+      check "XHTTP: stream upstream xhttp_backend -> 127.0.0.1:${XHTTP_PORT}" ok
+    else
+      check "XHTTP: upstream xhttp_backend не указывает на 127.0.0.1:${XHTTP_PORT}" fail
+    fi
+    hcx_t=$(curl -sk -m 5 -o /dev/null -w "%{http_code}" --resolve "${hcx_dom}:${XHTTP_TARGET_PORT}:127.0.0.1" "https://${hcx_dom}:${XHTTP_TARGET_PORT}/" 2>/dev/null || echo 000)
+    [[ "$hcx_t" == "200" ]] && check "XHTTP: вхост-мишень 127.0.0.1:${XHTTP_TARGET_PORT} отвечает 200" ok || check "XHTTP: вхост-мишень 127.0.0.1:${XHTTP_TARGET_PORT} не отвечает 200 (код ${hcx_t})" fail
+    hcx_crt="/etc/letsencrypt/live/${hcx_dom}/fullchain.pem"
+    if [[ -s "$hcx_crt" ]]; then
+      if openssl x509 -in "$hcx_crt" -noout -checkend $((14*86400)) >/dev/null 2>&1; then
+        check "XHTTP: сертификат ${hcx_dom} действует ещё >14 дней" ok
+      else
+        check "XHTTP: сертификат ${hcx_dom} истекает <14 дней (или уже истёк) — certbot renew" fail
+      fi
+    else
+      check "XHTTP: сертификат ${hcx_dom} не найден" fail
+    fi
+    [[ -f "/etc/letsencrypt/renewal/${hcx_dom}.conf" ]] && check "XHTTP: автопродление сертификата настроено (renewal/${hcx_dom}.conf)" ok || check "XHTTP: нет renewal/${hcx_dom}.conf — сертификат не продлится сам" warn
+    if [[ -n "$hcx_ip" ]]; then
+      hcx_g=$(curl -s -m 10 -o /dev/null -w "%{http_code} %{ssl_verify_result}" --resolve "${hcx_dom}:443:${hcx_ip}" "https://${hcx_dom}/" 2>/dev/null || echo "000 -")
+      if [[ "$hcx_g" == "200 0" ]]; then
+        check "XHTTP: гость без ключа на https://${hcx_dom}/ получает сайт-заглушку с валидным сертификатом" ok
+      else
+        check "XHTTP: гость на https://${hcx_dom}/ -> '${hcx_g}' (ожидается '200 0': сайт и валидный сертификат)" fail
+      fi
+    else
+      check "XHTTP: публичный IP не определён — внешнюю проверку гостя пропускаю" warn
+    fi
+  else
+    echo "  XHTTP не включён (опционально: sudo bash $0 add-xhttp <третье имя>)"
   fi
   echo
 
@@ -6400,6 +6494,424 @@ cmd_remove_swap() {
   echo "Готово: swap-файл, запись в fstab и sysctl-файл удалены."
 }
 
+# ================== РЕЖИМ: ADD-XHTTP / REMOVE-XHTTP (v0.5.6) ==================
+# Третий вход на том же 443: VLESS + XHTTP + Reality на отдельном имени (SNI). Схема:
+#   nginx stream: <xhttp-домен> -> xhttp_backend -> 127.0.0.1:8447 (xray, VLESS+XHTTP+Reality,
+#   acceptProxyProtocol) ; Reality-мишень (target) = 127.0.0.1:8445 — собственный nginx-вхост
+#   с СОБСТВЕННЫМ сертификатом xhttp-домена и той же заглушкой (decoy-reality), поэтому
+#   непрошенный гость видит обычный сайт с валидным сертификатом именно на это имя.
+# TLS-инбаунд (127.0.0.1:443) и Reality перед TLS (127.0.0.1:8446) НЕ меняются.
+# Без CDN: Reality через CDN работать не может (CDN терминирует TLS сам).
+# Клиент без flow (Vision к XHTTP не применяется), mux не включать (по докам Xray).
+
+# true, если в stream-конфиге уже есть upstream xhttp_backend
+xhttp_active() {
+  grep -qE '^\s*upstream xhttp_backend\s*\{' /etc/nginx/stream-sni-router.conf 2>/dev/null
+}
+
+# имя, направленное на xhttp_backend (из map stream-конфига); пусто, если не включено
+xhttp_domain_cfg() {
+  grep -oP '^\s*\K[A-Za-z0-9.-]+(?=\s+xhttp_backend;)' /etc/nginx/stream-sni-router.conf 2>/dev/null | head -n1 || true
+}
+
+# убирает nginx-файлы add-xhttp (вхост :80 для ACME и вхост-мишень) и перечитывает nginx
+xhttp_remove_vhosts() {
+  rm -f /etc/nginx/sites-enabled/xhttp-80.conf /etc/nginx/sites-available/xhttp-80.conf \
+        /etc/nginx/sites-enabled/xhttp-decoy-tls.conf /etc/nginx/sites-available/xhttp-decoy-tls.conf
+  if nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx 2>/dev/null || true
+  fi
+}
+
+# Страховка для панелей, где `x-ui migrate` не перенёс клиента в таблицы clients/client_inbounds
+# (без этого xray получает clients=[] и никто не подключится). Вызывать при ОСТАНОВЛЕННОМ x-ui.
+xhttp_ensure_panel_client() { # tag email uuid subid
+  local tag="$1" email="$2" uuid="$3" subid="$4" iid cid now
+  sqlite3 "$XUIDB" "SELECT 1 FROM sqlite_master WHERE type='table' AND name='clients' LIMIT 1;" 2>/dev/null | grep -q 1 || return 0
+  sqlite_has_column clients uuid || return 0
+  sqlite_has_column clients sub_id || return 0
+  iid=$(sqlite3 "$XUIDB" "SELECT id FROM inbounds WHERE tag='${tag}' LIMIT 1;" 2>/dev/null || true)
+  [[ -n "$iid" ]] || return 0
+  if sqlite3 "$XUIDB" "SELECT 1 FROM client_inbounds WHERE inbound_id=${iid} LIMIT 1;" 2>/dev/null | grep -q 1; then
+    return 0
+  fi
+  now=$(( $(date +%s) * 1000 ))
+  cid=$(sqlite3 "$XUIDB" "SELECT id FROM clients WHERE email='${email}' LIMIT 1;" 2>/dev/null || true)
+  if [[ -z "$cid" ]]; then
+    sqlite3 "$XUIDB" "INSERT INTO clients (email,sub_id,uuid,password,auth,flow,security,limit_ip,total_gb,expiry_time,enable,tg_id,comment,created_at,updated_at) VALUES ('${email}','${subid}','${uuid}','$(openssl rand -hex 8)','$(openssl rand -hex 8)','','auto',0,0,0,1,0,'',${now},${now});" 2>/dev/null || return 0
+    cid=$(sqlite3 "$XUIDB" "SELECT id FROM clients WHERE email='${email}' LIMIT 1;" 2>/dev/null || true)
+  fi
+  [[ -n "$cid" ]] || return 0
+  sqlite3 "$XUIDB" "INSERT OR IGNORE INTO client_inbounds (client_id,inbound_id,flow_override,created_at) VALUES (${cid},${iid},'',${now});" 2>/dev/null || true
+  echo "  (страховка) клиент ${email} добавлен в таблицы панели напрямую — x-ui migrate его не перенёс."
+  return 0
+}
+
+# Создаёт XHTTP+Reality инбаунд 127.0.0.1:XHTTP_PORT. Нужны: XHTTP_DOM (имя), REALITY_DOMAIN, XUIDB.
+# Сам останавливает/запускает x-ui, делает бэкап БД (XH_BAK); при неудаче возвращает БД.
+# Выставляет XH_UUID/XH_PBK/XH_SID/XH_PATH/XH_BAK.
+create_xhttp_inbound() {
+  local xray_bin keys priv pub sid uuid subid now xpath set_json str_json
+  xray_bin=$(find /usr/local/x-ui -maxdepth 3 -name "xray-linux-*" -type f 2>/dev/null | head -n1 || true)
+  if [[ -z "$xray_bin" || ! -f "$XUIDB" ]]; then
+    echo "  ОШИБКА: xray или x-ui.db не найдены — XHTTP-инбаунд не создан."
+    return 1
+  fi
+  keys=$("$xray_bin" x25519 2>/dev/null || true)
+  priv=$(echo "$keys" | awk -F': *' 'tolower($1) ~ /^private ?key$/ {print $2; exit}')
+  pub=$(echo "$keys" | awk -F': *' 'tolower($1) ~ /public ?key|^password/ {print $2; exit}')
+  if [[ -z "$priv" || -z "$pub" ]]; then
+    echo "  ОШИБКА: не удалось сгенерировать Reality-ключи."
+    return 1
+  fi
+  sid=$(openssl rand -hex 8)
+  uuid=$(cat /proc/sys/kernel/random/uuid)
+  subid=$(openssl rand -hex 8)
+  xpath="/$(openssl rand -hex 6)"
+  now=$(( $(date +%s) * 1000 ))
+  # flow пустой: Vision к XHTTP не применяется
+  set_json='{"clients":[{"id":"'"${uuid}"'","flow":"","email":"client1-xhttp","limitIp":0,"totalGB":0,"expiryTime":0,"enable":true,"tgId":0,"subId":"'"${subid}"'","reset":0,"created_at":'"${now}"',"updated_at":'"${now}"'}],"decryption":"none","fallbacks":[]}'
+  str_json='{"network":"xhttp","security":"reality","externalProxy":[{"forceTls":"same","dest":"'"${XHTTP_DOM}"'","port":443,"remark":""}],"realitySettings":{"show":false,"xver":0,"target":"127.0.0.1:'"${XHTTP_TARGET_PORT}"'","serverNames":["'"${XHTTP_DOM}"'"],"privateKey":"'"${priv}"'","minClientVer":"'"${XHTTP_MIN_CLIENT}"'","maxClientVer":"","maxTimediff":0,"shortIds":["'"${sid}"'"],"settings":{"publicKey":"'"${pub}"'","fingerprint":"firefox","serverName":"","spiderX":"/","mldsa65Verify":""}},"xhttpSettings":{"path":"'"${xpath}"'","host":"","mode":"auto"},"sockopt":{"acceptProxyProtocol":true}}'
+  lucx_xui_stop
+  sleep 1
+  XH_BAK="${XUIDB}.backup.$(date +%s)"
+  cp -a "$XUIDB" "$XH_BAK"
+  if ! sqlite3 "$XUIDB" "INSERT INTO inbounds (\"user_id\",\"up\",\"down\",\"total\",\"remark\",\"enable\",\"expiry_time\",\"listen\",\"port\",\"protocol\",\"settings\",\"stream_settings\",\"tag\",\"sniffing\") VALUES ('1','0','0','0','xhttp-reality','1','0','127.0.0.1','${XHTTP_PORT}','vless','${set_json}','${str_json}','${XHTTP_TAG}','{\"enabled\":false,\"destOverride\":[\"http\",\"tls\",\"quic\",\"fakedns\"],\"metadataOnly\":false,\"routeOnly\":false}');"; then
+    echo "  ОШИБКА: SQLite INSERT XHTTP-инбаунда не удался. Бэкап: ${XH_BAK}"
+    lucx_xui_start
+    return 1
+  fi
+  set_inbound_share_addr "${XHTTP_TAG}" "${XHTTP_DOM}"
+  sqlite3 "$XUIDB" "INSERT INTO client_traffics (inbound_id, email, up, down, total, expiry_time, reset, enable) SELECT id, 'client1-xhttp', 0, 0, 0, 0, 0, 1 FROM inbounds WHERE tag='${XHTTP_TAG}' ON CONFLICT DO NOTHING;" || true
+  sync_panel_clients
+  xhttp_ensure_panel_client "${XHTTP_TAG}" "client1-xhttp" "$uuid" "$subid"
+  lucx_xui_start
+  sleep 3
+  if ! systemctl is-active --quiet x-ui || ! wait_xray_listener "${XHTTP_PORT}"; then
+    echo "  ОШИБКА: XHTTP-инбаунд не поднялся (x-ui не active или xray не слушает 127.0.0.1:${XHTTP_PORT}) — возвращаю БД из ${XH_BAK}"
+    lucx_xui_stop
+    sleep 1
+    cp -a "$XH_BAK" "$XUIDB"
+    lucx_xui_start
+    return 1
+  fi
+  XH_UUID="$uuid"
+  XH_PBK="$pub"
+  XH_SID="$sid"
+  XH_PATH="$xpath"
+  echo "  XHTTP-инбаунд создан: 127.0.0.1:${XHTTP_PORT}, клиент client1-xhttp, ссылки на порт 443 (External Proxy)."
+  return 0
+}
+
+# откат целиком: stream-конфиг из бэкапа, БД из бэкапа (без XHTTP-инбаунда), вхосты nginx убраны.
+# Сертификат Let's Encrypt остаётся (безвреден, переиспользуется при повторе).
+xhttp_rollback_all() { # stream_backup db_backup
+  local sbak="$1" dbak="${2:-}"
+  [[ -n "$sbak" && -f "$sbak" ]] && cp -a "$sbak" /etc/nginx/stream-sni-router.conf
+  xhttp_remove_vhosts
+  if [[ -n "$dbak" && -f "$dbak" ]]; then
+    lucx_xui_stop
+    sleep 1
+    cp -a "$dbak" "$XUIDB"
+    lucx_xui_start
+    sleep 2
+  fi
+  if nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx 2>/dev/null || true
+  fi
+}
+
+cmd_add_xhttp() {
+  if [[ $EUID -ne 0 ]]; then
+    echo "Запусти от root: sudo bash $0 add-xhttp <домен>"
+    exit 1
+  fi
+  REALITY_XRAY_PORT=443
+  read_domains
+  if [[ -z "${DOMAIN:-}" || -z "${REALITY_DOMAIN:-}" ]]; then
+    echo "ОШИБКА: не удалось определить домены из ${CREDS_FILE}."
+    exit 1
+  fi
+  local stream_conf="/etc/nginx/stream-sni-router.conf" webroot="/var/www/html"
+  local xdom="${1:-${XHTTP_DOMAIN:-}}" stamp sbak a_rec aaaa have_cert
+  SERVER_IP=$(get_server_ip)
+  if [[ ! -f "$XUIDB" || ! -f "$stream_conf" ]]; then
+    echo "ОШИБКА: ${XUIDB} или ${stream_conf} не найдены — схема скрипта не развёрнута."
+    exit 1
+  fi
+  if xhttp_active; then
+    echo "XHTTP уже включён (имя: $(xhttp_domain_cfg), nginx -> 127.0.0.1:${XHTTP_PORT}) — ничего не делаю."
+    echo "Проверка: bash $0 healthcheck (блок [7b]). Убрать: sudo bash $0 remove-xhttp"
+    exit 0
+  fi
+  if [[ -z "$xdom" ]]; then
+    if [[ -t 0 ]]; then
+      echo "Третье имя для XHTTP+Reality (A-запись на IP этого сервера ${SERVER_IP:-?}), напр. xht.example.com:"
+      read -rp "Имя: " xdom
+    else
+      echo "ОШИБКА: не задано имя. Запуск: sudo bash $0 add-xhttp xht.example.com   (или env XHTTP_DOMAIN=...)"
+      exit 1
+    fi
+  fi
+  xdom="${xdom,,}"
+  XHTTP_DOM="$xdom"
+  if [[ ! "$xdom" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+    echo "ОШИБКА: '${xdom}' не похоже на доменное имя."
+    exit 1
+  fi
+  if [[ "$xdom" == "$DOMAIN" || "$xdom" == "$REALITY_DOMAIN" ]]; then
+    echo "ОШИБКА: имя XHTTP должно отличаться от доменов панели (${DOMAIN}) и основного (${REALITY_DOMAIN})."
+    exit 1
+  fi
+  if ! grep -qE '^\s*upstream reality_backend\s*\{' "$stream_conf" || ! grep -qE '^\s*default\s+reality_backend;' "$stream_conf"; then
+    echo "ОШИБКА: stream-конфиг не в штатном виде (нет upstream reality_backend или default reality_backend) — ручная правка? Остановился."
+    exit 1
+  fi
+  if ! systemctl is-active --quiet x-ui || ! systemctl is-active --quiet nginx; then
+    echo "ОШИБКА: x-ui или nginx не active — сначала почини (healthcheck)."
+    exit 1
+  fi
+  if [[ ! -f /var/www/decoy-reality/index.html ]]; then
+    echo "ОШИБКА: нет /var/www/decoy-reality/index.html (заглушка) — схема развёрнута не полностью."
+    exit 1
+  fi
+  if [[ -z "$SERVER_IP" ]]; then
+    echo "ОШИБКА: не удалось определить публичный IP сервера."
+    exit 1
+  fi
+  local p
+  for p in "$XHTTP_PORT" "$XHTTP_TARGET_PORT"; do
+    if ss -ltn 2>/dev/null | grep -qE "[:.]${p} "; then
+      echo "ОШИБКА: порт ${p} занят — нужен свободный loopback-порт."
+      exit 1
+    fi
+  done
+  # DNS: A-запись имени = IP сервера, AAAA нет (certbot по webroot пойдёт на порт 80 этого IP)
+  a_rec=$(dig +short +time=3 +tries=2 A "$xdom" @1.1.1.1 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
+  [[ -n "$a_rec" ]] || a_rec=$(getent ahostsv4 "$xdom" 2>/dev/null | awk '{print $1; exit}' || true)
+  if [[ "$a_rec" != "$SERVER_IP" ]]; then
+    echo "ОШИБКА: A-запись ${xdom} = '${a_rec:-нет}', а IP сервера ${SERVER_IP}. Создай A-запись и подожди обновления DNS."
+    exit 1
+  fi
+  aaaa=$(lucx_aaaa_lookup "$xdom")
+  if [[ -n "$aaaa" && "$aaaa" != "UNKNOWN" ]]; then
+    echo "ОШИБКА: у ${xdom} есть AAAA-запись (${aaaa}) — nginx слушает только IPv4, certbot и клиенты пойдут мимо. Удали AAAA."
+    exit 1
+  fi
+  [[ "$aaaa" == "UNKNOWN" ]] && echo "ВНИМАНИЕ: AAAA-запись не удалось проверить (DNS не ответил) — убедись, что у ${xdom} её нет."
+  echo "Добавляю XHTTP+Reality на ${xdom}. x-ui будет перезапущен на несколько секунд."
+  stamp=$(date +%Y%m%d-%H%M%S)
+  sbak="/root/stream-sni-router.conf.pre-xhttp-${stamp}"
+  cp -a "$stream_conf" "$sbak"
+  echo "Бэкап nginx-конфига: ${sbak}"
+
+  # 1) nginx :80 — ACME и редирект для нового имени (отдельный файл, 80-redirect.conf не трогаем)
+  mkdir -p "${webroot}/.well-known/acme-challenge"
+  cat > /etc/nginx/sites-available/xhttp-80.conf <<EOF
+server {
+    listen 80;
+    server_name ${xdom};
+    server_tokens off;
+    location /.well-known/acme-challenge/ { root ${webroot}; }
+    location / { return 301 https://\$host\$request_uri; }
+}
+EOF
+  ln -sf /etc/nginx/sites-available/xhttp-80.conf /etc/nginx/sites-enabled/xhttp-80.conf
+  if ! nginx -t >/dev/null 2>&1; then
+    echo "ОШИБКА: nginx -t не прошёл после добавления xhttp-80.conf."
+    xhttp_remove_vhosts
+    exit 1
+  fi
+  systemctl reload nginx
+  # 2) сертификат (отдельный, автопродление certbot + reload nginx)
+  have_cert=0
+  [[ -s "/etc/letsencrypt/live/${xdom}/fullchain.pem" ]] && have_cert=1
+  if [[ "$have_cert" == "0" ]]; then
+    if ! certbot certonly --webroot -w "$webroot" -d "$xdom" --cert-name "$xdom" --keep-until-expiring \
+         --non-interactive --agree-tos --register-unsafely-without-email --deploy-hook "systemctl reload nginx"; then
+      echo "ОШИБКА: certbot не получил сертификат для ${xdom} — nginx-вхосты убраны, схема как была."
+      xhttp_remove_vhosts
+      exit 1
+    fi
+  else
+    echo "Сертификат ${xdom} уже есть — переиспользую."
+  fi
+  # 3) вхост-мишень Reality: свой сертификат + заглушка decoy-reality, только loopback
+  cat > /etc/nginx/sites-available/xhttp-decoy-tls.conf <<EOF
+server {
+    listen 127.0.0.1:${XHTTP_TARGET_PORT} ssl http2;
+    server_name ${xdom};
+    server_tokens off;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    ssl_certificate     /etc/letsencrypt/live/${xdom}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${xdom}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    root /var/www/decoy-reality;
+    index index.html;
+    error_page 404 /404.html;
+    location / { try_files \$uri \$uri/ =404; }
+}
+EOF
+  ln -sf /etc/nginx/sites-available/xhttp-decoy-tls.conf /etc/nginx/sites-enabled/xhttp-decoy-tls.conf
+  if ! nginx -t >/dev/null 2>&1; then
+    echo "ОШИБКА: nginx -t не прошёл после добавления xhttp-decoy-tls.conf."
+    nginx -t 2>&1 | sed 's/^/    /' || true
+    xhttp_remove_vhosts
+    exit 1
+  fi
+  systemctl reload nginx
+  local i tcode="000"
+  for i in 1 2 3 4 5; do
+    tcode=$(curl -sk -m 5 -o /dev/null -w "%{http_code}" --resolve "${xdom}:${XHTTP_TARGET_PORT}:127.0.0.1" "https://${xdom}:${XHTTP_TARGET_PORT}/" 2>/dev/null || echo 000)
+    [[ "$tcode" == "200" ]] && break
+    sleep 1
+  done
+  if [[ "$tcode" != "200" ]]; then
+    echo "ОШИБКА: вхост-мишень 127.0.0.1:${XHTTP_TARGET_PORT} не отвечает 200 (код ${tcode}) — откатываю."
+    xhttp_remove_vhosts
+    exit 1
+  fi
+  # 4) инбаунд + клиент
+  create_xhttp_inbound || { xhttp_remove_vhosts; exit 1; }
+  # 5) stream: имя -> xhttp_backend
+  sed -i "/^[[:space:]]*default[[:space:]]\+reality_backend;/i\\        ${xdom}        xhttp_backend;" "$stream_conf"
+  sed -i "/^[[:space:]]*upstream reality_backend[[:space:]]*{/a\\    upstream xhttp_backend { server 127.0.0.1:${XHTTP_PORT}; }" "$stream_conf"
+  if ! nginx -t >/dev/null 2>&1; then
+    echo "ОШИБКА: nginx -t не прошёл после правки stream-конфига — откатываю всё."
+    xhttp_rollback_all "$sbak" "$XH_BAK"
+    exit 1
+  fi
+  systemctl reload nginx
+  sleep 1
+  # 6) самотест через публичный IP
+  echo "Самотест через публичный IP ${SERVER_IP}:"
+  local xip gate ok=0 fuuid="" fpbk="" fsid=""
+  xip=$(xray_probe_client '{"network":"xhttp","xhttpSettings":{"path":"'"${XH_PATH}"'","mode":"auto"},"security":"reality","realitySettings":{"serverName":"'"${xdom}"'","fingerprint":"firefox","publicKey":"'"${XH_PBK}"'","shortId":"'"${XH_SID}"'","spiderX":"/"}}' "$XH_UUID" "" "$SERVER_IP" "$(lucx_free_port 10863)")
+  if [[ "$xip" == "NOXRAY" ]]; then
+    echo "  XHTTP-клиент: НЕ проверен (xray-бинарь не найден)"
+    ok=1
+  else
+    echo "  XHTTP-клиент (client1-xhttp) -> выходной IP '${xip:-нет}'"
+    [[ -n "$xip" ]] || ok=1
+  fi
+  gate=$(curl -s -m 10 -o /dev/null -w "%{http_code} %{ssl_verify_result}" --resolve "${xdom}:443:${SERVER_IP}" "https://${xdom}/" 2>/dev/null || echo "000 -")
+  echo "  гость без ключа на https://${xdom}/ (код, проверка сертификата 0=ок) -> ${gate}"
+  [[ "$gate" == "200 0" ]] || ok=1
+  if reality_front_active && lucx_load_front_params; then
+    fuuid="$FRONT_UUID"; fpbk="$FRONT_PBK"; fsid="$FRONT_SID"
+  fi
+  selftest_443 0 "$fuuid" "$fpbk" "$fsid" || ok=1
+  if [[ "$ok" != "0" ]]; then
+    echo "ОШИБКА: самотест не прошёл — возвращаю nginx-конфиг, БД и вхосты (схема как была; сертификат ${xdom} оставлен)."
+    xhttp_rollback_all "$sbak" "$XH_BAK"
+    systemctl is-active --quiet x-ui && echo "x-ui active, схема как была." || echo "ВНИМАНИЕ: x-ui не active после отката — journalctl -u x-ui -n 50"
+    exit 1
+  fi
+  echo "$VERSION" > /root/.lucx-script-version
+  local penc link
+  penc="%2F${XH_PATH#/}"
+  link="vless://${XH_UUID}@${xdom}:443?type=xhttp&path=${penc}&mode=auto&security=reality&pbk=${XH_PBK}&fp=firefox&sni=${xdom}&sid=${XH_SID}&spx=%2F#client1-xhttp"
+  if [[ -f "$CREDS_FILE" ]]; then
+    {
+      echo "XHTTP Domain: ${xdom}"
+      echo "XHTTP UUID: ${XH_UUID}"
+      echo "XHTTP Public Key: ${XH_PBK}"
+      echo "XHTTP Short ID: ${XH_SID}"
+      echo "XHTTP Path: ${XH_PATH}"
+      echo "XHTTP Link: ${link}"
+    } >> "$CREDS_FILE"
+  fi
+  echo
+  echo "================= ГОТОВО ================="
+  echo "XHTTP+Reality включён: nginx (SNI ${xdom}) -> 127.0.0.1:${XHTTP_PORT} (xray) ; target -> 127.0.0.1:${XHTTP_TARGET_PORT} (nginx, сертификат ${xdom})."
+  echo "Ссылка: ${link}"
+  echo "TLS и Reality перед TLS не менялись. Не меняй инбаунд через форму панели (настройки sockopt/Reality)."
+  echo "Если клиент не заведётся с mode=auto — попробуй mode=stream-up или packet-up в настройках клиента."
+  echo "Откат: sudo bash $0 remove-xhttp   (или вручную: cp ${sbak} ${stream_conf}; БД: ${XH_BAK})"
+  echo "Проверка: bash $0 healthcheck (блок [7b])."
+  echo "=========================================="
+}
+
+cmd_remove_xhttp() {
+  if [[ $EUID -ne 0 ]]; then
+    echo "Запусти от root: sudo bash $0 remove-xhttp [--yes] [--purge-cert]"
+    exit 1
+  fi
+  local stream_conf="/etc/nginx/stream-sni-router.conf" xdom stamp sbak dbak yes=0 purge=0 a ids iid
+  for a in "$@"; do
+    case "$a" in
+      --yes|-y) yes=1 ;;
+      --purge-cert) purge=1 ;;
+      *) echo "Неизвестный параметр: $a"; exit 1 ;;
+    esac
+  done
+  xdom=$(xhttp_domain_cfg)
+  iid=$(sqlite3 "$XUIDB" "SELECT id FROM inbounds WHERE tag='${XHTTP_TAG}' LIMIT 1;" 2>/dev/null || true)
+  if [[ -z "$xdom" && -z "$iid" ]] && ! xhttp_active; then
+    echo "XHTTP не включён — нечего убирать."
+    exit 0
+  fi
+  echo "Будет убрано: nginx stream (${xdom:-?} -> xhttp_backend), инбаунд ${XHTTP_TAG} и его клиенты, вхосты xhttp-80/xhttp-decoy-tls."
+  if [[ "$yes" != "1" ]]; then
+    if [[ -t 0 ]]; then
+      read -rp "Продолжить? [y/N]: " a
+      [[ "${a:-}" =~ ^[Yy]$ ]] || { echo "Отменено."; exit 0; }
+    else
+      echo "ОШИБКА: без терминала нужен флаг --yes."
+      exit 1
+    fi
+  fi
+  stamp=$(date +%Y%m%d-%H%M%S)
+  sbak="/root/stream-sni-router.conf.pre-remove-xhttp-${stamp}"
+  cp -a "$stream_conf" "$sbak"
+  echo "Бэкап nginx-конфига: ${sbak}"
+  # 1) stream: обе строки (map и upstream) содержат xhttp_backend
+  sed -i '/xhttp_backend/d' "$stream_conf"
+  if ! nginx -t >/dev/null 2>&1; then
+    cp -a "$sbak" "$stream_conf"
+    echo "ОШИБКА: nginx -t не прошёл после правки stream-конфига — конфиг возвращён."
+    exit 1
+  fi
+  systemctl reload nginx
+  # 2) БД: инбаунд, его клиенты и связи
+  if [[ -n "$iid" ]]; then
+    dbak="${XUIDB}.backup.$(date +%s)"
+    ids=$(sqlite3 "$XUIDB" "SELECT group_concat(client_id) FROM client_inbounds WHERE inbound_id=${iid};" 2>/dev/null || true)
+    lucx_xui_stop
+    sleep 1
+    cp -a "$XUIDB" "$dbak"
+    echo "Бэкап БД: ${dbak}"
+    sqlite3 "$XUIDB" "DELETE FROM client_traffics WHERE inbound_id=${iid};" 2>/dev/null || true
+    sqlite3 "$XUIDB" "DELETE FROM client_inbounds WHERE inbound_id=${iid};" 2>/dev/null || true
+    if [[ -n "${ids:-}" ]]; then
+      # клиенты этого инбаунда, не привязанные больше ни к одному инбаунду
+      sqlite3 "$XUIDB" "DELETE FROM clients WHERE id IN (${ids}) AND id NOT IN (SELECT client_id FROM client_inbounds);" 2>/dev/null || true
+    fi
+    if ! sqlite3 "$XUIDB" "DELETE FROM inbounds WHERE id=${iid};"; then
+      echo "ОШИБКА: не удалось удалить инбаунд — возвращаю БД из ${dbak}"
+      cp -a "$dbak" "$XUIDB"
+      lucx_xui_start
+      exit 1
+    fi
+    lucx_xui_start
+    sleep 2
+  fi
+  # 3) вхосты nginx
+  xhttp_remove_vhosts
+  if [[ "$purge" == "1" && -n "$xdom" ]]; then
+    certbot delete --cert-name "$xdom" --non-interactive 2>&1 | tail -n 3 || true
+  elif [[ -n "$xdom" ]]; then
+    echo "Сертификат ${xdom} оставлен (удалить: certbot delete --cert-name ${xdom} или флаг --purge-cert)."
+  fi
+  if systemctl is-active --quiet x-ui && systemctl is-active --quiet nginx; then
+    echo "Готово: XHTTP убран, x-ui и nginx active. Проверка: bash $0 healthcheck"
+  else
+    echo "ВНИМАНИЕ: x-ui или nginx не active — смотри journalctl -u x-ui -n 50 / nginx -t"
+    exit 1
+  fi
+}
+
 # ================== РАЗБОР АРГУМЕНТОВ ==================
 
 case "${1:-install}" in
@@ -6417,6 +6929,14 @@ case "${1:-install}" in
     ;;
   add-h2|h2)
     cmd_add_h2
+    ;;
+  add-xhttp|xhttp)
+    shift
+    cmd_add_xhttp "$@"
+    ;;
+  remove-xhttp|unxhttp)
+    shift
+    cmd_remove_xhttp "$@"
     ;;
   add-bot|bot)
     cmd_add_bot
@@ -6462,6 +6982,9 @@ case "${1:-install}" in
     echo "                               бэкап БД, самотест, автооткат)"
     echo "  sudo bash $0 add-reality-front — Reality перед TLS на том же домене/443 (без 3-го домена;"
     echo "                               nginx -> 127.0.0.1:8446; бэкап, самотест, автооткат)"
+    echo "  sudo bash $0 add-xhttp <имя> — третий вход: VLESS+XHTTP+Reality на отдельном имени (A-запись на этот"
+    echo "                               сервер; свой серт. Let's Encrypt; без CDN; бэкап, самотест, автооткат)"
+    echo "  sudo bash $0 remove-xhttp  — убрать XHTTP (nginx-строки, инбаунд, вхосты; --purge-cert удаляет серт.)"
     echo "  sudo bash $0 add-bot       — поставить/обновить Telegram-бота управления"
     echo "                               (спросит токен @BotFather; env не затирает)"
     echo "  sudo bash $0 remove-bot    — удалить Telegram-бота"

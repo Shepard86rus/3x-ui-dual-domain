@@ -858,6 +858,9 @@
 #   установки (блок [10c], после кредов) вызывается add-xhttp в подоболочке: провал XHTTP НЕ валит
 #   установку основной схемы. ПОВЕДЕНИЕ: повторный install перегенерирует stream-конфиг без XHTTP —
 #   после него add-xhttp запустить заново (или снова указать имя в install).
+#   Аудит ZCode (2026-10-20) учтён: reload nginx на каждом шаге add/remove с откатом; remove чистит креды XHTTP
+#   и переживает отсутствие stream-конфига; предпроверка однострочного upstream; ранняя проверка имени в install;
+#   trap guard'а явно в подоболочке [10c]; minClientVer Reality-фронта = 1.8.0 (REALITY_MIN_CLIENT), как у XHTTP.
 #   minClientVer инбаунда XHTTP = 1.8.0 (при пустом значении Xray 26.x применяет минимум 26.3.27 и
 #   отсекает клиентов с иным отпечатком версии — проверено предупреждением в журнале xray).
 VERSION="0.5.6"
@@ -1385,6 +1388,7 @@ EOF
 REALITY_FRONT_PORT=8446
 REALITY_FRONT_TAG="in-8446-tcp"
 H2C_PORT=8081
+REALITY_MIN_CLIENT="1.8.0"   # v0.5.6: при пустом значении Xray 26.x применяет минимум 26.3.27 и отсекает старые клиенты
 TLS_ALPN_JSON_H2='["h2","http/1.1"]'
 TLS_ALPN_JSON_H1='["http/1.1"]'
 TLS_FB_JSON_H2='[{"dest":"127.0.0.1:8080","xver":0},{"alpn":"h2","dest":"127.0.0.1:8081","xver":0}]'
@@ -1480,7 +1484,7 @@ create_reality_front_inbound() {
   subid=$(openssl rand -hex 8)
   now=$(( $(date +%s) * 1000 ))
   set_json='{"clients":[{"id":"'"${uuid}"'","flow":"xtls-rprx-vision","email":"client1-reality","limitIp":0,"totalGB":0,"expiryTime":0,"enable":true,"tgId":0,"subId":"'"${subid}"'","reset":0,"created_at":'"${now}"',"updated_at":'"${now}"'}],"decryption":"none","fallbacks":[]}'
-  str_json='{"network":"tcp","security":"reality","externalProxy":[{"forceTls":"same","dest":"'"${REALITY_DOMAIN}"'","port":443,"remark":""}],"realitySettings":{"show":false,"xver":1,"target":"127.0.0.1:443","serverNames":["'"${REALITY_DOMAIN}"'"],"privateKey":"'"${priv}"'","minClientVer":"","maxClientVer":"","maxTimediff":0,"shortIds":["'"${sid}"'"],"settings":{"publicKey":"'"${pub}"'","fingerprint":"firefox","serverName":"","spiderX":"/","mldsa65Verify":""}},"tcpSettings":{"acceptProxyProtocol":true,"header":{"type":"none"}}}'
+  str_json='{"network":"tcp","security":"reality","externalProxy":[{"forceTls":"same","dest":"'"${REALITY_DOMAIN}"'","port":443,"remark":""}],"realitySettings":{"show":false,"xver":1,"target":"127.0.0.1:443","serverNames":["'"${REALITY_DOMAIN}"'"],"privateKey":"'"${priv}"'","minClientVer":"'"${REALITY_MIN_CLIENT}"'","maxClientVer":"","maxTimediff":0,"shortIds":["'"${sid}"'"],"settings":{"publicKey":"'"${pub}"'","fingerprint":"firefox","serverName":"","spiderX":"/","mldsa65Verify":""}},"tcpSettings":{"acceptProxyProtocol":true,"header":{"type":"none"}}}'
   lucx_xui_stop
   sleep 1
   bak="${XUIDB}.backup.$(date +%s)"
@@ -2007,6 +2011,10 @@ cmd_install() {
     echo
   fi
   XHTTP_DOM_INST="${XHTTP_DOM_INST,,}"
+  if [[ -n "$XHTTP_DOM_INST" && ! "$XHTTP_DOM_INST" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+    echo "ВНИМАНИЕ: '${XHTTP_DOM_INST}' не похоже на доменное имя — XHTTP пропускаю (потом: sudo bash $0 add-xhttp <имя>)."
+    XHTTP_DOM_INST=""
+  fi
   read -rp "SubPath панели [по умолчанию /panel/]: " PANEL_PATH
   echo
   PANEL_PATH=${PANEL_PATH:-/panel/}
@@ -4580,7 +4588,7 @@ EOF
   # v0.5.6 [10c]: необязательный третий вход XHTTP+Reality (в подоболочке: провал не валит установку)
   if [[ -n "${XHTTP_DOM_INST:-}" ]]; then
     echo "=== [10c] XHTTP+Reality на ${XHTTP_DOM_INST} (опция) ==="
-    ( cmd_add_xhttp "$XHTTP_DOM_INST" ) || echo "ВНИМАНИЕ: XHTTP не включён (основная схема установлена и работает). Устрани причину и выполни: sudo bash $0 add-xhttp ${XHTTP_DOM_INST}"
+    ( trap lucx_xui_guard_fire EXIT; cmd_add_xhttp "$XHTTP_DOM_INST" ) || echo "ВНИМАНИЕ: XHTTP не включён (основная схема установлена и работает). Устрани причину и выполни: sudo bash $0 add-xhttp ${XHTTP_DOM_INST}"
     echo
   fi
 
@@ -6698,8 +6706,8 @@ cmd_add_xhttp() {
     echo "ОШИБКА: имя XHTTP должно отличаться от доменов панели (${DOMAIN}) и основного (${REALITY_DOMAIN})."
     exit 1
   fi
-  if ! grep -qE '^\s*upstream reality_backend\s*\{' "$stream_conf" || ! grep -qE '^\s*default\s+reality_backend;' "$stream_conf"; then
-    echo "ОШИБКА: stream-конфиг не в штатном виде (нет upstream reality_backend или default reality_backend) — ручная правка? Остановился."
+  if ! grep -qE '^\s*upstream reality_backend\s*\{\s*server [^;]+;\s*\}' "$stream_conf" || ! grep -qE '^\s*default\s+reality_backend;' "$stream_conf"; then
+    echo "ОШИБКА: stream-конфиг не в штатном виде (upstream reality_backend должен быть одной строкой '{ server ...; }', и должна быть строка 'default reality_backend;') — ручная правка? Остановился."
     exit 1
   fi
   if ! systemctl is-active --quiet x-ui || ! systemctl is-active --quiet nginx; then
@@ -6757,7 +6765,11 @@ EOF
     xhttp_remove_vhosts
     exit 1
   fi
-  systemctl reload nginx
+  if ! systemctl reload nginx; then
+    echo "ОШИБКА: reload nginx не прошёл после добавления xhttp-80.conf — убираю вхосты."
+    xhttp_remove_vhosts
+    exit 1
+  fi
   # 2) сертификат (отдельный, автопродление certbot + reload nginx)
   have_cert=0
   [[ -s "/etc/letsencrypt/live/${xdom}/fullchain.pem" ]] && have_cert=1
@@ -6795,7 +6807,11 @@ EOF
     xhttp_remove_vhosts
     exit 1
   fi
-  systemctl reload nginx
+  if ! systemctl reload nginx; then
+    echo "ОШИБКА: reload nginx не прошёл после добавления xhttp-decoy-tls.conf — убираю вхосты."
+    xhttp_remove_vhosts
+    exit 1
+  fi
   local i tcode="000"
   for i in 1 2 3 4 5; do
     tcode=$(curl -sk -m 5 -o /dev/null -w "%{http_code}" --resolve "${xdom}:${XHTTP_TARGET_PORT}:127.0.0.1" "https://${xdom}:${XHTTP_TARGET_PORT}/" 2>/dev/null || echo 000)
@@ -6817,7 +6833,11 @@ EOF
     xhttp_rollback_all "$sbak" "$XH_BAK"
     exit 1
   fi
-  systemctl reload nginx
+  if ! systemctl reload nginx; then
+    echo "ОШИБКА: reload nginx не прошёл после правки stream-конфига — откатываю всё."
+    xhttp_rollback_all "$sbak" "$XH_BAK"
+    exit 1
+  fi
   sleep 1
   # 6) самотест через публичный IP
   echo "Самотест через публичный IP ${SERVER_IP}:"
@@ -6899,16 +6919,24 @@ cmd_remove_xhttp() {
   fi
   stamp=$(date +%Y%m%d-%H%M%S)
   sbak="/root/stream-sni-router.conf.pre-remove-xhttp-${stamp}"
-  cp -a "$stream_conf" "$sbak"
-  echo "Бэкап nginx-конфига: ${sbak}"
-  # 1) stream: обе строки (map и upstream) содержат xhttp_backend
-  sed -i '/xhttp_backend/d' "$stream_conf"
-  if ! nginx -t >/dev/null 2>&1; then
-    cp -a "$sbak" "$stream_conf"
-    echo "ОШИБКА: nginx -t не прошёл после правки stream-конфига — конфиг возвращён."
-    exit 1
+  if [[ -f "$stream_conf" ]]; then
+    cp -a "$stream_conf" "$sbak"
+    echo "Бэкап nginx-конфига: ${sbak}"
+    # 1) stream: обе строки (map и upstream) содержат xhttp_backend
+    sed -i '/xhttp_backend/d' "$stream_conf"
+    if ! nginx -t >/dev/null 2>&1; then
+      cp -a "$sbak" "$stream_conf"
+      echo "ОШИБКА: nginx -t не прошёл после правки stream-конфига — конфиг возвращён."
+      exit 1
+    fi
+    if ! systemctl reload nginx; then
+      cp -a "$sbak" "$stream_conf"
+      echo "ОШИБКА: reload nginx не прошёл после правки stream-конфига — конфиг возвращён."
+      exit 1
+    fi
+  else
+    echo "ВНИМАНИЕ: ${stream_conf} не найден — шаг nginx stream пропускаю, убираю остальное."
   fi
-  systemctl reload nginx
   # 2) БД: инбаунд, его клиенты и связи
   if [[ -n "$iid" ]]; then
     dbak="${XUIDB}.backup.$(date +%s)"
@@ -6932,8 +6960,9 @@ cmd_remove_xhttp() {
     lucx_xui_start
     sleep 2
   fi
-  # 3) вхосты nginx
+  # 3) вхосты nginx и креды XHTTP
   xhttp_remove_vhosts
+  [[ -f "$CREDS_FILE" ]] && sed -i '/^XHTTP /d' "$CREDS_FILE" || true
   if [[ "$purge" == "1" && -n "$xdom" ]]; then
     certbot delete --cert-name "$xdom" --non-interactive 2>&1 | tail -n 3 || true
   elif [[ -n "$xdom" ]]; then

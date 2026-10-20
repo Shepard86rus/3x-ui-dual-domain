@@ -860,7 +860,7 @@
 #   после него add-xhttp запустить заново (или снова указать имя в install).
 #   Аудит ZCode (2026-10-20) учтён: reload nginx на каждом шаге add/remove с откатом; remove чистит креды XHTTP
 #   и переживает отсутствие stream-конфига; предпроверка однострочного upstream; ранняя проверка имени в install;
-#   trap guard'а явно в подоболочке [10c]; minClientVer Reality-фронта = 1.8.0 (REALITY_MIN_CLIENT), как у XHTTP.
+#   trap guard'а явно в подоболочке [10c]; minClientVer фронта вынесен в REALITY_MIN_CLIENT (по решению владельца пусто — поведение прежнее).
 #   minClientVer инбаунда XHTTP = 1.8.0 (при пустом значении Xray 26.x применяет минимум 26.3.27 и
 #   отсекает клиентов с иным отпечатком версии — проверено предупреждением в журнале xray).
 VERSION="0.5.6"
@@ -1388,7 +1388,7 @@ EOF
 REALITY_FRONT_PORT=8446
 REALITY_FRONT_TAG="in-8446-tcp"
 H2C_PORT=8081
-REALITY_MIN_CLIENT="1.8.0"   # v0.5.6: при пустом значении Xray 26.x применяет минимум 26.3.27 и отсекает старые клиенты
+REALITY_MIN_CLIENT=""   # Reality перед TLS: пусто, как раньше (решение владельца 2026-10-20; у XHTTP-входа 1.8.0, см. XHTTP_MIN_CLIENT)
 TLS_ALPN_JSON_H2='["h2","http/1.1"]'
 TLS_ALPN_JSON_H1='["http/1.1"]'
 TLS_FB_JSON_H2='[{"dest":"127.0.0.1:8080","xver":0},{"alpn":"h2","dest":"127.0.0.1:8081","xver":0}]'

@@ -70,6 +70,8 @@ bash 3x-ui-dual-domain.sh healthcheck
 | `bash 3x-ui-dual-domain.sh add-vls` / `add-reality` | перевод режима 443 TLS ⇄ Reality (для старых установок) |
 
 Панель обновляется отдельно: `x-ui update`, затем `healthcheck`.
+
+> ℹ️ XHTTP+Reality (`add-xhttp`): клиенты на ядре mihomo (Clash Verge, XKeen) могут не подключаться к свежему Xray; клиенты на Xray (INCY и др.) работают. Подробности и обходы — [docs/xhttp.md](docs/xhttp.md#если-клиент-не-подключается).
 Версии скрипта и релизы — на странице [Releases](https://github.com/Shepard86rus/3x-ui-dual-domain/releases).
 Скрипт `upgrade` скачивает релиз и сверяет sha256; версии ≤0.5.4 качали `main` без проверки, обновите их до 0.5.5.
 

@@ -811,7 +811,7 @@
 #   (1) h2: TLS-инбаунд получает tlsSettings.alpn [h2,http/1.1] и ALPN-fallback h2 -> h2c-слушатель
 #       nginx 127.0.0.1:8081 (decoy-h2c.conf); http/1.1 по-прежнему -> :8080. Нужно, чтобы браузерная
 #       проба видела h2, как у обычного сайта (Mihomo/fp firefox и так предлагает h2,http/1.1).
-#   (2) Reality перед TLS (без третьего домена и серта): nginx reality_backend -> 127.0.0.1:8446
+#   (2) Reality перед TLS (без отдельного домена и серта): nginx reality_backend -> 127.0.0.1:8446
 #       (Reality-инбаунд in-8446-tcp, target=127.0.0.1:443, xver=1, serverNames=[основной домен],
 #       acceptProxyProtocol, External Proxy = домен:443); всё, что не Reality-клиент (браузеры, сканеры,
 #       VLESS+TLS клиенты), Reality пересылает на неизменный TLS-инбаунд 127.0.0.1:443. Схема проверена
@@ -861,6 +861,8 @@
 #   Аудит ZCode (2026-10-20) учтён: reload nginx на каждом шаге add/remove с откатом; remove чистит креды XHTTP
 #   и переживает отсутствие stream-конфига; предпроверка однострочного upstream; ранняя проверка имени в install;
 #   trap guard'а явно в подоболочке [10c]; minClientVer фронта вынесен в REALITY_MIN_CLIENT (по решению владельца пусто — поведение прежнее).
+#   install: шаг [10b] (Telegram-бот) перенесён в самый конец, после блока ГОТОВО (панель уже доступна: адрес и пароль
+#   выданы; раньше подсказка просила API-токен панели до выдачи доступа в неё); в ГОТОВО добавлена строка про XHTTP.
 #   minClientVer у всех Reality-входов (в т.ч. XHTTP) ПУСТОЙ по решению владельца (XHTTP_MIN_CLIENT / REALITY_MIN_CLIENT).
 #   Справка: при пустом значении Xray 26.x пишет «default minimal client version is 26.3.27, other clients may be
 #   refused»; непустое значение, наоборот, предупреждает о риске блокировки. Если старые клиенты не подключаются — задать 1.8.0.
@@ -4424,7 +4426,7 @@ EOF
   FRONT_ACTIVE=0
   INST_SEC_NOW=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.security') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
   if [[ "${REALITY_OK:-0}" == "1" && "$VLESS_MODE" == "tls" && "$INST_SEC_NOW" == "tls" && "${REALITY_FRONT:-1}" != "0" ]]; then
-    echo "=== [10/10+] Reality перед TLS (127.0.0.1:${REALITY_FRONT_PORT}, без третьего домена) ==="
+    echo "=== [10/10+] Reality перед TLS (127.0.0.1:${REALITY_FRONT_PORT}, без отдельного домена и серта) ==="
     if create_reality_front_inbound; then
       if [[ "${FRONT_EXISTS:-0}" == "1" ]]; then
         echo "  Reality-инбаунд уже был — nginx не переключаю (схему включай командой add-reality-front)."
@@ -4474,17 +4476,6 @@ EOF
   # --- [10a] Hysteria 2 inbound на UDP/443 (SQLite) ---
   echo "=== [10a] Hysteria 2 inbound на UDP/443 (SQLite) ==="
   create_hy2_inbound || exit 1
-
-  # --- [10b] Опция: Telegram-бот управления (v0.4.8; дефолт НЕТ) ---
-  echo
-  echo "=== [10b] Telegram-бот управления панелью (опция) ==="
-  local BOT_WANT=""
-  read -rp "Поставить Telegram-бота управления? [y/N]: " BOT_WANT || BOT_WANT=""
-  if [[ "$BOT_WANT" =~ ^[Yy] ]]; then
-    cmd_add_bot || echo "Бот не поставился — установка панели не пострадала; поставь позже: sudo bash $0 add-bot"
-  else
-    echo "Пропущено (поставить позже: sudo bash $0 add-bot)"
-  fi
 
   # --- Финал ---
   echo
@@ -4596,6 +4587,9 @@ EOF
   echo "УЖЕ СДЕЛАНО УСТАНОВЩИКОМ (v0.5.4):"
   echo "  - у инбаундов VLESS и Hysteria 2 адрес для ссылок = ${REALITY_DOMAIN} (Пользовательская);"
   echo "  - в режиме TLS у них стоит uTLS firefox;"
+  if [[ -n "${XHTTP_DOM_INST:-}" ]] && xhttp_active; then
+    echo "  - третий вход XHTTP+Reality на ${XHTTP_DOM_INST}: ссылка клиента — в блоке [10c] выше и в ${CREDS_FILE};"
+  fi
   if [[ ! "${SUB_REC:-y}" =~ ^[Nn]$ ]]; then
     echo "  - рекомендованные настройки подписок (Clash/Mihomo, Happ, Incy) — см. блок [5a] выше."
   fi
@@ -4645,6 +4639,20 @@ EOF
   echo "[cleanup] Временные файлы удалены."
   # v0.4.1: маркер версии управления — пишется только при полном успехе install
   echo "$VERSION" > /root/.lucx-script-version
+
+  # --- [10b] Опция: Telegram-бот управления (v0.4.8; дефолт НЕТ) ---
+  # v0.5.6: вопрос перенесён В КОНЕЦ install, после блока ГОТОВО: раньше он шёл до выдачи адреса и пароля
+  # панели, а подсказка просила создать API-токен в панели, куда ещё нельзя было зайти.
+  echo
+  echo "=== [10b] Telegram-бот управления панелью (опция) ==="
+  echo "Панель уже доступна: адрес, логин и пароль — в блоке ГОТОВО выше."
+  local BOT_WANT=""
+  read -rp "Поставить Telegram-бота управления? [y/N]: " BOT_WANT || BOT_WANT=""
+  if [[ "$BOT_WANT" =~ ^[Yy] ]]; then
+    cmd_add_bot || echo "Бот не поставился — установка панели не пострадала; поставь позже: sudo bash $0 add-bot"
+  else
+    echo "Пропущено (поставить позже: sudo bash $0 add-bot)"
+  fi
 }
 
 # ================== РЕЖИМ: HEALTHCHECK ==================
@@ -6340,6 +6348,7 @@ cmd_add_bot() {
   echo
   echo "Управление клиентами из бота (создать/удалить/список) — опционально."
   echo "Нужен API-токен панели со scope «admin» (панель → настройки → API-токены). Он хранится в $TGBOT_ENV (600)."
+  echo "Токена ещё нет — просто Enter: создашь его в панели и добавишь позже той же командой: sudo bash $0 add-bot"
   read -rs -rp "API-токен панели (пусто — не менять / не использовать; ввод скрыт): " apit || apit=""
   echo
   if [ -n "$apit" ] && ! printf '%s' "$apit" | grep -qE '^[A-Za-z0-9._~+/=-]{8,200}$'; then

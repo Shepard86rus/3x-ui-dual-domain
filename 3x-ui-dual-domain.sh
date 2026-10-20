@@ -861,8 +861,9 @@
 #   Аудит ZCode (2026-10-20) учтён: reload nginx на каждом шаге add/remove с откатом; remove чистит креды XHTTP
 #   и переживает отсутствие stream-конфига; предпроверка однострочного upstream; ранняя проверка имени в install;
 #   trap guard'а явно в подоболочке [10c]; minClientVer фронта вынесен в REALITY_MIN_CLIENT (по решению владельца пусто — поведение прежнее).
-#   minClientVer инбаунда XHTTP = 1.8.0 (при пустом значении Xray 26.x применяет минимум 26.3.27 и
-#   отсекает клиентов с иным отпечатком версии — проверено предупреждением в журнале xray).
+#   minClientVer у всех Reality-входов (в т.ч. XHTTP) ПУСТОЙ по решению владельца (XHTTP_MIN_CLIENT / REALITY_MIN_CLIENT).
+#   Справка: при пустом значении Xray 26.x пишет «default minimal client version is 26.3.27, other clients may be
+#   refused»; непустое значение, наоборот, предупреждает о риске блокировки. Если старые клиенты не подключаются — задать 1.8.0.
 VERSION="0.5.6"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -1398,7 +1399,7 @@ TLS_FB_JSON_H1='[{"dest":"127.0.0.1:8080","xver":0}]'
 XHTTP_PORT=8447
 XHTTP_TARGET_PORT=8445
 XHTTP_TAG="in-8447-xhttp"
-XHTTP_MIN_CLIENT="1.8.0"
+XHTTP_MIN_CLIENT=""   # пусто по решению владельца (2026-10-20), как у Reality перед TLS
 
 # h2c-фасад decoy №2 (:8081, loopback) — цель alpn-fallback'а TLS-инбаунда (по докам Xray
 # h2c-слушатель nginx не обслуживает http/1.1, поэтому http/1.1 остаётся на :8080).

@@ -863,6 +863,8 @@
 #   trap guard'а явно в подоболочке [10c]; minClientVer фронта вынесен в REALITY_MIN_CLIENT (по решению владельца пусто — поведение прежнее).
 #   install: шаг [10b] (Telegram-бот) перенесён в самый конец, после блока ГОТОВО (панель уже доступна: адрес и пароль
 #   выданы; раньше подсказка просила API-токен панели до выдачи доступа в неё); в ГОТОВО добавлена строка про XHTTP.
+#   install: третье имя XHTTP проверяется мягко (DNS/AAAA/порты) — неготовность выключает XHTTP, а не обрывает установку;
+#   rebind-ip учитывает имя XHTTP; dig +short A берёт только IPv4 (CNAME первой строкой давал ложную ошибку DNS).
 #   minClientVer у всех Reality-входов (в т.ч. XHTTP) ПУСТОЙ по решению владельца (XHTTP_MIN_CLIENT / REALITY_MIN_CLIENT).
 #   Справка: при пустом значении Xray 26.x пишет «default minimal client version is 26.3.27, other clients may be
 #   refused»; непустое значение, наоборот, предупреждает о риске блокировки. Если старые клиенты не подключаются — задать 1.8.0.
@@ -2010,7 +2012,7 @@ cmd_install() {
   # v0.5.6: необязательное третье имя — вход VLESS+XHTTP+Reality (env XHTTP_DOMAIN или вопрос; Enter — пропустить)
   XHTTP_DOM_INST="${XHTTP_DOMAIN:-}"
   if [[ -z "$XHTTP_DOM_INST" ]]; then
-    read -rp "Третье имя для XHTTP+Reality (необязательно, Enter — пропустить; нужна A-запись на этот сервер): " XHTTP_DOM_INST || XHTTP_DOM_INST=""
+    read -rp "Третье имя для XHTTP+Reality (необязательно, Enter — пропустить; нужна A-запись на этот сервер; сертификат и вход ставятся в самом конце установки): " XHTTP_DOM_INST || XHTTP_DOM_INST=""
     echo
   fi
   XHTTP_DOM_INST="${XHTTP_DOM_INST,,}"
@@ -2027,7 +2029,7 @@ cmd_install() {
   PANEL_BASEPATH_NOSLASH="${PANEL_BASEPATH_NOSLASH%/}"
 
   # Валидация
-  for d in "$DOMAIN" "$REALITY_DOMAIN" ${XHTTP_DOM_INST:+"$XHTTP_DOM_INST"}; do
+  for d in "$DOMAIN" "$REALITY_DOMAIN"; do
     if [[ ! "$d" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$ ]]; then
       echo "ОШИБКА: '$d' не похоже на валидный домен."
       exit 1
@@ -2098,7 +2100,7 @@ cmd_install() {
   echo
   echo "Домен панели:          $DOMAIN"
   echo "Домен-обложка Reality: $REALITY_DOMAIN"
-  [[ -n "$XHTTP_DOM_INST" ]] && echo "Имя XHTTP+Reality:     $XHTTP_DOM_INST (необязательный третий вход)"
+  [[ -n "$XHTTP_DOM_INST" ]] && echo "Имя XHTTP+Reality:     $XHTTP_DOM_INST (необязательный третий вход; сертификат и вход — в конце установки, шаг [10c])"
   echo "SubPath панели:        $PANEL_PATH"
   echo "SubPath подписок:      $SUB_SECRET_PATH"
   echo "Публичный IP:          $SERVER_IP"
@@ -2123,8 +2125,8 @@ cmd_install() {
 
   # --- [2/10] Проверки окружения ---
   echo "=== [2/10] Проверки окружения ==="
-  for d in "$DOMAIN" "$REALITY_DOMAIN" ${XHTTP_DOM_INST:+"$XHTTP_DOM_INST"}; do
-    resolved=$(dig +short A "$d" @1.1.1.1 | head -n1 || true)
+  for d in "$DOMAIN" "$REALITY_DOMAIN"; do
+    resolved=$(dig +short A "$d" @1.1.1.1 | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
     if [[ -z "$resolved" ]]; then
       resolved=$(getent hosts "$d" | awk '{print $1}' | head -n1 || true)
     fi
@@ -2140,7 +2142,7 @@ cmd_install() {
   # не достучится («Timeout during connect»). Ловим ДО установки: сейчас —
   # громкий стоп с внятной причиной, а не загадочное падение certbot на [6/10].
   # К этому моменту dig уже доказанно работает (A-проверка выше прошла).
-  for d in "$DOMAIN" "$REALITY_DOMAIN" ${XHTTP_DOM_INST:+"$XHTTP_DOM_INST"}; do
+  for d in "$DOMAIN" "$REALITY_DOMAIN"; do
     aaaa=$(lucx_aaaa_lookup "$d")
     if [[ "$aaaa" == "UNKNOWN" ]]; then
       echo "  ВНИМАНИЕ: не удалось проверить AAAA у $d (резолверы не ответили) — продолжаю; убедись сам, что AAAA нет"
@@ -2160,13 +2162,38 @@ cmd_install() {
     ss -tlnp | grep ':443 ' || true
     exit 1
   fi
-  for p in 8443 8444 2096 ${XHTTP_DOM_INST:+$XHTTP_PORT $XHTTP_TARGET_PORT}; do
+  for p in 8443 8444 2096; do
     if ss -tlnp 2>/dev/null | grep -q ":$p "; then
       echo "ОШИБКА: порт $p уже занят"
       ss -tlnp | grep ":$p " || true
       exit 1
     fi
   done
+
+  # v0.5.6: третье имя (XHTTP) НЕОБЯЗАТЕЛЬНО — его неготовность (DNS, AAAA, занятые порты) не должна
+  # обрывать установку основной схемы: предупреждаем, выключаем XHTTP, ставим остальное.
+  if [[ -n "$XHTTP_DOM_INST" ]]; then
+    xh_bad=""
+    xh_res=$(dig +short A "$XHTTP_DOM_INST" @1.1.1.1 | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
+    [[ -n "$xh_res" ]] || xh_res=$(getent ahostsv4 "$XHTTP_DOM_INST" 2>/dev/null | awk '{print $1; exit}' || true)
+    xh_aaaa=$(lucx_aaaa_lookup "$XHTTP_DOM_INST")
+    if [[ "$xh_res" != "$SERVER_IP" ]]; then
+      xh_bad="A-запись '${xh_res:-не найдена}', а не ${SERVER_IP}"
+    elif [[ -n "$xh_aaaa" && "$xh_aaaa" != "UNKNOWN" ]]; then
+      xh_bad="есть AAAA-запись (${xh_aaaa}); схема IPv4-only"
+    else
+      for p in "$XHTTP_PORT" "$XHTTP_TARGET_PORT"; do
+        if ss -tlnp 2>/dev/null | grep -q ":$p "; then xh_bad="порт $p занят"; fi
+      done
+    fi
+    if [[ -n "$xh_bad" ]]; then
+      echo "  ВНИМАНИЕ: XHTTP (${XHTTP_DOM_INST}): ${xh_bad} — XHTTP пропускаю, основная установка продолжится."
+      echo "            Исправь и выполни после установки: sudo bash $0 add-xhttp ${XHTTP_DOM_INST}"
+      XHTTP_DOM_INST=""
+    else
+      echo "  XHTTP OK: ${XHTTP_DOM_INST} -> ${xh_res} (A есть, AAAA нет, порты ${XHTTP_PORT}/${XHTTP_TARGET_PORT} свободны)"
+    fi
+  fi
 
   # v0.3.1: UDP-порты будущих протоколов (hy2 займёт 443/udp, AWG — AWG_PORT)
   if ss -ulnp 2>/dev/null | grep -qE '(\*|0\.0\.0\.0):443 '; then
@@ -4617,7 +4644,7 @@ EOF
   echo "     не нужен."
   echo
   echo " ПРИ СМЕНЕ IP У ПРОВАЙДЕРА (блокировка и т.п.):"
-  echo "   1. Обнови A-записи обоих доменов на новый IP"
+  echo "   1. Обнови A-записи ВСЕХ доменов на новый IP (панель, обложка Reality и имя XHTTP, если оно включено)"
   echo "   2. sudo bash $0 rebind-ip — поправит nginx stream-роутер"
   echo "   Больше на сервере ничего трогать не нужно."
   echo "============================================"
@@ -5749,8 +5776,10 @@ cmd_rebind_ip() {
   fi
 
   echo "Текущий публичный IP: ${SERVER_IP}"
-  for d in "$DOMAIN" "${REALITY_DOMAIN:-$DOMAIN}"; do
-    cur=$(dig +short A "$d" @1.1.1.1 | head -n1 || true)
+  local rb_xh
+  rb_xh=$(xhttp_domain_cfg 2>/dev/null || true)
+  for d in "$DOMAIN" "${REALITY_DOMAIN:-$DOMAIN}" ${rb_xh:+"$rb_xh"}; do
+    cur=$(dig +short A "$d" @1.1.1.1 | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
     if [[ "$cur" != "$SERVER_IP" ]]; then
       echo "WARN: $d резолвится в '${cur:-не найден}', а не в ${SERVER_IP}."
       echo "      Сначала обнови A-запись у регистратора, иначе трафик сюда не придёт."

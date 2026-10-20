@@ -4611,7 +4611,7 @@ EOF
     echo
   fi
 
-  echo "УЖЕ СДЕЛАНО УСТАНОВЩИКОМ (v0.5.4):"
+  echo "УЖЕ СДЕЛАНО УСТАНОВЩИКОМ (v${VERSION}):"
   echo "  - у инбаундов VLESS и Hysteria 2 адрес для ссылок = ${REALITY_DOMAIN} (Пользовательская);"
   echo "  - в режиме TLS у них стоит uTLS firefox;"
   if [[ -n "${XHTTP_DOM_INST:-}" ]] && xhttp_active; then
@@ -6917,7 +6917,7 @@ EOF
     } >> "$CREDS_FILE"
   fi
   echo
-  echo "================= ГОТОВО ================="
+  echo "============== XHTTP+Reality ГОТОВ =============="
   echo "XHTTP+Reality включён: nginx (SNI ${xdom}) -> 127.0.0.1:${XHTTP_PORT} (xray) ; target -> 127.0.0.1:${XHTTP_TARGET_PORT} (nginx, сертификат ${xdom})."
   echo "Ссылка: ${link}"
   echo "TLS и Reality перед TLS не менялись. Не меняй инбаунд через форму панели (настройки sockopt/Reality)."

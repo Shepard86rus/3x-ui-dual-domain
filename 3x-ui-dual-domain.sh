@@ -1406,7 +1406,7 @@ TLS_FB_JSON_H1='[{"dest":"127.0.0.1:8080","xver":0}]'
 # v0.5.6: XHTTP+Reality (add-xhttp)
 XHTTP_PORT=8447
 XHTTP_TARGET_PORT=8445
-XHTTP_TAG="in-8447-xhttp"
+XHTTP_TAG="in-${XHTTP_PORT}-tcp"   # lucx сам нормализует тег до in-<порт>-<tcp|udp> (видно по in-443-tcp, in-8446-tcp), поэтому берём «родное» имя; поиск после старта — по порту
 XHTTP_MIN_CLIENT=""   # пусто по решению владельца (2026-10-20), как у Reality перед TLS
 
 # h2c-фасад decoy №2 (:8081, loopback) — цель alpn-fallback'а TLS-инбаунда (по докам Xray
@@ -5345,7 +5345,7 @@ cmd_healthcheck() {
   if [[ -f "$XUIDB" ]] && xhttp_active; then
     hcx_dom=$(xhttp_domain_cfg)
     hcx_ip=$(get_server_ip 2>/dev/null || true)
-    hcx_row="SELECT %s FROM inbounds WHERE tag='${XHTTP_TAG}' LIMIT 1;"
+    hcx_row="SELECT %s FROM inbounds WHERE port=${XHTTP_PORT} AND listen='127.0.0.1' LIMIT 1;"
     # shellcheck disable=SC2059
     hcx_en=$(sqlite3 "$XUIDB" "$(printf "$hcx_row" "enable")" 2>/dev/null || true)
     # shellcheck disable=SC2059
@@ -5375,11 +5375,11 @@ cmd_healthcheck() {
       else
         check "XHTTP: на 127.0.0.1:${XHTTP_PORT} нет xray — вход ${hcx_dom} мёртв" fail
       fi
-      hcx_mm=$(sqlite3 "$XUIDB" "SELECT count(*) FROM inbounds i, json_each(i.settings,'\$.clients') c JOIN clients cl ON cl.email=json_extract(c.value,'\$.email') WHERE i.tag='${XHTTP_TAG}' AND (COALESCE(cl.sub_id,'')<>COALESCE(json_extract(c.value,'\$.subId'),'') OR COALESCE(cl.uuid,'')<>COALESCE(json_extract(c.value,'\$.id'),''));" 2>/dev/null || echo 0)
+      hcx_mm=$(sqlite3 "$XUIDB" "SELECT count(*) FROM inbounds i, json_each(i.settings,'\$.clients') c JOIN clients cl ON cl.email=json_extract(c.value,'\$.email') WHERE i.port=${XHTTP_PORT} AND i.listen='127.0.0.1' AND (COALESCE(cl.sub_id,'')<>COALESCE(json_extract(c.value,'\$.subId'),'') OR COALESCE(cl.uuid,'')<>COALESCE(json_extract(c.value,'\$.id'),''));" 2>/dev/null || echo 0)
       if [[ "${hcx_mm:-0}" -gt 0 ]]; then
         check "XHTTP: у ${hcx_mm} клиент(ов) sub_id/uuid в таблице панели не совпадают с JSON инбаунда — в списке клиентов панели возможна пустая привязка" warn
       fi
-      hcx_cl=$(sqlite3 "$XUIDB" "SELECT count(*) FROM client_inbounds ci JOIN inbounds i ON i.id=ci.inbound_id WHERE i.tag='${XHTTP_TAG}';" 2>/dev/null || echo 0)
+      hcx_cl=$(sqlite3 "$XUIDB" "SELECT count(*) FROM client_inbounds ci JOIN inbounds i ON i.id=ci.inbound_id WHERE i.port=${XHTTP_PORT} AND i.listen='127.0.0.1';" 2>/dev/null || echo 0)
       if [[ "${hcx_cl:-0}" -gt 0 ]]; then
         check "XHTTP: к инбаунду привязано клиентов: ${hcx_cl}" ok
       else
@@ -6941,7 +6941,7 @@ cmd_remove_xhttp() {
     esac
   done
   xdom=$(xhttp_domain_cfg)
-  iid=$(sqlite3 "$XUIDB" "SELECT id FROM inbounds WHERE tag='${XHTTP_TAG}' LIMIT 1;" 2>/dev/null || true)
+  iid=$(sqlite3 "$XUIDB" "SELECT id FROM inbounds WHERE port=${XHTTP_PORT} AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
   if [[ -z "$xdom" && -z "$iid" ]] && ! xhttp_active; then
     echo "XHTTP не включён — нечего убирать."
     exit 0

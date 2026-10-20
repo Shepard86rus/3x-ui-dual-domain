@@ -865,6 +865,10 @@
 #   выданы; раньше подсказка просила API-токен панели до выдачи доступа в неё); в ГОТОВО добавлена строка про XHTTP.
 #   install: третье имя XHTTP проверяется мягко (DNS/AAAA/порты) — неготовность выключает XHTTP, а не обрывает установку;
 #   rebind-ip учитывает имя XHTTP; dig +short A берёт только IPv4 (CNAME первой строкой давал ложную ошибку DNS).
+#   install: конец установки приведён в порядок — подробности (сырые ссылки, вывод certbot, самотесты XHTTP) идут в лог и
+#   файл кредов, на экране последним остаётся один итоговый блок (адрес/логин/пароль панели, подписки, что работает,
+#   что сделать, что НЕ делать, где остальное); шаг XHTTP [10c] запускается отдельным процессом (в подоболочке под
+#   `( ... ) ||` bash отключал set -e для всего тела — сбой команды не останавливал бы add-xhttp).
 #   minClientVer у всех Reality-входов (в т.ч. XHTTP) ПУСТОЙ по решению владельца (XHTTP_MIN_CLIENT / REALITY_MIN_CLIENT).
 #   Справка: при пустом значении Xray 26.x пишет «default minimal client version is 26.3.27, other clients may be
 #   refused»; непустое значение, наоборот, предупреждает о риске блокировки. Если старые клиенты не подключаются — задать 1.8.0.
@@ -1967,11 +1971,66 @@ cmd_switch_mode() {
 # ================== РЕЖИМ: INSTALL ==================
 
 
+# v0.5.6: единый итоговый экран install. Раньше конец установки был «кашей»: блок ГОТОВО с сырыми ссылками, вывод
+# certbot, списки «уже сделано»/«что осталось»/«при смене IP» — адрес и пароль панели уезжали за экран, новичок пугался.
+# Теперь подробности идут в лог и файл кредов, а на экране последним остаётся этот короткий блок.
+install_print_summary() {
+  local p
+  echo
+  echo "================ УСТАНОВКА ЗАВЕРШЕНА ================"
+  echo
+  echo "  Панель управления (сохрани!):"
+  echo "    адрес:   https://${DOMAIN}${PANEL_PATH}"
+  echo "    логин:   ${XUI_USERNAME}"
+  echo "    пароль:  ${XUI_PASSWORD}"
+  echo
+  echo "  Подписка для клиентов:  https://${DOMAIN}${SUB_SECRET_PATH}"
+  echo "  Подписка AmneziaWG:     https://${DOMAIN}${AWG_SECRET_PATH}"
+  echo
+  echo "  Что работает:"
+  if [[ "${REALITY_OK:-0}" == "1" ]]; then
+    echo "    ✓ VLESS + TLS (Vision)        на ${REALITY_DOMAIN}"
+    [[ "${FRONT_ACTIVE:-0}" == "1" ]] && echo "    ✓ VLESS + Reality             на ${REALITY_DOMAIN}"
+  fi
+  [[ "${HY2_OK:-0}" == "1" && -n "${HY2_AUTH:-}" ]] && echo "    ✓ Hysteria 2 (UDP/443)        на ${REALITY_DOMAIN}"
+  if xhttp_active; then
+    echo "    ✓ VLESS + XHTTP + Reality     на $(xhttp_domain_cfg)"
+  fi
+  if [[ "${#INSTALL_PROBLEMS[@]}" -gt 0 ]]; then
+    echo
+    echo "  Не удалось (остальное работает):"
+    for p in "${INSTALL_PROBLEMS[@]}"; do
+      echo "    ✗ ${p}"
+    done
+  fi
+  echo
+  echo "  Что сделать сейчас (пара минут):"
+  echo "    1. Открой панель по адресу выше и войди."
+  echo "    2. Страница AmneziaWG -> Enable -> порт ${AWG_PORT} (udp) -> Save."
+  echo "       В созданном AWG-инбаунде выбери «Стратегия адреса для ссылок» = «Пользовательская»"
+  echo "       и впиши адрес: ${REALITY_DOMAIN}"
+  echo
+  echo "  В панели НЕ делай:"
+  echo "    - не создавай инбаунд «Cover site» и не жми «Apply» на странице Masking / SNI gateway:"
+  echo "      они займут 443/80 и сломают схему;"
+  echo "    - не сохраняй боевые инбаунды через форму (теряются proxy protocol и клиенты) —"
+  echo "      клиентов и подписки менять можно свободно."
+  echo
+  echo "  Где остальное:"
+  echo "    все ссылки и ключи:    cat ${CREDS_FILE}"
+  echo "    полный лог установки:  ${LOG_FILE}"
+  echo "    проверка схемы:        sudo bash $0 healthcheck"
+  echo "    если сменится IP:      обнови A-записи ВСЕХ доменов, затем sudo bash $0 rebind-ip"
+  echo "====================================================="
+}
+
 cmd_install() {
   if [[ $EUID -ne 0 ]]; then
     echo "Запусти от root: sudo bash $0 install"
     exit 1
   fi
+
+  INSTALL_SELF=$(readlink -f "$0" 2>/dev/null || true)   # для запуска add-xhttp отдельным процессом ([10c])
 
   # Логирование
   # v0.3.7: в лог попадают креды панели (username/password, hy2-ссылка с
@@ -4504,56 +4563,14 @@ EOF
   echo "=== [10a] Hysteria 2 inbound на UDP/443 (SQLite) ==="
   create_hy2_inbound || exit 1
 
-  # --- Финал ---
-  echo
-  echo "================= ГОТОВО ================="
-  echo "Панель:              https://${DOMAIN}${PANEL_PATH}"
-  echo "Логин/пароль:        ${XUI_USERNAME} / ${XUI_PASSWORD}"
-  echo "Подписки:            https://${DOMAIN}${SUB_SECRET_PATH}"
-  echo "AWG подписки:        https://${DOMAIN}${AWG_SECRET_PATH}"
-  echo "Decoy №1:            https://${DOMAIN}/"
-  if [[ "${VLESS_MODE}" == "tls" ]]; then
-    echo "Decoy №2:            https://${REALITY_DOMAIN}/ отдаёт decoy-сайт (fallback -> 127.0.0.1:8080)"
-  else
-    echo "Decoy №2:            https://${REALITY_DOMAIN}/"
+  # --- Финал: подробности — в лог/креды, на экран — install_print_summary в самом конце ---
+  INSTALL_PROBLEMS=()
+  if [[ "${REALITY_OK:-0}" != "1" ]]; then
+    INSTALL_PROBLEMS+=("VLESS-инбаунд не создан — создай вручную через панель (причина — в логе выше)")
   fi
-  echo "443 порт:            nginx SNI-роутер -> панель ИЛИ vless (${VLESS_MODE})"
-  echo
-  if [[ "${REALITY_OK:-0}" == "1" ]]; then
-    if [[ "${VLESS_MODE}" == "reality" ]]; then
-      echo "Reality inbound:     готов (remark: ${REALITY_REMARK})"
-      echo "  Client UUID:       ${CLIENT_UUID:-(см. панель)}"
-      echo "  Short IDs:          ${SHORT_ID_1:-(см. панель)}, ${SHORT_ID_2:-(см. панель)}"
-      echo "  Public key:         ${REALITY_PUBLIC:-(см. панель)}"
-      echo "  ServerName:         ${REALITY_DOMAIN}"
-    else
-      echo "VLESS+TLS inbound:   готов (remark: ${REALITY_REMARK}, fallback -> 127.0.0.1:8080$([[ "${INST_H2:-1}" != "0" ]] && echo ", ALPN h2 -> 127.0.0.1:${H2C_PORT}"))"
-      echo "  Client UUID:       ${CLIENT_UUID:-(см. панель)}"
-      echo "  ServerName/SNI:     ${REALITY_DOMAIN}"
-      echo "  Ссылка для клиента (raw + fp=firefox + Vision):"
-      echo "  vless://${CLIENT_UUID:-(UUID)}@${REALITY_DOMAIN}:443?type=tcp&security=tls&sni=${REALITY_DOMAIN}&fp=firefox&flow=xtls-rprx-vision#${REALITY_REMARK}"
-      echo "  (v0.5.1: Vision включён по умолчанию — убирает отпечаток вложенного TLS."
-      echo "   Клиент должен поддерживать flow xtls-rprx-vision; старый клиент без flow подключиться не сможет.)"
-      if [[ "${FRONT_ACTIVE:-0}" == "1" ]]; then
-        echo "Reality перед TLS:   включён (nginx -> 127.0.0.1:${REALITY_FRONT_PORT} -> target 127.0.0.1:443), клиент client1-reality"
-        echo "  Ссылка Reality:"
-        echo "  vless://${FRONT_UUID}@${REALITY_DOMAIN}:443?type=tcp&security=reality&pbk=${FRONT_PBK}&fp=firefox&sni=${REALITY_DOMAIN}&sid=${FRONT_SID}&flow=xtls-rprx-vision&spx=%2F#client1-reality"
-        echo "  (TLS-инбаунд и Reality-инбаунд зависят друг от друга — не отключай и не удаляй по отдельности.)"
-      fi
-    fi
-  else
-    echo "vless inbound:       НЕ создан — создай вручную через панель."
+  if [[ ! ( "${HY2_OK:-0}" == "1" && -n "${HY2_AUTH:-}" ) ]]; then
+    INSTALL_PROBLEMS+=("Hysteria 2 не создан — создай вручную (причина — в логе выше)")
   fi
-  if [[ "${HY2_OK:-0}" == "1" && -n "${HY2_AUTH:-}" ]]; then
-    echo "Hysteria 2:          UDP/443 (remark: Hy2-443, masquerade -> ${REALITY_DOMAIN})"
-    echo "  Client email:      ${HY2_EMAIL}"
-    echo "  Auth password:     ${HY2_AUTH}"
-    echo "  Ссылка для клиента:"
-    echo "  hysteria2://${HY2_AUTH}@${REALITY_DOMAIN}:443/?sni=${REALITY_DOMAIN}&insecure=0#Hy2-443"
-  else
-    echo "Hysteria 2:          НЕ создан — создай вручную (см. лог выше)."
-  fi
-  echo
 
   # v0.3.7: файл создаётся с 600 сразу (touch под локальным umask 077),
   # чтобы не было окна мир-читаемости между "cat >" и chmod 600 ниже.
@@ -4604,50 +4621,30 @@ EOF
   echo "Креды сохранены в: ${CREDS_FILE}"
   echo
 
-  # v0.5.6 [10c]: необязательный третий вход XHTTP+Reality (в подоболочке: провал не валит установку)
+  # v0.5.6 [10c]: необязательный третий вход XHTTP+Reality. Запускается ОТДЕЛЬНЫМ процессом скрипта: в подоболочке
+  # `( ... ) || ...` bash отключает set -e для всего тела, и неожиданный сбой команды (например, cp бэкапа БД) не
+  # останавливал бы add-xhttp. Подробный вывод (certbot, самотест) — в лог; на экран — одна строка. При провале — полный вывод.
   if [[ -n "${XHTTP_DOM_INST:-}" ]]; then
     echo "=== [10c] XHTTP+Reality на ${XHTTP_DOM_INST} (опция) ==="
-    ( trap lucx_xui_guard_fire EXIT; cmd_add_xhttp "$XHTTP_DOM_INST" ) || echo "ВНИМАНИЕ: XHTTP не включён (основная схема установлена и работает). Устрани причину и выполни: sudo bash $0 add-xhttp ${XHTTP_DOM_INST}"
+    xh_log=$(mktemp)
+    xh_rc=0
+    if [[ -n "${INSTALL_SELF:-}" && -r "$INSTALL_SELF" ]]; then
+      bash "$INSTALL_SELF" add-xhttp "$XHTTP_DOM_INST" >"$xh_log" 2>&1 || xh_rc=$?
+    else
+      ( trap lucx_xui_guard_fire EXIT; cmd_add_xhttp "$XHTTP_DOM_INST" ) >"$xh_log" 2>&1 || xh_rc=$?
+    fi
+    cat "$xh_log" >> "$LOG_FILE"
+    if [[ "$xh_rc" == "0" ]]; then
+      echo "  XHTTP+Reality включён на ${XHTTP_DOM_INST}, самотест пройден (подробности — в логе)."
+    else
+      cat "$xh_log"
+      echo "ВНИМАНИЕ: XHTTP не включён (основная схема установлена и работает). Устрани причину и выполни: sudo bash $0 add-xhttp ${XHTTP_DOM_INST}"
+      INSTALL_PROBLEMS+=("XHTTP не включён — после исправления причины: sudo bash $0 add-xhttp ${XHTTP_DOM_INST}")
+    fi
+    rm -f "$xh_log"
     echo
   fi
 
-  echo "УЖЕ СДЕЛАНО УСТАНОВЩИКОМ (v${VERSION}):"
-  echo "  - у инбаундов VLESS и Hysteria 2 адрес для ссылок = ${REALITY_DOMAIN} (Пользовательская);"
-  echo "  - в режиме TLS у них стоит uTLS firefox;"
-  if [[ -n "${XHTTP_DOM_INST:-}" ]] && xhttp_active; then
-    echo "  - третий вход XHTTP+Reality на ${XHTTP_DOM_INST}: ссылка клиента — в блоке [10c] выше и в ${CREDS_FILE};"
-  fi
-  if [[ ! "${SUB_REC:-y}" =~ ^[Nn]$ ]]; then
-    echo "  - рекомендованные настройки подписок (Clash/Mihomo, Happ, Incy) — см. блок [5a] выше."
-  fi
-  echo "  Подписки (subURI/subClashURI/subAwgURI) настроены автоматически."
-  echo
-  echo "ЧТО ОСТАЛОСЬ СДЕЛАТЬ РУКАМИ В ПАНЕЛИ:"
-  echo "  1. Открой https://${DOMAIN}${PANEL_PATH}"
-  echo "  2. AmneziaWG: страница AmneziaWG -> Enable -> порт ${AWG_PORT} (udp) -> Save"
-  echo "     (443/udp занят Hysteria 2, AWG живёт на своём порте)."
-  echo "     В созданном AWG-инбаунде (Inbounds -> 'Основное') выбери"
-  echo "     'Стратегия адреса для ссылок' = 'Пользовательская' и впиши адрес: ${REALITY_DOMAIN}"
-  echo "  3. Если планируешь Telegram WEB proxy (tproxy):"
-  echo "     в форме инбаунда включи 'externalTLS', иначе Caddy/mtproxy"
-  echo "     попытаются занять порт 443 и конфликтуют с nginx."
-  echo "  4. НЕ создавай инбаунд 'Cover site' (новое в lucx-ui .215+):"
-  echo "     он жёстко занимает :80 и :443 на хосте — конфликт с nginx"
-  echo "     (webroot certbot на 80, SNI-роутер на 443). Сам разработчик"
-  echo "     помечает его как несовместимый с REALITY/AWG — твоим стеком."
-  echo "  5. НЕ нажимай 'Apply' на странице Masking / 'SNI gateway'"
-  echo "     (новое в lucx-ui v3.8.5-lucx.245+): она поднимает СВОЙ"
-  echo "     bundled SNI-шлюз (nginx в .245, Caddy L4 в .246+) на"
-  echo "     публичном :443 и перехватывает роутинг, ломая нашу схему"
-  echo "     (decoy-сайты, location подписок, certbot webroot)."
-  echo "     Этот сервер уже имеет SNI-роутер от скрипта — gateway"
-  echo "     не нужен."
-  echo
-  echo " ПРИ СМЕНЕ IP У ПРОВАЙДЕРА (блокировка и т.п.):"
-  echo "   1. Обнови A-записи ВСЕХ доменов на новый IP (панель, обложка Reality и имя XHTTP, если оно включено)"
-  echo "   2. sudo bash $0 rebind-ip — поправит nginx stream-роутер"
-  echo "   Больше на сервере ничего трогать не нужно."
-  echo "============================================"
 
   INSTALL_SUCCESS=1
 
@@ -4668,11 +4665,12 @@ EOF
   echo "$VERSION" > /root/.lucx-script-version
 
   # --- [10b] Опция: Telegram-бот управления (v0.4.8; дефолт НЕТ) ---
-  # v0.5.6: вопрос перенесён В КОНЕЦ install, после блока ГОТОВО: раньше он шёл до выдачи адреса и пароля
-  # панели, а подсказка просила создать API-токен в панели, куда ещё нельзя было зайти.
+  # v0.5.6: вопрос перенесён в КОНЕЦ install (перед итоговым блоком): раньше он шёл до выдачи адреса и пароля панели.
+  # Адрес/логин/пароль печатаются прямо здесь — для создания API-токена панели.
   echo
   echo "=== [10b] Telegram-бот управления панелью (опция) ==="
-  echo "Панель уже доступна: адрес, логин и пароль — в блоке ГОТОВО выше."
+  echo "Панель уже доступна: https://${DOMAIN}${PANEL_PATH}   логин: ${XUI_USERNAME}   пароль: ${XUI_PASSWORD}"
+  echo "(понадобятся, если захочешь создать API-токен панели для управления клиентами из бота)"
   local BOT_WANT=""
   read -rp "Поставить Telegram-бота управления? [y/N]: " BOT_WANT || BOT_WANT=""
   if [[ "$BOT_WANT" =~ ^[Yy] ]]; then
@@ -4681,20 +4679,7 @@ EOF
     echo "Пропущено (поставить позже: sudo bash $0 add-bot)"
   fi
 
-  # v0.5.6: короткий ИТОГ в самом конце. Блок ГОТОВО с адресом и паролем панели стоит выше [10c], списков
-  # «что осталось» и шага бота и при длинном выводе уезжает за экран — дублируем главное последним.
-  echo
-  echo "================= ИТОГ: СОХРАНИ ================="
-  echo "Панель:              https://${DOMAIN}${PANEL_PATH}"
-  echo "Логин/пароль:        ${XUI_USERNAME} / ${XUI_PASSWORD}"
-  echo "Подписки:            https://${DOMAIN}${SUB_SECRET_PATH}"
-  if [[ -n "${XHTTP_DOM_INST:-}" ]] && xhttp_active; then
-    echo "XHTTP+Reality:       включён на ${XHTTP_DOM_INST}"
-  fi
-  echo "Все ссылки и ключи:  cat ${CREDS_FILE}"
-  echo "Проверка схемы:      sudo bash $0 healthcheck"
-  echo "Что сделать руками в панели (AmneziaWG и др.) — в блоке «ЧТО ОСТАЛОСЬ» выше."
-  echo "=================================================="
+  install_print_summary
 }
 
 # ================== РЕЖИМ: HEALTHCHECK ==================

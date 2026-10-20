@@ -5396,7 +5396,7 @@ cmd_healthcheck() {
     hcx_crt="/etc/letsencrypt/live/${hcx_dom}/fullchain.pem"
     if [[ -s "$hcx_crt" ]]; then
       if openssl x509 -in "$hcx_crt" -noout -checkend $((14*86400)) >/dev/null 2>&1; then
-        check "XHTTP: сертификат ${hcx_dom} действует ещё >14 дней" ok
+        check "XHTTP: сертификат ${hcx_dom} валиден (до: $(openssl x509 -in "$hcx_crt" -noout -enddate 2>/dev/null | cut -d= -f2), запас больше 14 дней)" ok
       else
         check "XHTTP: сертификат ${hcx_dom} истекает <14 дней (или уже истёк) — certbot renew" fail
       fi

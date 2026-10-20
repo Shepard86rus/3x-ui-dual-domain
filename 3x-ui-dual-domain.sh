@@ -872,7 +872,15 @@
 #   minClientVer у всех Reality-входов (в т.ч. XHTTP) ПУСТОЙ по решению владельца (XHTTP_MIN_CLIENT / REALITY_MIN_CLIENT).
 #   Справка: при пустом значении Xray 26.x пишет «default minimal client version is 26.3.27, other clients may be
 #   refused»; непустое значение, наоборот, предупреждает о риске блокировки. Если старые клиенты не подключаются — задать 1.8.0.
-VERSION="0.5.6"
+# v0.5.7 (2026-10-20) — точечные правки по аудиту ZCode релиза v0.5.6 (Claude + ZCode):
+#   (1) xhttp_rollback_all и cmd_remove_xhttp: сбой `systemctl start x-ui` больше не обрывает команду молча (под реальным errexit
+#       это пропускало перезагрузку nginx после отката) — печатается ВНИМАНИЕ с подсказкой journalctl;
+#   (2) create_xhttp_inbound: контроль cp -a бэкапа БД (диск полон -> отказ ДО правки БД, x-ui запускается обратно) и
+#       проверка «XHTTP-инбаунд уже есть» (повторный add-xhttp после остатка не создаёт дубль, а подсказывает remove-xhttp);
+#   (3) healthcheck [4]: исключение XHTTP-инбаунда из «лишних vless» только по port+listen (панель может переименовать тег);
+#   (4) install: INSTALL_SELF принимается, только если это скрипт (есть VERSION=), а не бинарь bash при запуске через пайп;
+#   (5) upgrade: flock — два одновременных upgrade не затрут общий .upgrade-old.
+VERSION="0.5.7"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
 # С v3.7.0-lucx.203 install-awg-module.sh качает исходники tarball'ом
@@ -2031,6 +2039,8 @@ cmd_install() {
   fi
 
   INSTALL_SELF=$(readlink -f "$0" 2>/dev/null || true)   # для запуска add-xhttp отдельным процессом ([10c])
+  # при запуске через пайп (curl | bash) $0 = bash: берём путь только если это наш скрипт
+  if [[ -n "$INSTALL_SELF" ]] && ! grep -q '^VERSION=' "$INSTALL_SELF" 2>/dev/null; then INSTALL_SELF=""; fi
 
   # Логирование
   # v0.3.7: в лог попадают креды панели (username/password, hy2-ссылка с
@@ -5189,10 +5199,10 @@ cmd_healthcheck() {
       # эксперименты пользователя валидны. Но если такой инбаунд слушает
       # НЕ loopback — это открытый порт мимо nginx SNI-роутера, и тут
       # уже FAIL.
-      extra=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbounds WHERE protocol='vless' AND port!=443 AND NOT (port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' AND tag='${REALITY_FRONT_TAG}') AND NOT (port=${XHTTP_PORT} AND listen='127.0.0.1' AND tag='${XHTTP_TAG}');" 2>/dev/null || echo 0)
+      extra=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbounds WHERE protocol='vless' AND port!=443 AND NOT (port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' AND tag='${REALITY_FRONT_TAG}') AND NOT (port=${XHTTP_PORT} AND listen='127.0.0.1');" 2>/dev/null || echo 0)
       if [[ "$extra" -gt 0 ]]; then
-        extra_list=$(sqlite3 "$XUIDB" "SELECT remark||':'||COALESCE(listen,'<все>')||':'||port FROM inbounds WHERE protocol='vless' AND port!=443 AND NOT (port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' AND tag='${REALITY_FRONT_TAG}') AND NOT (port=${XHTTP_PORT} AND listen='127.0.0.1' AND tag='${XHTTP_TAG}');" 2>/dev/null | paste -sd', ' - || true)
-        extra_open=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbounds WHERE protocol='vless' AND port!=443 AND NOT (port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' AND tag='${REALITY_FRONT_TAG}') AND NOT (port=${XHTTP_PORT} AND listen='127.0.0.1' AND tag='${XHTTP_TAG}') AND (listen IS NULL OR listen='' OR listen NOT LIKE '127.%');" 2>/dev/null || echo 0)
+        extra_list=$(sqlite3 "$XUIDB" "SELECT remark||':'||COALESCE(listen,'<все>')||':'||port FROM inbounds WHERE protocol='vless' AND port!=443 AND NOT (port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' AND tag='${REALITY_FRONT_TAG}') AND NOT (port=${XHTTP_PORT} AND listen='127.0.0.1');" 2>/dev/null | paste -sd', ' - || true)
+        extra_open=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbounds WHERE protocol='vless' AND port!=443 AND NOT (port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' AND tag='${REALITY_FRONT_TAG}') AND NOT (port=${XHTTP_PORT} AND listen='127.0.0.1') AND (listen IS NULL OR listen='' OR listen NOT LIKE '127.%');" 2>/dev/null || echo 0)
         if [[ "$extra_open" -gt 0 ]]; then
           check "Доп. vless-инбаунды НЕ на loopback (${extra_list}) — риск открытого порта мимо nginx" fail
         else
@@ -5838,6 +5848,10 @@ cmd_upgrade() {
   # а не copy+unlink с обрезкой inode под работающим bash
   self_dir=$(dirname -- "$0")
   [[ -d "$self_dir" && -w "$self_dir" ]] || self_dir="/tmp"
+  # v0.5.7: два одновременных upgrade затёрли бы общий .upgrade-old
+  if command -v flock >/dev/null 2>&1 && exec 9>/var/lock/lucx-upgrade.lock; then
+    flock -n 9 || { echo "ОШИБКА: upgrade уже выполняется (другой процесс)"; return 1; }
+  fi
   tmp=$(mktemp "$self_dir/lucx-upgrade.XXXXXX") || { echo "ОШИБКА: не создать временный файл"; return 1; }
   echo "Скачиваю последний РЕЛИЗ скрипта с GitHub (с проверкой sha256)..."
   if ! curl -fsSL --max-time 120 "$raw_url" -o "$tmp"; then
@@ -5884,7 +5898,7 @@ cmd_upgrade() {
   echo "$new_ver" > /root/.lucx-script-version 2>/dev/null || true   # v0.5.5 (Н4)
   echo "Обновлено: v$VERSION -> v$new_ver (бэкап предыдущей: ${self}.upgrade-old)"
   echo "Запускаю healthcheck новой версией..."
-  exec bash "$self" healthcheck
+  exec bash "$self" healthcheck 9>&-
 }
 
 # ================== TELEGRAM-БОТ УПРАВЛЕНИЯ (v0.4.8, опция) ==================
@@ -6631,6 +6645,13 @@ create_xhttp_inbound() {
     echo "  ОШИБКА: xray или x-ui.db не найдены — XHTTP-инбаунд не создан."
     return 1
   fi
+  local xh_exist
+  xh_exist=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbounds WHERE port=${XHTTP_PORT} AND listen='127.0.0.1';" 2>/dev/null || echo 0)
+  if [[ "${xh_exist:-0}" -gt 0 ]]; then
+    echo "  ОШИБКА: инбаунд 127.0.0.1:${XHTTP_PORT} уже есть в БД панели (остаток прежней неудачи?). Дубль не создаю."
+    echo "  Сначала: bash $0 remove-xhttp  — затем повторите add-xhttp."
+    return 1
+  fi
   keys=$("$xray_bin" x25519 2>/dev/null || true)
   priv=$(echo "$keys" | awk -F': *' 'tolower($1) ~ /^private ?key$/ {print $2; exit}')
   pub=$(echo "$keys" | awk -F': *' 'tolower($1) ~ /public ?key|^password/ {print $2; exit}')
@@ -6649,7 +6670,11 @@ create_xhttp_inbound() {
   lucx_xui_stop
   sleep 1
   XH_BAK="${XUIDB}.backup.$(date +%s)"
-  cp -a "$XUIDB" "$XH_BAK"
+  if ! cp -a "$XUIDB" "$XH_BAK"; then
+    echo "  ОШИБКА: не удалось сделать бэкап БД (${XH_BAK}) — диск полон? БД не тронута."
+    lucx_xui_start || true
+    return 1
+  fi
   if ! sqlite3 "$XUIDB" "INSERT INTO inbounds (\"user_id\",\"up\",\"down\",\"total\",\"remark\",\"enable\",\"expiry_time\",\"listen\",\"port\",\"protocol\",\"settings\",\"stream_settings\",\"tag\",\"sniffing\") VALUES ('1','0','0','0','xhttp-reality','1','0','127.0.0.1','${XHTTP_PORT}','vless','${set_json}','${str_json}','${XHTTP_TAG}','{\"enabled\":false,\"destOverride\":[\"http\",\"tls\",\"quic\",\"fakedns\"],\"metadataOnly\":false,\"routeOnly\":false}');"; then
     echo "  ОШИБКА: SQLite INSERT XHTTP-инбаунда не удался. Бэкап: ${XH_BAK}"
     lucx_xui_start
@@ -6694,7 +6719,7 @@ xhttp_rollback_all() { # stream_backup db_backup
     lucx_xui_stop
     sleep 1
     cp -a "$dbak" "$XUIDB"
-    lucx_xui_start
+    lucx_xui_start || echo "  ВНИМАНИЕ: x-ui не запустился после отката — journalctl -u x-ui -n 50"
     sleep 2
   fi
   if nginx -t >/dev/null 2>&1; then
@@ -6993,10 +7018,10 @@ cmd_remove_xhttp() {
     if ! sqlite3 "$XUIDB" "DELETE FROM inbounds WHERE id=${iid};"; then
       echo "ОШИБКА: не удалось удалить инбаунд — возвращаю БД из ${dbak}"
       cp -a "$dbak" "$XUIDB"
-      lucx_xui_start
+      lucx_xui_start || echo "ВНИМАНИЕ: x-ui не запустился — journalctl -u x-ui -n 50"
       exit 1
     fi
-    lucx_xui_start
+    lucx_xui_start || echo "ВНИМАНИЕ: x-ui не запустился — journalctl -u x-ui -n 50"
     sleep 2
   fi
   # 3) вхосты nginx и креды XHTTP

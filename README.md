@@ -41,7 +41,7 @@ decoy-сайты, ufw + fail2ban. Опционально — Telegram-бот у�
 # 1. скачать скрипт (он остаётся на сервере, все команды запускаются из него)
 curl -fsSL https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/3x-ui-dual-domain.sh -o 3x-ui-dual-domain.sh
 
-# 2. установить (скрипт спросит домены и всё сделает сам)
+# 2. установить (скрипт спросит домены и всё сделает сам; третье имя для XHTTP — необязательно, Enter пропускает)
 bash 3x-ui-dual-domain.sh install
 
 # 3. доделать панель вручную (два шага: адрес для AWG и клиенты) — см. docs/install.md

@@ -852,8 +852,12 @@
 #   (2) через nginx XHTTP-инбаунду нужен sockopt.acceptProxyProtocol; (3) на ноде старый nginx: «listen … ssl http2»,
 #   а не «http2 on;». Самотест: клиент xray (xhttp+reality) через публичный IP + гость без ключа (200 и
 #   валидный сертификат) + существующие TLS/Reality; провал — откат nginx/БД/вхостов (серт остаётся).
-#   healthcheck: блок [7b]; доп. loopback-инбаунд XHTTP больше не даёт WARN «эксперимент». ПОВЕДЕНИЕ:
-#   повторный install перегенерирует stream-конфиг без XHTTP — после него add-xhttp запустить заново.
+#   healthcheck: блок [7b]; доп. loopback-инбаунд XHTTP больше не даёт WARN «эксперимент».
+#   install: необязательный вопрос «третье имя для XHTTP+Reality» (Enter — пропустить; или env XHTTP_DOMAIN):
+#   имя проверяется как остальные (формат, DNS A, нет AAAA, порты 8447/8445 свободны), а в конце
+#   установки (блок [10c], после кредов) вызывается add-xhttp в подоболочке: провал XHTTP НЕ валит
+#   установку основной схемы. ПОВЕДЕНИЕ: повторный install перегенерирует stream-конфиг без XHTTP —
+#   после него add-xhttp запустить заново (или снова указать имя в install).
 #   minClientVer инбаунда XHTTP = 1.8.0 (при пустом значении Xray 26.x применяет минимум 26.3.27 и
 #   отсекает клиентов с иным отпечатком версии — проверено предупреждением в журнале xray).
 VERSION="0.5.6"
@@ -1996,6 +2000,13 @@ cmd_install() {
   DOMAIN="${DOMAIN,,}"
   REALITY_DOMAIN="${REALITY_DOMAIN,,}"
   echo
+  # v0.5.6: необязательное третье имя — вход VLESS+XHTTP+Reality (env XHTTP_DOMAIN или вопрос; Enter — пропустить)
+  XHTTP_DOM_INST="${XHTTP_DOMAIN:-}"
+  if [[ -z "$XHTTP_DOM_INST" ]]; then
+    read -rp "Третье имя для XHTTP+Reality (необязательно, Enter — пропустить; нужна A-запись на этот сервер): " XHTTP_DOM_INST || XHTTP_DOM_INST=""
+    echo
+  fi
+  XHTTP_DOM_INST="${XHTTP_DOM_INST,,}"
   read -rp "SubPath панели [по умолчанию /panel/]: " PANEL_PATH
   echo
   PANEL_PATH=${PANEL_PATH:-/panel/}
@@ -2005,7 +2016,7 @@ cmd_install() {
   PANEL_BASEPATH_NOSLASH="${PANEL_BASEPATH_NOSLASH%/}"
 
   # Валидация
-  for d in "$DOMAIN" "$REALITY_DOMAIN"; do
+  for d in "$DOMAIN" "$REALITY_DOMAIN" ${XHTTP_DOM_INST:+"$XHTTP_DOM_INST"}; do
     if [[ ! "$d" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$ ]]; then
       echo "ОШИБКА: '$d' не похоже на валидный домен."
       exit 1
@@ -2013,6 +2024,10 @@ cmd_install() {
   done
   if [[ "$DOMAIN" == "$REALITY_DOMAIN" ]]; then
     echo "ОШИБКА: домены должны быть разными."
+    exit 1
+  fi
+  if [[ -n "$XHTTP_DOM_INST" && ( "$XHTTP_DOM_INST" == "$DOMAIN" || "$XHTTP_DOM_INST" == "$REALITY_DOMAIN" ) ]]; then
+    echo "ОШИБКА: имя XHTTP должно отличаться от двух остальных доменов."
     exit 1
   fi
 
@@ -2072,6 +2087,7 @@ cmd_install() {
   echo
   echo "Домен панели:          $DOMAIN"
   echo "Домен-обложка Reality: $REALITY_DOMAIN"
+  [[ -n "$XHTTP_DOM_INST" ]] && echo "Имя XHTTP+Reality:     $XHTTP_DOM_INST (необязательный третий вход)"
   echo "SubPath панели:        $PANEL_PATH"
   echo "SubPath подписок:      $SUB_SECRET_PATH"
   echo "Публичный IP:          $SERVER_IP"
@@ -2096,7 +2112,7 @@ cmd_install() {
 
   # --- [2/10] Проверки окружения ---
   echo "=== [2/10] Проверки окружения ==="
-  for d in "$DOMAIN" "$REALITY_DOMAIN"; do
+  for d in "$DOMAIN" "$REALITY_DOMAIN" ${XHTTP_DOM_INST:+"$XHTTP_DOM_INST"}; do
     resolved=$(dig +short A "$d" @1.1.1.1 | head -n1 || true)
     if [[ -z "$resolved" ]]; then
       resolved=$(getent hosts "$d" | awk '{print $1}' | head -n1 || true)
@@ -2113,7 +2129,7 @@ cmd_install() {
   # не достучится («Timeout during connect»). Ловим ДО установки: сейчас —
   # громкий стоп с внятной причиной, а не загадочное падение certbot на [6/10].
   # К этому моменту dig уже доказанно работает (A-проверка выше прошла).
-  for d in "$DOMAIN" "$REALITY_DOMAIN"; do
+  for d in "$DOMAIN" "$REALITY_DOMAIN" ${XHTTP_DOM_INST:+"$XHTTP_DOM_INST"}; do
     aaaa=$(lucx_aaaa_lookup "$d")
     if [[ "$aaaa" == "UNKNOWN" ]]; then
       echo "  ВНИМАНИЕ: не удалось проверить AAAA у $d (резолверы не ответили) — продолжаю; убедись сам, что AAAA нет"
@@ -2133,7 +2149,7 @@ cmd_install() {
     ss -tlnp | grep ':443 ' || true
     exit 1
   fi
-  for p in 8443 8444 2096; do
+  for p in 8443 8444 2096 ${XHTTP_DOM_INST:+$XHTTP_PORT $XHTTP_TARGET_PORT}; do
     if ss -tlnp 2>/dev/null | grep -q ":$p "; then
       echo "ОШИБКА: порт $p уже занят"
       ss -tlnp | grep ":$p " || true
@@ -4561,6 +4577,13 @@ EOF
   echo "Креды сохранены в: ${CREDS_FILE}"
   echo
 
+  # v0.5.6 [10c]: необязательный третий вход XHTTP+Reality (в подоболочке: провал не валит установку)
+  if [[ -n "${XHTTP_DOM_INST:-}" ]]; then
+    echo "=== [10c] XHTTP+Reality на ${XHTTP_DOM_INST} (опция) ==="
+    ( cmd_add_xhttp "$XHTTP_DOM_INST" ) || echo "ВНИМАНИЕ: XHTTP не включён (основная схема установлена и работает). Устрани причину и выполни: sudo bash $0 add-xhttp ${XHTTP_DOM_INST}"
+    echo
+  fi
+
   echo "УЖЕ СДЕЛАНО УСТАНОВЩИКОМ (v0.5.4):"
   echo "  - у инбаундов VLESS и Hysteria 2 адрес для ссылок = ${REALITY_DOMAIN} (Пользовательская);"
   echo "  - в режиме TLS у них стоит uTLS firefox;"
@@ -6637,6 +6660,7 @@ cmd_add_xhttp() {
     echo "Запусти от root: sudo bash $0 add-xhttp <домен>"
     exit 1
   fi
+  trap lucx_xui_guard_fire EXIT   # в подоболочке install ловушки не наследуются
   REALITY_XRAY_PORT=443
   read_domains
   if [[ -z "${DOMAIN:-}" || -z "${REALITY_DOMAIN:-}" ]]; then
@@ -6981,7 +7005,8 @@ case "${1:-install}" in
     ;;
   *)
     echo "Использование:"
-    echo "  sudo bash $0 install       — установить всё с нуля (чистый сервер;"
+    echo "  sudo bash $0 install       — установить всё с нуля (чистый сервер; по желанию спросит третье"
+    echo "                               имя и сразу включит XHTTP+Reality; или env XHTTP_DOMAIN=...;"
     echo "                               ставит TLS + h2 + Reality перед TLS без вопросов)"
     echo "  sudo bash $0 upgrade       — обновить сам этот скрипт до новейшей версии"
     echo "                               с GitHub (патч без переустановки)"

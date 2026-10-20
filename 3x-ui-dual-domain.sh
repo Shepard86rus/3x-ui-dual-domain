@@ -5308,6 +5308,10 @@ cmd_healthcheck() {
       else
         check "XHTTP: на 127.0.0.1:${XHTTP_PORT} нет xray — вход ${hcx_dom} мёртв" fail
       fi
+      hcx_mm=$(sqlite3 "$XUIDB" "SELECT count(*) FROM inbounds i, json_each(i.settings,'\$.clients') c JOIN clients cl ON cl.email=json_extract(c.value,'\$.email') WHERE i.tag='${XHTTP_TAG}' AND (COALESCE(cl.sub_id,'')<>COALESCE(json_extract(c.value,'\$.subId'),'') OR COALESCE(cl.uuid,'')<>COALESCE(json_extract(c.value,'\$.id'),''));" 2>/dev/null || echo 0)
+      if [[ "${hcx_mm:-0}" -gt 0 ]]; then
+        check "XHTTP: у ${hcx_mm} клиент(ов) sub_id/uuid в таблице панели не совпадают с JSON инбаунда — в списке клиентов панели возможна пустая привязка" warn
+      fi
       hcx_cl=$(sqlite3 "$XUIDB" "SELECT count(*) FROM client_inbounds ci JOIN inbounds i ON i.id=ci.inbound_id WHERE i.tag='${XHTTP_TAG}';" 2>/dev/null || echo 0)
       if [[ "${hcx_cl:-0}" -gt 0 ]]; then
         check "XHTTP: к инбаунду привязано клиентов: ${hcx_cl}" ok
@@ -6599,6 +6603,13 @@ create_xhttp_inbound() {
   XH_PBK="$pub"
   XH_SID="$sid"
   XH_PATH="$xpath"
+  # самопроверка: клиент в таблице панели совпадает с клиентом в JSON инбаунда (sub_id, uuid)
+  local tsub tuuid
+  tsub=$(sqlite3 "$XUIDB" "SELECT COALESCE(sub_id,'') FROM clients WHERE email='client1-xhttp' LIMIT 1;" 2>/dev/null || true)
+  tuuid=$(sqlite3 "$XUIDB" "SELECT COALESCE(uuid,'') FROM clients WHERE email='client1-xhttp' LIMIT 1;" 2>/dev/null || true)
+  if [[ "$tsub" != "$subid" || "$tuuid" != "$uuid" ]]; then
+    echo "  ВНИМАНИЕ: клиент client1-xhttp в таблице панели не совпадает с инбаундом (sub_id '${tsub:-нет}' vs '${subid}', uuid '${tuuid:-нет}'). Список клиентов в панели может показать его без привязки; проверь страницу «Клиенты»."
+  fi
   echo "  XHTTP-инбаунд создан: 127.0.0.1:${XHTTP_PORT}, клиент client1-xhttp, ссылки на порт 443 (External Proxy)."
   return 0
 }

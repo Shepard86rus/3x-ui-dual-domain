@@ -6,7 +6,7 @@
    запускаются из этого файла, обычно в `/root`):
 
    ```bash
-   curl -fsSL https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/3x-ui-dual-domain.sh -o 3x-ui-dual-domain.sh
+   curl -fsSL https://github.com/Shepard86rus/3x-ui-dual-domain/releases/latest/download/3x-ui-dual-domain.sh -o 3x-ui-dual-domain.sh
    ```
 
 2. Запустите установку (скрипт интерактивный):
@@ -15,11 +15,15 @@
    bash 3x-ui-dual-domain.sh install
    ```
 
-   Он спросит домены, предложит выбор версии панели (Enter =
-   последняя стабильная), сохранит креды в `/root/.lucx-credentials` (mode 600)
-   и напечатает итог. База данных — SQLite (скрипт выставляет и проверяет это
-   сам; PostgreSQL не поддерживается). В конце предложит опционального
-   Telegram-бота — Enter пропускает.
+   Он спросит: **домен панели**; **«домен-обложка Reality»** (в этой документации
+   это **основной домен**, на который идут клиенты); необязательное **третье имя для
+   XHTTP** (Enter — пропустить, см. [xhttp.md](xhttp.md)); SubPath панели; порт
+   AmneziaWG (Enter = 52911); применить ли рекомендованные настройки подписок;
+   версию панели (Enter = последняя стабильная). Креды сохранятся в
+   `/root/.lucx-credentials` (mode 600). База данных — SQLite (скрипт выставляет и
+   проверяет это сам; PostgreSQL не поддерживается). В самом конце — итоговый экран
+   (адрес, логин и пароль панели, подписки, что сделать дальше) и вопрос про
+   опционального Telegram-бота — Enter пропускает.
 
 3. **Доделайте панель вручную** (с v0.5.3 остаётся два шага). Установщик теперь
    сам делает то, что раньше правилось в панели руками:
@@ -29,7 +33,7 @@
    - в режиме TLS ставит **uTLS `firefox`** у VLESS и Hysteria2;
    - на вопрос **«Применить рекомендованные настройки подписок?»** (Enter = да)
      включает подписку **Clash/Mihomo** с автоопределением по User-Agent и правилами
-     из [`clash-universal.yaml`](clash-universal.yaml) (клиенту нужен Mihomo ≥ 1.19),
+     из [`clash-universal.yaml`](../clash-universal.yaml) (клиенту нужен Mihomo ≥ 1.19),
      маршрутизацию **Happ** и **Incy** по профилям
      [hydraponique](https://github.com/hydraponique/roscomvpn-routing), скрывает
      настройки сервера (Happ) и URL подписки (Incy), включает DoH-резолв Incy и

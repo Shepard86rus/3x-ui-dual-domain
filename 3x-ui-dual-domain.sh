@@ -2070,7 +2070,7 @@ install_preflight_kernel() {
   # для работающего ядра нет заголовков -> модулю AmneziaWG понадобится новое ядро
   if [[ $need -eq 0 && ! -d "${mod_dir}/${kver}/build" ]]; then
     apt-get -q -o DPkg::Lock::Timeout=300 update >/dev/null 2>&1 || true
-    cand=$(apt-cache policy "linux-headers-${kver}" 2>/dev/null | awk '/Candidate:/ {print $2; exit}' || true)
+    cand=$(LC_ALL=C apt-cache policy "linux-headers-${kver}" 2>/dev/null | awk '/Candidate:/ {print $2; exit}' || true)
     if [[ -z "$cand" || "$cand" == "(none)" ]]; then
       need=1; why="для работающего ядра ${kver} нет заголовков (оно устарело; для модуля AmneziaWG нужно новое ядро)"
     fi
@@ -2088,7 +2088,13 @@ install_preflight_kernel() {
     return 0
   fi
   local ans=""
-  read -rp "Обновить систему сейчас (apt full-upgrade) и перезагрузить? [Y/n]: " ans || ans="n"
+  # на уже настроенном сервере (есть БД панели) безопаснее дефолт «нет»; на чистом — «да»
+  if [[ -f /etc/x-ui/x-ui.db ]]; then
+    read -rp "Обновить систему сейчас (apt full-upgrade) и перезагрузить? [y/N]: " ans || ans="n"
+    [[ "$ans" =~ ^[Yy] ]] || ans="n"
+  else
+    read -rp "Обновить систему сейчас (apt full-upgrade) и перезагрузить? [Y/n]: " ans || ans="n"
+  fi
   if [[ "$ans" =~ ^[Nn] ]]; then
     echo "  Продолжаю без обновления: сервер может перезагрузиться сам (после этого запусти install ещё раз)."
     return 0
@@ -2107,7 +2113,7 @@ install_preflight_kernel() {
 
   # новое ядро поставилось? сравниваем самое свежее в /boot с работающим
   local newest=""
-  newest=$(ls -1 "${boot_dir}"/vmlinuz-* 2>/dev/null | sed 's#.*/vmlinuz-##' | grep -v '\.old$' | sort -V | tail -n1 || true)
+  newest=$(ls -1 "${boot_dir}"/vmlinuz-* 2>/dev/null | sed 's#.*/vmlinuz-##' | grep -v -e '\.old$' -e '-rc' | sort -V | tail -n1 || true)
   local need_rb=0
   if [[ -n "$newest" && "$newest" != "$kver" ]]; then need_rb=1; fi
   if [[ -f "$rr" && -f "${rr}.pkgs" ]] && grep -q 'linux-image' "${rr}.pkgs" 2>/dev/null; then need_rb=1; fi

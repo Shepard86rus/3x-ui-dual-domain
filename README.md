@@ -44,6 +44,7 @@ curl -fsSL https://github.com/Shepard86rus/3x-ui-dual-domain/releases/latest/dow
 
 # 2. установить (скрипт спросит домены и всё сделает сам; третье имя для XHTTP — необязательно, Enter пропускает)
 bash 3x-ui-dual-domain.sh install
+#    (если в начале предложит обновить систему и перезагрузиться — согласитесь и запустите install ещё раз)
 
 # 3. доделать панель вручную (два шага: адрес для AWG и клиенты) — см. docs/install.md
 

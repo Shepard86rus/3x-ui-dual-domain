@@ -880,7 +880,15 @@
 #   (3) healthcheck [4]: исключение XHTTP-инбаунда из «лишних vless» только по port+listen (панель может переименовать тег);
 #   (4) install: INSTALL_SELF принимается, только если это скрипт (есть VERSION=), а не бинарь bash при запуске через пайп;
 #   (5) upgrade: flock — два одновременных upgrade не затрут общий .upgrade-old.
-VERSION="0.5.7"
+# v0.5.8 (2026-10-21) — install на чистом сервере с устаревшим ядром обрывался посреди установки.
+#   Установщик панели (lucx-ui install.sh) в самом конце СВОЕЙ работы сам перезагружает сервер через 10 с, если apt поставил
+#   новое ядро для модуля AmneziaWG (флаг /etc/x-ui/.awg-reboot-needed). Наш шаг [5] вызывает его посреди install, поэтому
+#   сервер уходил в ребут до nginx, сертификатов и инбаундов (реальный случай: ядро 6.8.0-35 -> 6.8.0-147).
+#   Теперь скрипт отключает этот автоперезапуск в скачанном install.sh (sed по маркеру LUCX-HOOK), доделывает установку,
+#   в итоговом экране ставит ПЕРЕЗАГРУЗКУ первым пунктом и в самом конце предлагает перезагрузить сервер сам ([y/N]).
+#   healthcheck [9]: если модуль AWG не загружен и есть флаг — подсказывает перезагрузку; после ребута флаг убирает.
+VERSION="0.5.8"
+AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
 # С v3.7.0-lucx.203 install-awg-module.sh качает исходники tarball'ом
@@ -2012,6 +2020,11 @@ install_print_summary() {
     done
   fi
   echo
+  if [[ -f "$AWG_REBOOT_FLAG" ]]; then
+    echo "  ⚠ СНАЧАЛА ПЕРЕЗАГРУЗИ СЕРВЕР: установлено новое ядро, AmneziaWG заработает только после перезагрузки."
+    echo "    Команда: sudo reboot   (потом: sudo bash $0 healthcheck)"
+    echo
+  fi
   echo "  Что сделать сейчас (пара минут):"
   echo "    1. Открой панель по адресу выше и войди."
   echo "    2. Страница AmneziaWG -> Enable -> порт ${AWG_PORT} (udp) -> Save."
@@ -2435,6 +2448,14 @@ cmd_install() {
   # v0.1.5: export не помогает, т.к. install.sh ПЕРЕОПРЕДЕЛЯЕТ
   # переменную внутри себя. Патчим install.sh через sed перед запуском.
   sed -i "s/^LUCX_BRANCH=.*/LUCX_BRANCH=\"${LUCX_TAG}\"/" "$LUCX_INSTALL_TMP"
+  # v0.5.8: установщик панели в конце сам делает reboot через 10 с, если поставил новое ядро для AWG. Посреди нашего
+  # install это обрывает установку (nginx, серты, инбаунды ещё не сделаны). Отключаем его автоперезапуск: флаг
+  # /etc/x-ui/.awg-reboot-needed остаётся, перезагрузку предложит сам наш install в самом конце.
+  sed -i '/LUCX-HOOK: deferred reboot after AWG kernel upgrade/{n;s#if \[\[ -f /etc/x-ui/\.awg-reboot-needed \]\]; then#if false; then  \# LUCX-REBOOT-DEFERRED-BY-INSTALL#}' "$LUCX_INSTALL_TMP"
+  if ! grep -q 'LUCX-REBOOT-DEFERRED-BY-INSTALL' "$LUCX_INSTALL_TMP"; then
+    echo "ВНИМАНИЕ: не удалось отключить автоперезагрузку установщика панели (его текст изменился)."
+    echo "  Если сервер перезагрузится посреди установки — после перезагрузки просто запусти install ещё раз."
+  fi
   export LUCX_BRANCH="${LUCX_TAG}"
   # v0.2.4: install.sh из lucx-ui v3.8.x принимает версию ПОЗИЦИОННЫМ
   # АРГУМЕНТОМ (install_x-ui $1 -> lucx_parse_args). БЕЗ аргумента он
@@ -4690,6 +4711,21 @@ EOF
   fi
 
   install_print_summary
+
+  # v0.5.8: отложенная перезагрузка (новое ядро для AWG) — предлагаем в самом конце, когда всё уже настроено и показано
+  if [[ -f "$AWG_REBOOT_FLAG" ]]; then
+    local RB_WANT=""
+    echo
+    read -rp "Перезагрузить сервер сейчас (нужно для AmneziaWG; SSH-сессия оборвётся)? [y/N]: " RB_WANT || RB_WANT=""
+    if [[ "$RB_WANT" =~ ^[Yy] ]]; then
+      echo "Перезагрузка через 5 секунд. После неё: sudo bash $0 healthcheck"
+      sync
+      sleep 5
+      reboot || echo "Не удалось перезагрузить — выполни вручную: sudo reboot"
+    else
+      echo "Не забудь: sudo reboot (до этого AmneziaWG не заработает)."
+    fi
+  fi
 }
 
 # ================== РЕЖИМ: HEALTHCHECK ==================
@@ -5479,7 +5515,14 @@ cmd_healthcheck() {
   echo
 
   echo "=== [9] AWG модуль ядра ==="
-  lsmod 2>/dev/null | grep -q amneziawg && check "Модуль amneziawg загружен" ok || check "Модуль amneziawg НЕ загружен" warn
+  if lsmod 2>/dev/null | grep -q amneziawg; then
+    check "Модуль amneziawg загружен" ok
+    rm -f "$AWG_REBOOT_FLAG" 2>/dev/null || true   # ребут после установки нового ядра уже был
+  elif [[ -f "$AWG_REBOOT_FLAG" ]]; then
+    check "Модуль amneziawg НЕ загружен — нужна перезагрузка сервера (установлено новое ядро): sudo reboot" warn
+  else
+    check "Модуль amneziawg НЕ загружен" warn
+  fi
   command -v awg >/dev/null 2>&1 && check "awg установлен" ok || check "awg НЕ установлен" fail
   [[ -f /etc/modules-load.d/amneziawg.conf ]] && check "amneziawg.conf в modules-load.d" ok || check "amneziawg.conf НЕ найден" warn
   echo

@@ -107,7 +107,7 @@ EOS
       cat <<'EOS'
 echo "панель: $(/usr/local/x-ui/x-ui -v 2>/dev/null | head -1 || echo '?')"
 echo "xray: $(/usr/local/x-ui/bin/xray-linux-amd64 -version 2>/dev/null | head -1 | awk "{print \$2}" || echo '?')"
-echo "скрипт: $(cat /root/.lucx-script-version 2>/dev/null || echo '?')"
+v=$(sed -n 's/^VERSION="\(.*\)"/\1/p' /root/3x-ui-dual-domain.sh 2>/dev/null | head -1); [ -n "$v" ] || v=$(cat /root/.lucx-script-version 2>/dev/null); echo "скрипт: ${v:-?}"
 EOS
       ;;
     disk)    echo 'df -h /' ;;
@@ -115,7 +115,7 @@ EOS
     backup)  echo 'f="/root/x-ui-backup-$(date +%F-%H%M).db"; cp /etc/x-ui/x-ui.db "$f" && echo "бэкап: $f" || echo "ОШИБКА бэкапа"' ;;
     hc)
       cat <<'EOS'
-s=$(ls -1 /root/3x-ui-dual-domain-*.sh 2>/dev/null | tail -1)
+s=/root/3x-ui-dual-domain.sh; [ -f "$s" ] || s=$(ls -1 /root/3x-ui-dual-domain-*.sh 2>/dev/null | tail -1)
 if [ -z "$s" ]; then echo "ОШИБКА: скрипт в /root не найден"; else
   o=$(timeout 280 bash "$s" healthcheck 2>&1)
   echo "$o" | grep -E "Итого:|FAIL\]" || echo "$o" | tail -5
@@ -126,7 +126,7 @@ EOS
     restart_xray)  echo 'pkill -f "[x]ray-linux-"; sleep 3; n=$(pgrep -c -f "[x]ray-linux-" 2>/dev/null); n=${n:-0}; if [ "$n" -eq 0 ]; then sleep 5; n=$(pgrep -c -f "[x]ray-linux-" 2>/dev/null); n=${n:-0}; fi; echo "xray процессов: $n"' ;;
     upgrade)
       cat <<'EOS'
-s=$(ls -1 /root/3x-ui-dual-domain-*.sh 2>/dev/null | tail -1)
+s=/root/3x-ui-dual-domain.sh; [ -f "$s" ] || s=$(ls -1 /root/3x-ui-dual-domain-*.sh 2>/dev/null | tail -1)
 if [ -z "$s" ]; then echo "ОШИБКА: скрипт не найден"; else
   o=$(timeout 120 bash "$s" upgrade 2>&1)
   grep -E "Обновлено|уже актуален|ОТКАЗ|ОШИБКА" <<<"$o" | head -3 || echo "upgrade: вывод без итога — проверь hc"

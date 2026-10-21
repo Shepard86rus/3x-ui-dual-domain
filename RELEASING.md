@@ -6,7 +6,7 @@
 
 1. Поднимите `VERSION` в `3x-ui-dual-domain.sh` и допишите описание версии в шапку файла.
 2. Влейте изменения в `main` через pull request (ветка `main` защищена, прямой пуш запрещён).
-3. Создайте тег `vX.Y.Z` (например `v0.5.6`) на коммите из `main`.
+3. Создайте тег `vX.Y.Z` (например `v0.5.7`) на коммите из `main`: проще всего через GitHub → Releases → Draft a new release → «Choose a tag» → ввести тег → «Create new tag on publish». Заголовок релиза — просто `vX.Y.Z`, файлы вручную не прикладывайте (их добавит workflow), метка «Latest» остаётся.
 4. Workflow `release-assets` (`.github/workflows/release.yml`) сам:
    - проверит, что `VERSION` в скрипте совпадает с тегом;
    - проверит синтаксис (`bash -n`);

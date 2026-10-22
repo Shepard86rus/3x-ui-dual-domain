@@ -29,8 +29,13 @@
      [#3319](https://github.com/MetaCubeX/mihomo/issues/3319)).
    - Если `minClientVer` пустой, Xray с v26.7.11 сам требует клиента не ниже 26.3.27, а mihomo всегда
      подписывается версией 1.8.2 ([mihomo #2967](https://github.com/MetaCubeX/mihomo/issues/2967)).
-   - Обходы: клиент на Xray (INCY и др.); mihomo-форк, собранный с веткой `v1.9.0-mod-meta` библиотеки uTLS
-     (отпечатки firefox/safari с ML-KEM); либо ядро Xray сервера не новее 26.7.28.
+   - Обходы: клиент на Xray (INCY и др.); mihomo-форк с ML-KEM для firefox/safari; либо ядро Xray сервера
+     не новее 26.7.28.
+   - **Роутер Keenetic с XKeen / XKeen-UI (проверено, работает).** XKeen ядра сам не обслуживает: источник
+     ядра задаётся в настройках. В XKeen-UI откройте **Настройки → Обновления → «Источник Mihomo»**, впишите
+     `https://github.com/legiz-ru/Prizrak-Core` (источник Xray оставьте `https://github.com/XTLS/Xray-core`) и
+     обновите ядро Mihomo. С этим форком Reality и XHTTP+Reality с отпечатком `firefox` подключаются к
+     серверу на свежем Xray. Форк стороннего автора: проверяйте, что скачиваете.
    - Отпечаток `chrome` как обход не рекомендуется: в ряде сетей он блокируется.
 
 ## Установка

@@ -75,7 +75,7 @@ bash 3x-ui-dual-domain.sh healthcheck
 Версии скрипта и релизы — на странице [Releases](https://github.com/Shepard86rus/3x-ui-dual-domain/releases).
 Скрипт `upgrade` скачивает релиз и сверяет sha256; версии ≤0.5.4 качали `main` без проверки — обновите их до 0.5.5 или новее.
 
-> ℹ️ **Клиенты на ядре mihomo** (Clash Verge, XKeen на роутерах) могут не подключаться к Reality и XHTTP+Reality на свежем Xray (≥ 26.9.8); клиенты на Xray (INCY и др.) работают. Причины и обходы — в [docs/xhttp.md](docs/xhttp.md#если-клиент-не-подключается).
+> ℹ️ **Клиенты на ядре mihomo** (Clash Verge, XKeen на роутерах) могут не подключаться к Reality и XHTTP+Reality на свежем Xray (≥ 26.9.8); клиенты на Xray (INCY и др.) работают; на роутере с XKeen-UI помогает источник Mihomo Prizrak-Core. Причины и обходы — в [docs/xhttp.md](docs/xhttp.md#если-клиент-не-подключается).
 
 ## Что можно и что нельзя в панели
 

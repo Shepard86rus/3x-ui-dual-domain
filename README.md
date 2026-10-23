@@ -72,6 +72,16 @@ bash 3x-ui-dual-domain.sh healthcheck
 | `bash 3x-ui-dual-domain.sh add-vls` / `add-reality` | перевод режима 443 TLS ⇄ Reality (для старых установок) |
 
 Панель обновляется отдельно: `x-ui update`, затем `healthcheck`.
+
+### Проверка IP: в какой стране его видят
+
+Отдельный скрипт [`tools/ipregion-lucx.sh`](tools/ipregion-lucx.sh) (форк [ipregion](https://github.com/Davoyan/ipregion), MIT) показывает, какой страной IP считают GeoIP-сервисы, YouTube, ChatGPT, Netflix и др., и помечен ли он как VPN/хостинг. Запуск по ссылке, ничего не устанавливая:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/tools/ipregion-lucx.sh)            # IP этой машины
+bash <(curl -fsSL https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/tools/ipregion-lucx.sh) 1.2.3.4    # чужой IP, например до покупки
+bash <(curl -fsSL https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/tools/ipregion-lucx.sh) --expect RU # сверить со страной, код выхода 3 если не совпало
+```
 Версии скрипта и релизы — на странице [Releases](https://github.com/Shepard86rus/3x-ui-dual-domain/releases).
 Скрипт `upgrade` скачивает релиз и сверяет sha256; версии ≤0.5.4 качали `main` без проверки — обновите их до 0.5.5 или новее.
 

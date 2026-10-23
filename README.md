@@ -20,7 +20,7 @@ decoy-сайты, ufw + fail2ban. Опционально — Telegram-бот у�
 - **Boosty** (разовый донат): [boosty.to/shepard86rus/donate](https://boosty.to/shepard86rus/donate)
 - **ЮMoney**: [yoomoney.ru/to/4100175017397](https://yoomoney.ru/to/4100175017397)
 
-Вопросы по проекту — в ишуи или в комментарии на [Boosty](https://boosty.to/shepard86rus).
+Вопросы по проекту — в ишуи, в [Telegram-чате проекта](https://t.me/+UuSzOpo76F1iZmVi) или в комментарии на [Boosty](https://boosty.to/shepard86rus).
 
 ## Что вы получите
 

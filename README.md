@@ -68,7 +68,7 @@ bash 3x-ui-dual-domain.sh healthcheck
 | `bash 3x-ui-dual-domain.sh add-xhttp <имя>` / `remove-xhttp` | третий вход XHTTP+Reality на отдельном имени (необязательно, см. [docs/xhttp.md](docs/xhttp.md)) |
 | `bash 3x-ui-dual-domain.sh add-bot` / `remove-bot` | поставить или удалить Telegram-бота |
 | `bash 3x-ui-dual-domain.sh add-swap` / `remove-swap` | опционально: swap-файл на ноде с малой памятью |
-| `bash 3x-ui-dual-domain.sh rebind-ip` | сервер сменил IP — перепрописать конфиги |
+| `bash 3x-ui-dual-domain.sh rebind-ip` | сервер сменил IP — перепрописать конфиги (порядок действий: [docs/ip-change.md](docs/ip-change.md)) |
 | `bash 3x-ui-dual-domain.sh add-vls` / `add-reality` | перевод режима 443 TLS ⇄ Reality (для старых установок) |
 
 Панель обновляется отдельно: `x-ui update`, затем `healthcheck`.
@@ -92,6 +92,7 @@ bash 3x-ui-dual-domain.sh healthcheck
 | [docs/panel-rules.md](docs/panel-rules.md) | что можно и нельзя в панели, как добавлять новые протоколы |
 | [docs/telegram-bot.md](docs/telegram-bot.md) | Telegram-бот, управление клиентами, безопасность |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | если что-то не так |
+| [docs/ip-change.md](docs/ip-change.md) | сервер сменил IP: DNS и `rebind-ip` по шагам |
 | [tools/hub/README.md](tools/hub/README.md) | один бот на весь флот (для продвинутых) |
 | [RELEASING.md](RELEASING.md) | как выпустить релиз (для мейнтейнера) |
 

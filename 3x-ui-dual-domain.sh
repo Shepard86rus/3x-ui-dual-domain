@@ -4498,6 +4498,10 @@ EOF
   STREAM_CONF="/etc/nginx/stream-sni-router.conf"
   cat > "$STREAM_CONF" <<EOF
 stream {
+    # Размер корзины хеша зададим явно: на VPS, где nginx не узнаёт процессор
+    # (кэш-линия 32), дефолт 32 не вмещает имена длиннее 14 символов —
+    # «could not build map_hash, you should increase map_hash_bucket_size: 32».
+    map_hash_bucket_size 128;
     map \$ssl_preread_server_name \$backend_pool {
         ${DOMAIN}          panel_backend;
         ${REALITY_DOMAIN}  reality_backend;

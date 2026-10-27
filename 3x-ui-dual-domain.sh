@@ -2407,17 +2407,17 @@ cmd_install() {
   # grep читает из подстановки, а не из конвейера: при pipefail ранний выход grep -q не даёт SIGPIPE и ложную ветку.
   if grep -Eq '^[[:space:]]*server_names_hash_bucket_size[[:space:]]' < <(nginx -T 2>/dev/null); then
     echo "  server_names_hash_bucket_size уже задан — не трогаю"
-  elif grep -Eq 'include[[:space:]]+/etc/nginx/conf\.d/\*\.conf' "$NGINX_CONF"; then
+  else
     mkdir -p /etc/nginx/conf.d
     printf '%s\n' '# lucx: явный размер хеша имён (см. install [2/10])' 'server_names_hash_bucket_size 128;' > "$HASH_CONF"
-    if nginx -t >/dev/null 2>&1; then
+    # Проверяем факт подключения, а не текст nginx.conf: файл должен попасть в дамп `nginx -T`
+    # (conf.d мог быть не подключён или include закомментирован), и конфиг должен проходить nginx -t.
+    if nginx -t >/dev/null 2>&1 && grep -qF "# configuration file ${HASH_CONF}:" < <(nginx -T 2>/dev/null); then
       echo "  server_names_hash_bucket_size -> 128 ($HASH_CONF)"
     else
       rm -f "$HASH_CONF"
-      echo "  WARN: nginx -t не прошёл с $HASH_CONF — убрал, продолжаю без него"
+      echo "  WARN: $HASH_CONF не подключился (conf.d не включён в nginx.conf или nginx -t не прошёл) — убрал, продолжаю без него"
     fi
-  else
-    echo "  conf.d не подключён в nginx.conf — server_names_hash_bucket_size не добавляю"
   fi
 
   # --- [3/10] ufw ---
@@ -7009,6 +7009,7 @@ EOF
   ln -sf /etc/nginx/sites-available/xhttp-80.conf /etc/nginx/sites-enabled/xhttp-80.conf
   if ! nginx -t >/dev/null 2>&1; then
     echo "ОШИБКА: nginx -t не прошёл после добавления xhttp-80.conf."
+    { nginx -t 2>&1 | tail -3 | sed 's/^/    /'; } || true
     xhttp_remove_vhosts
     exit 1
   fi
@@ -7077,6 +7078,7 @@ EOF
   sed -i "/^[[:space:]]*upstream reality_backend[[:space:]]*{/a\\    upstream xhttp_backend { server 127.0.0.1:${XHTTP_PORT}; }" "$stream_conf"
   if ! nginx -t >/dev/null 2>&1; then
     echo "ОШИБКА: nginx -t не прошёл после правки stream-конфига — откатываю всё."
+    { nginx -t 2>&1 | tail -3 | sed 's/^/    /'; } || true
     xhttp_rollback_all "$sbak" "$XH_BAK"
     exit 1
   fi

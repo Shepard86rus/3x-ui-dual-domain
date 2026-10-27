@@ -891,7 +891,14 @@
 #   ядра нет заголовков (или ядро уже ждёт перезагрузки), скрипт предлагает `apt full-upgrade` (без вопросов apt, с ожиданием
 #   блокировки), затем перезагрузку и останавливается; после ребута install запускается заново на чистом сервере с новым ядром.
 #   Пропуск: env SKIP_KERNEL_PREFLIGHT=1; в контейнерах и без tty предпроверка не выполняется (остаётся защита выше).
-VERSION="0.5.8"
+# v0.5.9 (2026-10-27) — install падал на VPS, где nginx не определяет процессор (размер кэш-линии 32).
+#   На шаге [9/10] nginx -t отвечал «could not build map_hash, you should increase map_hash_bucket_size: 32»: дефолт размера
+#   корзины хеша берётся по кэш-линии процессора, и 32 не вмещает имена от 15 символов (реальный случай: новый VPS, три имени
+#   вида xht.<домен>). Теперь (1) в stream-конфиг SNI-роутера явно добавлено `map_hash_bucket_size 128;`; (2) в конце шага [2/10]
+#   (до первого nginx -t с server_name, на [6/10]) в /etc/nginx/conf.d/00-lucx-hash.conf кладётся `server_names_hash_bucket_size 128;` — тот же класс ошибки в http-части; только
+#   если директива нигде не задана (иначе nginx ругается на дубль), с nginx -t и откатом файла; (3) домены длиннее 100 символов
+#   отклоняются сразу с понятным сообщением (при 128 предел хеша ~110 символов). Живые ноды не затронуты (install запускается один раз).
+VERSION="0.5.9"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -2191,8 +2198,8 @@ cmd_install() {
     echo
   fi
   XHTTP_DOM_INST="${XHTTP_DOM_INST,,}"
-  if [[ -n "$XHTTP_DOM_INST" && ! "$XHTTP_DOM_INST" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
-    echo "ВНИМАНИЕ: '${XHTTP_DOM_INST}' не похоже на доменное имя — XHTTP пропускаю (потом: sudo bash $0 add-xhttp <имя>)."
+  if [[ -n "$XHTTP_DOM_INST" ]] && { [[ ! "$XHTTP_DOM_INST" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] || (( ${#XHTTP_DOM_INST} > 100 )); }; then
+    echo "ВНИМАНИЕ: '${XHTTP_DOM_INST}' не похоже на доменное имя (или длиннее 100 символов) — XHTTP пропускаю (потом: sudo bash $0 add-xhttp <имя>)."
     XHTTP_DOM_INST=""
   fi
   read -rp "SubPath панели [по умолчанию /panel/]: " PANEL_PATH
@@ -2207,6 +2214,12 @@ cmd_install() {
   for d in "$DOMAIN" "$REALITY_DOMAIN"; do
     if [[ ! "$d" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$ ]]; then
       echo "ОШИБКА: '$d' не похоже на валидный домен."
+      exit 1
+    fi
+    # Имена попадают в хеш-таблицы nginx (map в stream, server_name в http) с размером
+    # корзины 128: имя длиннее ~100 символов туда не влезет и nginx -t упадёт.
+    if (( ${#d} > 100 )); then
+      echo "ОШИБКА: '$d' слишком длинное (${#d} символов, максимум 100)."
       exit 1
     fi
   done
@@ -2380,6 +2393,31 @@ cmd_install() {
     echo "ОШИБКА: UDP/${AWG_PORT} (AWG) уже занят"
     ss -ulnp | grep ":${AWG_PORT} " || true
     exit 1
+  fi
+
+  # Размер корзины хеша имён server_name: как и у map в stream, дефолт зависит от
+  # кэш-линии процессора и на VPS, где nginx его не узнаёт, равен 32 — длинные имена
+  # вхостов не влезают («could not build server_names_hash»). Кладём директиву в
+  # conf.d (Ubuntu включает его внутрь http{}), только если её нигде нет — иначе nginx
+  # ругнётся на дубль. Файл перезаписывается целиком, повторный запуск безопасен.
+  # Стоит в конце [2/10], ДО первого nginx -t с server_name (80-redirect на [6/10]):
+  # иначе длинное имя основного домена упало бы раньше, чем директива появится.
+  NGINX_CONF="/etc/nginx/nginx.conf"
+  HASH_CONF="/etc/nginx/conf.d/00-lucx-hash.conf"
+  # grep читает из подстановки, а не из конвейера: при pipefail ранний выход grep -q не даёт SIGPIPE и ложную ветку.
+  if grep -Eq '^[[:space:]]*server_names_hash_bucket_size[[:space:]]' < <(nginx -T 2>/dev/null); then
+    echo "  server_names_hash_bucket_size уже задан — не трогаю"
+  else
+    mkdir -p /etc/nginx/conf.d
+    printf '%s\n' '# lucx: явный размер хеша имён (см. install [2/10])' 'server_names_hash_bucket_size 128;' > "$HASH_CONF"
+    # Проверяем факт подключения, а не текст nginx.conf: файл должен попасть в дамп `nginx -T`
+    # (conf.d мог быть не подключён или include закомментирован), и конфиг должен проходить nginx -t.
+    if nginx -t >/dev/null 2>&1 && grep -qF "# configuration file ${HASH_CONF}:" < <(nginx -T 2>/dev/null); then
+      echo "  server_names_hash_bucket_size -> 128 ($HASH_CONF)"
+    else
+      rm -f "$HASH_CONF"
+      echo "  WARN: $HASH_CONF не подключился (conf.d не включён в nginx.conf или nginx -t не прошёл) — убрал, продолжаю без него"
+    fi
   fi
 
   # --- [3/10] ufw ---
@@ -4498,6 +4536,10 @@ EOF
   STREAM_CONF="/etc/nginx/stream-sni-router.conf"
   cat > "$STREAM_CONF" <<EOF
 stream {
+    # Размер корзины хеша зададим явно: на VPS, где nginx не узнаёт процессор
+    # (кэш-линия 32), дефолт 32 не вмещает имена длиннее 14 символов —
+    # «could not build map_hash, you should increase map_hash_bucket_size: 32».
+    map_hash_bucket_size 128;
     map \$ssl_preread_server_name \$backend_pool {
         ${DOMAIN}          panel_backend;
         ${REALITY_DOMAIN}  reality_backend;
@@ -6903,6 +6945,10 @@ cmd_add_xhttp() {
     echo "ОШИБКА: '${xdom}' не похоже на доменное имя."
     exit 1
   fi
+  if (( ${#xdom} > 100 )); then
+    echo "ОШИБКА: '${xdom}' слишком длинное (${#xdom} символов, максимум 100)."
+    exit 1
+  fi
   if [[ "$xdom" == "$DOMAIN" || "$xdom" == "$REALITY_DOMAIN" ]]; then
     echo "ОШИБКА: имя XHTTP должно отличаться от доменов панели (${DOMAIN}) и основного (${REALITY_DOMAIN})."
     exit 1
@@ -6963,6 +7009,7 @@ EOF
   ln -sf /etc/nginx/sites-available/xhttp-80.conf /etc/nginx/sites-enabled/xhttp-80.conf
   if ! nginx -t >/dev/null 2>&1; then
     echo "ОШИБКА: nginx -t не прошёл после добавления xhttp-80.conf."
+    { nginx -t 2>&1 | tail -3 | sed 's/^/    /'; } || true
     xhttp_remove_vhosts
     exit 1
   fi
@@ -7031,6 +7078,7 @@ EOF
   sed -i "/^[[:space:]]*upstream reality_backend[[:space:]]*{/a\\    upstream xhttp_backend { server 127.0.0.1:${XHTTP_PORT}; }" "$stream_conf"
   if ! nginx -t >/dev/null 2>&1; then
     echo "ОШИБКА: nginx -t не прошёл после правки stream-конфига — откатываю всё."
+    { nginx -t 2>&1 | tail -3 | sed 's/^/    /'; } || true
     xhttp_rollback_all "$sbak" "$XH_BAK"
     exit 1
   fi

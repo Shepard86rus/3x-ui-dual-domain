@@ -2191,8 +2191,8 @@ cmd_install() {
     echo
   fi
   XHTTP_DOM_INST="${XHTTP_DOM_INST,,}"
-  if [[ -n "$XHTTP_DOM_INST" && ! "$XHTTP_DOM_INST" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
-    echo "ВНИМАНИЕ: '${XHTTP_DOM_INST}' не похоже на доменное имя — XHTTP пропускаю (потом: sudo bash $0 add-xhttp <имя>)."
+  if [[ -n "$XHTTP_DOM_INST" ]] && { [[ ! "$XHTTP_DOM_INST" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] || (( ${#XHTTP_DOM_INST} > 100 )); }; then
+    echo "ВНИМАНИЕ: '${XHTTP_DOM_INST}' не похоже на доменное имя (или длиннее 100 символов) — XHTTP пропускаю (потом: sudo bash $0 add-xhttp <имя>)."
     XHTTP_DOM_INST=""
   fi
   read -rp "SubPath панели [по умолчанию /panel/]: " PANEL_PATH
@@ -2207,6 +2207,12 @@ cmd_install() {
   for d in "$DOMAIN" "$REALITY_DOMAIN"; do
     if [[ ! "$d" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$ ]]; then
       echo "ОШИБКА: '$d' не похоже на валидный домен."
+      exit 1
+    fi
+    # Имена попадают в хеш-таблицы nginx (map в stream, server_name в http) с размером
+    # корзины 128: имя длиннее ~100 символов туда не влезет и nginx -t упадёт.
+    if (( ${#d} > 100 )); then
+      echo "ОШИБКА: '$d' слишком длинное (${#d} символов, максимум 100)."
       exit 1
     fi
   done
@@ -4395,6 +4401,27 @@ SYSTEMDEOF
     echo "  ОШИБКА: nginx -t не прошёл после изменения лимитов."
     nginx -t || true
     exit 1
+  fi
+
+  # Размер корзины хеша имён server_name: как и у map в stream, дефолт зависит от
+  # кэш-линии процессора и на VPS, где nginx его не узнаёт, равен 32 — длинные имена
+  # вхостов не влезают («could not build server_names_hash»). Кладём директиву в
+  # conf.d (Ubuntu включает его внутрь http{}), только если её нигде нет — иначе nginx
+  # ругнётся на дубль. Файл перезаписывается целиком, повторный запуск безопасен.
+  HASH_CONF="/etc/nginx/conf.d/00-lucx-hash.conf"
+  if nginx -T 2>/dev/null | grep -Eq '^[[:space:]]*server_names_hash_bucket_size[[:space:]]'; then
+    echo "  server_names_hash_bucket_size уже задан — не трогаю"
+  elif grep -Eq 'include[[:space:]]+/etc/nginx/conf\.d/\*\.conf' "$NGINX_CONF"; then
+    mkdir -p /etc/nginx/conf.d
+    printf '%s\n' '# lucx: явный размер хеша имён (см. install [7.5/10])' 'server_names_hash_bucket_size 128;' > "$HASH_CONF"
+    if nginx -t >/dev/null 2>&1; then
+      echo "  server_names_hash_bucket_size -> 128 ($HASH_CONF)"
+    else
+      rm -f "$HASH_CONF"
+      echo "  WARN: nginx -t не прошёл с $HASH_CONF — убрал, продолжаю без него"
+    fi
+  else
+    echo "  conf.d не подключён в nginx.conf — server_names_hash_bucket_size не добавляю"
   fi
 
   # --- [8/10] nginx http (с location для подписок) ---

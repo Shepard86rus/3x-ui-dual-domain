@@ -899,11 +899,11 @@
 #   если директива нигде не задана (иначе nginx ругается на дубль), с nginx -t и откатом файла; (3) домены длиннее 100 символов
 #   отклоняются сразу с понятным сообщением (при 128 предел хеша ~110 символов). Живые ноды не затронуты (install запускается один раз).
 # v0.6.0 (2026-10-29) — install зависал на «Collecting pyasynchat» у VPS с нерабочим IPv6 до PyPI (реальный случай: клиентский сервер,
-#   Ubuntu 24.04). Установщик панели ставит fail2ban и докачивает через pip pyasynchat; у сервера был IPv6-адрес без маршрута до
-#   PyPI, pip ждал таймаут по каждому адресу, и установка выглядела зависшей. Теперь в конце [2/10] install_preflight_pypi:
-#   IPv4 жив, IPv6 в таймауте -> в /etc/gai.conf дописывается помеченный блок «IPv4 первым» (IPv6 не отключается, повтор безопасен,
-#   результат проверяется, при неудаче блок убирается с советом); PyPI недоступен вообще -> на Python >= 3.12 install останавливается
-#   с понятным текстом, на старых Python — предупреждение. Пропуск: SKIP_PYPI_PREFLIGHT=1.
+#   Ubuntu 24.04). Установщик панели ставит fail2ban и на Ubuntu >= 24.04 докачивает через pip pyasynchat; у сервера был IPv6-адрес без
+#   маршрута до PyPI, pip ждал таймаут по каждому адресу, и установка выглядела зависшей. Теперь в конце [2/10] install_preflight_pypi:
+#   IPv4 жив, IPv6 в таймауте и getaddrinfo отдаёт IPv6 первым -> в /etc/gai.conf дописывается помеченный блок «IPv4 первым» (IPv6 не
+#   отключается, повтор безопасен, результат проверяется, при неудаче блок убирается с советом); PyPI недоступен вообще -> предупреждение
+#   (установка fail2ban в lucx нефатальна). Проверки меряют установку соединения, а не скачивание страницы. Пропуск: SKIP_PYPI_PREFLIGHT=1.
 VERSION="0.6.0"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
@@ -2062,41 +2062,48 @@ install_print_summary() {
   echo "====================================================="
 }
 
-# v0.6.0: предпроверка доступа к PyPI. Установщик панели (lucx-ui) ставит fail2ban и на Python >= 3.12 (Ubuntu 24.04)
-# докачивает через pip пакет pyasynchat. Если у сервера есть IPv6-адрес, но маршрут до PyPI по IPv6 не работает, pip ждёт
-# таймаут по каждому адресу и установка выглядит зависшей («Collecting pyasynchat» и тишина). Здесь: (1) IPv4 до PyPI жив,
-# а IPv6 уходит в таймаут (код 28) -> дописываем в /etc/gai.conf приоритет IPv4 (помеченный блок, повтор безопасен;
-# IPv6 на сервере остаётся включённым); (2) PyPI недоступен вообще -> на Python >= 3.12 останавливаемся с понятным текстом,
-# на старых Python предупреждаем и идём дальше (pip там не нужен). Мгновенный отказ IPv6 (нет маршрута) не лечим: pip в этом случае
-# не зависает. Пропуск: env SKIP_PYPI_PREFLIGHT=1. Хуки LUCX_PYPI_URL / LUCX_GAI_CONF / LUCX_GAI_TEST_HOST — только для тестов.
+# v0.6.0: предпроверка доступа к PyPI. Установщик панели (lucx-ui, x-ui.sh setup-fail2ban) на Ubuntu >= 24.04 ставит fail2ban и
+# докачивает через pip пакет pyasynchat. Если у сервера есть IPv6-адрес, но маршрут до PyPI по IPv6 не работает, pip ждёт таймаут
+# по каждому адресу и установка выглядит зависшей («Collecting pyasynchat» и тишина). Здесь: (1) IPv4 до PyPI жив, а IPv6 уходит
+# в таймаут (код 28), и getaddrinfo сейчас отдаёт IPv6 первым -> дописываем в /etc/gai.conf приоритет IPv4 (помеченный блок,
+# повтор безопасен; IPv6 на сервере остаётся включённым; результат проверяется); (2) PyPI недоступен вообще -> только предупреждение
+# (в lucx установка fail2ban нефатальна: без pyasynchat панель и VPN работают, IP-лимит может не заработать). Мгновенный отказ IPv6
+# (нет маршрута) не лечим: pip в этом случае не зависает. Проверки меряют установку соединения (HEAD, --connect-timeout), а не
+# скачивание страницы. Пропуск: env SKIP_PYPI_PREFLIGHT=1. Хуки LUCX_PYPI_URL / LUCX_GAI_CONF / LUCX_GAI_TEST_HOST — только для тестов.
 install_preflight_pypi() {
   [[ "${SKIP_PYPI_PREFLIGHT:-0}" == "1" ]] && return 0
   command -v curl >/dev/null 2>&1 || return 0
   local url="${LUCX_PYPI_URL:-https://pypi.org/simple/pip/}" gai="${LUCX_GAI_CONF:-/etc/gai.conf}"
   local mark="# lucx: IPv4 первым (IPv6 до PyPI не отвечает, pip иначе виснет)"
-  local rc4=0 rc6=0 created=0 host="${LUCX_GAI_TEST_HOST:-pypi.org}" first=""
+  local rc4=0 rc6=0 created=0 host="${LUCX_GAI_TEST_HOST:-pypi.org}" first="" try
 
-  curl -4 -sS -m 5 -o /dev/null "$url" >/dev/null 2>&1 || rc4=$?
+  # IPv4: до двух попыток (разовый сбой сети не должен считаться недоступностью)
+  for try in 1 2; do
+    rc4=0
+    curl -4 -sS -I --connect-timeout 5 -m 15 -o /dev/null "$url" >/dev/null 2>&1 || rc4=$?
+    [[ $rc4 -eq 0 ]] && break
+  done
   if [[ $rc4 -ne 0 ]]; then
     # IPv4 до PyPI не работает. Если IPv6 жив — pip дойдёт по нему, ничего не делаем.
-    curl -6 -sS -m 5 -o /dev/null "$url" >/dev/null 2>&1 || rc6=$?
+    curl -6 -sS -I --connect-timeout 5 -m 15 -o /dev/null "$url" >/dev/null 2>&1 || rc6=$?
     [[ $rc6 -eq 0 ]] && return 0
-    if python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null; then
-      echo "  ОШИБКА: сервер не достучался до PyPI (pypi.org) ни по IPv4, ни по IPv6."
-      echo "    На этой системе (Python >= 3.12) установщик панели докачивает через pip пакет pyasynchat для fail2ban,"
-      echo "    без доступа к PyPI установка зависнет. Попроси хостера открыть доступ или возьми сервер в другом месте."
-      echo "    Пропустить проверку (на свой риск): SKIP_PYPI_PREFLIGHT=1 bash $0 install"
-      INSTALL_SUCCESS=1   # cleanup не должен трогать x-ui: его ещё нет (как в install_preflight_kernel)
-      exit 1
-    fi
-    echo "  WARN: PyPI недоступен (pypi.org). На этой системе pip для fail2ban не нужен — продолжаю."
+    echo "  WARN: сервер не достучался до PyPI (pypi.org) ни по IPv4, ни по IPv6. Установщик панели на Ubuntu 24.04+ докачивает оттуда"
+    echo "        pyasynchat для fail2ban: этот шаг будет долго ждать таймаутов и завершится без пакета (установка не прервётся, панель и"
+    echo "        VPN работают, IP-лимит может не заработать). Лучше попросить хостера открыть PyPI или взять сервер в другом месте."
     return 0
   fi
 
   # IPv4 жив. Смотрим IPv6: код 28 = таймаут (pip будет ждать каждый таймаут), остальное — мгновенный отказ или успех.
-  curl -6 -sS -m 5 -o /dev/null "$url" >/dev/null 2>&1 || rc6=$?
+  curl -6 -sS -I --connect-timeout 5 -m 15 -o /dev/null "$url" >/dev/null 2>&1 || rc6=$?
   if [[ $rc6 -ne 28 ]]; then
     echo "  PyPI доступен (IPv4)"
+    return 0
+  fi
+
+  # IPv6 в таймауте. Лечим только если getaddrinfo сейчас отдаёт IPv6 первым (иначе pip и так берёт IPv4 и не виснет).
+  first=$(getent ahosts "$host" 2>/dev/null | awk 'NR==1 {print $1}' || true)
+  if [[ "$first" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "  PyPI доступен (IPv4 уже первым в выдаче адресов)"
     return 0
   fi
 

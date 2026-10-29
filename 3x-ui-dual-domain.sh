@@ -2074,7 +2074,7 @@ install_preflight_pypi() {
   command -v curl >/dev/null 2>&1 || return 0
   local url="${LUCX_PYPI_URL:-https://pypi.org/simple/pip/}" gai="${LUCX_GAI_CONF:-/etc/gai.conf}"
   local mark="# lucx: IPv4 первым (IPv6 до PyPI не отвечает, pip иначе виснет)"
-  local rc4=0 rc6=0 host="${LUCX_GAI_TEST_HOST:-pypi.org}" first=""
+  local rc4=0 rc6=0 created=0 host="${LUCX_GAI_TEST_HOST:-pypi.org}" first=""
 
   curl -4 -sS -m 5 -o /dev/null "$url" >/dev/null 2>&1 || rc4=$?
   if [[ $rc4 -ne 0 ]]; then
@@ -2086,6 +2086,7 @@ install_preflight_pypi() {
       echo "    На этой системе (Python >= 3.12) установщик панели докачивает через pip пакет pyasynchat для fail2ban,"
       echo "    без доступа к PyPI установка зависнет. Попроси хостера открыть доступ или возьми сервер в другом месте."
       echo "    Пропустить проверку (на свой риск): SKIP_PYPI_PREFLIGHT=1 bash $0 install"
+      INSTALL_SUCCESS=1   # cleanup не должен трогать x-ui: его ещё нет (как в install_preflight_kernel)
       exit 1
     fi
     echo "  WARN: PyPI недоступен (pypi.org). На этой системе pip для fail2ban не нужен — продолжаю."
@@ -2099,10 +2100,18 @@ install_preflight_pypi() {
     return 0
   fi
 
+  [[ -e "$gai" ]] || created=1
   if ! grep -qF "$mark" "$gai" 2>/dev/null; then
-    # файл без завершающего перевода строки: не склеиваем нашу строку с последней чужой
-    [[ -s "$gai" && -n "$(tail -c1 "$gai")" ]] && echo >> "$gai"
-    printf '%s\nprecedence ::ffff:0:0/96  100\n' "$mark" >> "$gai"
+    # файл без завершающего перевода строки: не склеиваем нашу строку с последней чужой.
+    # Запись в gai.conf может не удаться (read-only, chattr +i): не падаем молча под set -e, а объясняем.
+    {
+      [[ -s "$gai" && -n "$(tail -c1 "$gai")" ]] && echo >> "$gai"
+      printf '%s\nprecedence ::ffff:0:0/96  100\n' "$mark" >> "$gai"
+    } 2>/dev/null || {
+      echo "  WARN: не могу записать $gai — если установка зависнет на «Collecting pyasynchat», выполни:"
+      echo "        sysctl -w net.ipv6.conf.all.disable_ipv6=1 и запусти install заново."
+      return 0
+    }
   fi
   # Проверяем факт: имя должно теперь резолвиться первым IPv4-адресом.
   first=$(getent ahosts "$host" 2>/dev/null | awk 'NR==1 {print $1}' || true)
@@ -2112,8 +2121,10 @@ install_preflight_pypi() {
     # не подействовало: убираем свой блок и честно предупреждаем
     local tmp
     tmp=$(mktemp)
-    awk -v m="$mark" '$0==m {skip=2} skip>0 {skip--; next} {print}' "$gai" > "$tmp" && cat "$tmp" > "$gai"
+    awk -v m="$mark" '$0==m {skip=2} skip>0 {skip--; next} {print}' "$gai" > "$tmp" && cat "$tmp" > "$gai" || true
     rm -f "$tmp"
+    # файл создали мы и после отката он пуст — не оставляем мусор
+    [[ $created -eq 1 && ! -s "$gai" ]] && rm -f "$gai"
     echo "  WARN: IPv6 до PyPI не отвечает, а приоритет IPv4 через $gai не подействовал — убрал. Если установка зависнет на"
     echo "        «Collecting pyasynchat», выполни: sysctl -w net.ipv6.conf.all.disable_ipv6=1 и запусти install заново."
   fi

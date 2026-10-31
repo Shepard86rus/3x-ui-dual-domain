@@ -79,7 +79,7 @@ bash 3x-ui-dual-domain.sh healthcheck
 
 **Этап 5. Клиенты.** Ссылку подписки выдавайте только после этапа 3. Рекомендуем **[INCY](https://incy.cc)**
 (Android, iOS, Windows, macOS, Linux, все входы схемы) и **[Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev/releases)**
-(Windows, macOS, Linux). Где скачать, как взять ссылку и добавить её в приложение — в **[docs/clients.md](docs/clients.md)**.
+(Windows, macOS, Linux). Ссылки подписки (SUB для INCY, CLASH для Clash Verge) берутся в панели: Клиенты → кнопка ⓘ → «Информация о подписке». Где скачать приложения и как добавить подписку — в **[docs/clients.md](docs/clients.md)**.
 
 ## Команды
 

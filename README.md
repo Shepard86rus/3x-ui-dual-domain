@@ -39,6 +39,9 @@ decoy-сайты, ufw + fail2ban. Опционально — Telegram-бот у�
 (DNS должен резолвиться до установки). Панельный домен — для панели и подписок, основной — для клиентов.
 
 ```bash
+# 0. обновить систему и перезагрузить сервер (на свежем сервере — первым делом; после ребута зайдите снова под root)
+apt update && apt full-upgrade -y && reboot
+
 # 1. скачать скрипт последнего РЕЛИЗА (он остаётся на сервере, все команды запускаются из него)
 curl -fsSL https://github.com/Shepard86rus/3x-ui-dual-domain/releases/latest/download/3x-ui-dual-domain.sh -o 3x-ui-dual-domain.sh
 

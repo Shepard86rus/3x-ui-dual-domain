@@ -912,7 +912,11 @@
 #   /root/.lucx-panelpath-backup/, самотестом (прямой и внешний адрес) и автооткатом; повтор безопасен (уже нестандартный
 #   путь не трогает); (3) healthcheck [6]: если путь всё ещё /panel/ — WARN с подсказкой команды (на итог не влияет).
 #   Подписки клиентов не меняются; x-ui перезапускается на несколько секунд, клиенты переподключаются сами.
-VERSION="0.6.1"
+# v0.6.2 (2026-11-02) — новая команда `panel-tunnel`: печатает инструкцию входа в панель через SSH-туннель
+#   (ssh -L до 127.0.0.1:порт панели; для сетей, где провайдер режет/душит TLS до иностранных IP: страница панели по
+#   https://домен/путь/ виснет, а VPN работает — issue #40). Ничего не меняет на сервере, обычный доступ остаётся;
+#   предупреждает, если sshd запрещает AllowTcpForwarding. В healthcheck [6] к WARN «Панель вернула код …» добавлена подсказка.
+VERSION="0.6.2"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -5427,7 +5431,7 @@ cmd_healthcheck() {
     if [[ "$panel_code" == "200" ]]; then
       check "Панель доступна через nginx" ok
     else
-      check "Панель вернула код ${panel_code}" warn
+      check "Панель вернула код ${panel_code}. Если с твоего компьютера она не открывается, а VPN работает — провайдер режет TLS: открой панель через SSH-туннель (sudo bash $0 panel-tunnel)" warn
     fi
     # v0.6.1: стандартный путь входа угадывается — подсказываем команду (на итог не влияет)
     if [[ "$panel_path" == "/panel/" ]]; then
@@ -6115,6 +6119,80 @@ cmd_rebind_ip() {
   echo "  Подробности — в README (раздел «После установки»)."
   echo "============================================"
   echo "Проверка связки: bash $0 healthcheck (блок [2] и Decoy №2 должны быть зелёными)."
+}
+
+# ================== PANEL-TUNNEL (v0.6.2): доступ к панели через SSH-туннель ==================
+# Только читает настройки и печатает готовую инструкцию. Ничего не меняет и не перезапускает.
+# Зачем: часть провайдеров режет/душит TLS до иностранных IP — страница панели по https://домен/путь/
+# виснет, хотя VPN работает. Через ssh -L трафик идёт внутри SSH и проверку по SNI не проходит.
+
+cmd_panel_tunnel() {
+  if [[ $EUID -ne 0 ]]; then
+    echo "Запусти от root: sudo bash $0 panel-tunnel"
+    exit 1
+  fi
+  if [[ ! -f "$XUIDB" ]]; then
+    echo "ОШИБКА: ${XUIDB} не найдена — панель не установлена."
+    exit 1
+  fi
+  local pport pbase pcert scheme sshport host lport=8443
+  pport=$(sqlite3 -readonly "$XUIDB" "SELECT value FROM settings WHERE key='webPort' LIMIT 1;" 2>/dev/null || true)
+  pbase=$(sqlite3 -readonly "$XUIDB" "SELECT value FROM settings WHERE key='webBasePath' LIMIT 1;" 2>/dev/null || true)
+  pcert=$(sqlite3 -readonly "$XUIDB" "SELECT value FROM settings WHERE key='webCertFile' LIMIT 1;" 2>/dev/null || true)
+  if [[ ! "$pport" =~ ^[0-9]+$ ]]; then
+    echo "ОШИБКА: не удалось определить порт панели (webPort) из БД."
+    exit 1
+  fi
+  [[ -n "$pbase" ]] || pbase="/"
+  [[ "$pbase" == /* ]] || pbase="/${pbase}"
+  [[ "$pbase" == */ ]] || pbase="${pbase}/"
+  scheme="http"
+  [[ -n "$pcert" ]] && scheme="https"
+
+  # порт SSH: реальный слушающий sshd, иначе 22
+  sshport=$(ss -tlnp 2>/dev/null | awk '/sshd/ {n=split($4,a,":"); print a[n]; exit}' || true)
+  [[ "$sshport" =~ ^[0-9]+$ ]] || sshport=22
+
+  # адрес сервера: исходящий IP, иначе домен из creds
+  host=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src"){print $(i+1); exit}}' || true)
+  if [[ -z "$host" && -f "$CREDS_FILE" ]]; then
+    read_domains >/dev/null 2>&1 || true
+    host="${DOMAIN:-}"
+  fi
+  [[ -n "$host" ]] || host="IP_СЕРВЕРА"
+
+  local ssh_p=""
+  [[ "$sshport" != "22" ]] && ssh_p=" -p ${sshport}"
+
+  local sshd_dump=""
+  sshd_dump=$(sshd -T 2>/dev/null || true)
+  if grep -qi '^allowtcpforwarding no' <<<"$sshd_dump"; then
+    echo "ВНИМАНИЕ: в sshd запрещён AllowTcpForwarding — туннель не откроется (см. /etc/ssh/sshd_config)."
+    echo ""
+  elif grep -qiE '^permitopen (none|[^a]|a[^n])' <<<"$sshd_dump"; then
+    echo "ВНИМАНИЕ: в sshd задан PermitOpen — туннель на 127.0.0.1:${pport} может быть запрещён (см. /etc/ssh/sshd_config)."
+    echo ""
+  fi
+  echo "========== Доступ к панели через SSH-туннель =========="
+  echo "Когда нужен: панель по https://ДОМЕН/путь/ не открывается или зависает (провайдер режет TLS),"
+  echo "а сам VPN работает. Туннель идёт внутри SSH. Эта команда ничего не меняет на сервере."
+  echo ""
+  echo "1) С ТВОЕГО компьютера (Windows PowerShell / macOS / Linux) запусти и оставь окно открытым:"
+  echo "     ssh -N -L ${lport}:127.0.0.1:${pport}${ssh_p} root@${host}"
+  echo "2) В браузере открой:"
+  echo "     ${scheme}://127.0.0.1:${lport}${pbase}"
+  if [[ "$scheme" == "https" ]]; then
+    echo "   (у панели включён собственный сертификат — браузер покажет предупреждение для 127.0.0.1, это ожидаемо)"
+  else
+    echo "   (адрес http:// без замка — это нормально: трафик идёт внутри SSH)"
+  fi
+  echo ""
+  echo "Termius: раздел Port Forwarding -> New Forwarding -> Local (названия полей могут слегка отличаться по версиям):"
+  echo "   локальный порт ${lport}, адрес 127.0.0.1, промежуточный хост (Intermediate host) = твой сервер,"
+  echo "   адрес назначения (Destination/Remote) 127.0.0.1, порт назначения ${pport}; затем Start."
+  echo "Если порт ${lport} на компьютере занят — возьми другой (например 18443) и подставь его в браузер."
+  echo "Закрыть туннель: Ctrl+C в окне ssh (или Stop в Termius)."
+  echo "======================================================"
 }
 
 # ================== PANEL-PATH (v0.6.1): случайный путь панели вместо /panel/ ==================
@@ -7578,6 +7656,9 @@ case "${1:-install}" in
     shift
     cmd_panel_path "$@"
     ;;
+  panel-tunnel|paneltunnel|tunnel)
+    cmd_panel_tunnel
+    ;;
   add-swap|swap)
     shift
     cmd_add_swap "$@"
@@ -7594,6 +7675,8 @@ case "${1:-install}" in
     echo "                               с GitHub (патч без переустановки)"
     echo "  sudo bash $0 panel-path    — сменить путь панели /panel/ на случайный (или свой: panel-path /my-path/);"
     echo "                               nginx + панель + creds, бэкап, самотест, автооткат; --yes без вопроса"
+    echo "  sudo bash $0 panel-tunnel  — как открыть панель через SSH-туннель, если провайдер режет TLS (только"
+    echo "                               печатает готовую команду, ничего не меняет)"
     echo "  sudo bash $0 add-vls       — переключить 443 на vless+TLS (с Reality-"
     echo "                               сервера; ключи сохраняются в /root/.lucx-mode-backup/)"
     echo "  sudo bash $0 add-reality   — вернуть Reality (из бэкапа ключей)"

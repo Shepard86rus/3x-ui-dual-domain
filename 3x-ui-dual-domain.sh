@@ -907,7 +907,7 @@
 # v0.6.1 (2026-11-02) — путь страницы входа в панель был стандартным и угадываемым (/panel/).
 #   Подписки и AWG уже имели случайные пути (/sb-…/, /awg-…/), а вход в панель — нет: любой, кто знал домен, открывал
 #   форму входа и мог подбирать пароль (защищали только пароль и fail2ban). Теперь (1) install по умолчанию (Enter) выбирает
-#   СЛУЧАЙНЫЙ путь, свой тоже можно (проверяется: латиница, цифры, - и _); (2) новая команда `panel-path` меняет путь на уже
+#   СЛУЧАЙНЫЙ путь, свой тоже можно (один сегмент: латиница, цифры, - и _); (2) новая команда `panel-path` меняет путь на уже
 #   установленных серверах: nginx location + webBasePath панели + строка URL в /root/.lucx-credentials, с бэкапом в
 #   /root/.lucx-panelpath-backup/, самотестом (прямой и внешний адрес) и автооткатом; повтор безопасен (уже нестандартный
 #   путь не трогает); (3) healthcheck [6]: если путь всё ещё /panel/ — WARN с подсказкой команды (на итог не влияет).
@@ -2292,13 +2292,13 @@ cmd_install() {
     echo "ВНИМАНИЕ: '${XHTTP_DOM_INST}' не похоже на доменное имя (или длиннее 100 символов) — XHTTP пропускаю (потом: sudo bash $0 add-xhttp <имя>)."
     XHTTP_DOM_INST=""
   fi
-  read -rp "Путь панели [Enter — случайный (рекомендуется), или свой, напр. /my-path/]: " PANEL_PATH
+  read -rp "Путь панели [Enter — случайный (рекомендуется), или свой, напр. /my-path/]: " PANEL_PATH || PANEL_PATH=""
   echo
   [[ -z "$PANEL_PATH" ]] && PANEL_PATH=$(panel_path_random)
   [[ "$PANEL_PATH" != */ ]] && PANEL_PATH="${PANEL_PATH}/"
   [[ "$PANEL_PATH" != /* ]] && PANEL_PATH="/${PANEL_PATH}"
   if ! panel_path_valid "$PANEL_PATH"; then
-    echo "ОШИБКА: путь панели '${PANEL_PATH}' недопустим — только латиница, цифры, - и _ (например /my-path/)."
+    echo "ОШИБКА: путь панели '${PANEL_PATH}' недопустим — один сегмент из латиницы, цифр, - и _ (например /my-path/)."
     exit 1
   fi
   PANEL_BASEPATH_NOSLASH="${PANEL_PATH#/}"
@@ -6119,8 +6119,8 @@ cmd_rebind_ip() {
 
 # ================== PANEL-PATH (v0.6.1): случайный путь панели вместо /panel/ ==================
 
-panel_path_valid() { # путь вида /abc/ или /abc/def/ из [A-Za-z0-9_-] (безопасно для sed/nginx)
-  [[ "$1" =~ ^/[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*/$ ]]
+panel_path_valid() { # путь вида /abc/ — ОДИН сегмент из [A-Za-z0-9_-] (безопасно для sed/nginx; многосегментные CLI панели не подтверждены)
+  [[ "$1" =~ ^/[A-Za-z0-9_-]+/$ ]]
 }
 
 panel_path_random() { # /<16 hex>/ без зависимости от openssl
@@ -6141,6 +6141,9 @@ cmd_panel_path() {
   if [[ $EUID -ne 0 ]]; then
     echo "Запусти от root: sudo bash $0 panel-path"
     exit 1
+  fi
+  if command -v flock >/dev/null 2>&1 && exec 9>/var/lock/lucx-panel-path.lock; then
+    flock -n 9 || { echo "ОШИБКА: panel-path уже выполняется (другой процесс)."; exit 1; }
   fi
   if [[ ! -f "$CREDS_FILE" ]]; then
     echo "ОШИБКА: ${CREDS_FILE} не найден — не откуда взять домен панели (установка не выполнялась?)."
@@ -6178,7 +6181,7 @@ cmd_panel_path() {
     exit 1
   fi
   if ! panel_path_valid "$cur"; then
-    echo "ОШИБКА: текущий путь панели '${cur}' содержит необычные символы — меняй вручную, скрипт не рискует."
+    echo "ОШИБКА: текущий путь панели '${cur}' нестандартного формата (не один сегмент из латиницы, цифр, - и _) — меняй вручную, скрипт не рискует."
     exit 1
   fi
   ng="/etc/nginx/sites-available/${DOMAIN}.conf"
@@ -6206,7 +6209,7 @@ cmd_panel_path() {
     [[ "$want" != /* ]] && want="/${want}"
     [[ "$want" != */ ]] && want="${want}/"
     if ! panel_path_valid "$want"; then
-      echo "ОШИБКА: путь '${want}' недопустим — только латиница, цифры, - и _ (например /my-path/)."
+      echo "ОШИБКА: путь '${want}' недопустим — один сегмент из латиницы, цифр, - и _ (например /my-path/)."
       exit 1
     fi
     if [[ "$want" == "$cur" ]]; then
@@ -6216,7 +6219,7 @@ cmd_panel_path() {
     new="$want"
   fi
   if grep -qF "location ${new}" "$ng" \
-     || [[ -n "$(sqlite3 "$XUIDB" "SELECT 1 FROM settings WHERE key IN ('subPath','subJsonPath','subClashPath') AND value='${new}' LIMIT 1;" 2>/dev/null || true)" ]]; then
+     || [[ -n "$(sqlite3 "$XUIDB" "SELECT 1 FROM settings WHERE (key LIKE '%Path' OR key LIKE '%URI') AND instr(value,'${new}')>0 LIMIT 1;" 2>/dev/null || true)" ]]; then
     echo "ОШИБКА: путь ${new} уже занят (подписки/AWG) — выбери другой."
     exit 1
   fi
@@ -6258,7 +6261,12 @@ cmd_panel_path() {
     if nginx -t >/dev/null 2>&1; then systemctl reload nginx || true; fi
     systemctl restart x-ui || true
     sleep 8
-    echo "После отката панель на прежнем адресе: https://${DOMAIN}${cur}  (бэкап: ${bk})"
+    if systemctl is-active --quiet x-ui; then
+      echo "После отката панель на прежнем адресе: https://${DOMAIN}${cur}  (бэкап: ${bk})"
+    else
+      echo "ВНИМАНИЕ: после отката x-ui НЕ запущен. Смотри: journalctl -u x-ui -n 50 --no-pager ; восстановление из бэкапа: ${bk}"
+      journalctl -u x-ui -n 20 --no-pager 2>/dev/null || true
+    fi
     exit 1
   }
 

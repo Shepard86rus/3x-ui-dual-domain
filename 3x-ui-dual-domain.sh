@@ -904,7 +904,15 @@
 #   IPv4 жив, IPv6 в таймауте и getaddrinfo отдаёт IPv6 первым -> в /etc/gai.conf дописывается помеченный блок «IPv4 первым» (IPv6 не
 #   отключается, повтор безопасен, результат проверяется, при неудаче блок убирается с советом); PyPI недоступен вообще -> предупреждение
 #   (установка fail2ban в lucx нефатальна). Проверки меряют установку соединения, а не скачивание страницы. Пропуск: SKIP_PYPI_PREFLIGHT=1.
-VERSION="0.6.0"
+# v0.6.1 (2026-11-02) — путь страницы входа в панель был стандартным и угадываемым (/panel/).
+#   Подписки и AWG уже имели случайные пути (/sb-…/, /awg-…/), а вход в панель — нет: любой, кто знал домен, открывал
+#   форму входа и мог подбирать пароль (защищали только пароль и fail2ban). Теперь (1) install по умолчанию (Enter) выбирает
+#   СЛУЧАЙНЫЙ путь, свой тоже можно (один сегмент: латиница, цифры, - и _); (2) новая команда `panel-path` меняет путь на уже
+#   установленных серверах: nginx location + webBasePath панели + строка URL в /root/.lucx-credentials, с бэкапом в
+#   /root/.lucx-panelpath-backup/, самотестом (прямой и внешний адрес) и автооткатом; повтор безопасен (уже нестандартный
+#   путь не трогает); (3) healthcheck [6]: если путь всё ещё /panel/ — WARN с подсказкой команды (на итог не влияет).
+#   Подписки клиентов не меняются; x-ui перезапускается на несколько секунд, клиенты переподключаются сами.
+VERSION="0.6.1"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -2284,11 +2292,15 @@ cmd_install() {
     echo "ВНИМАНИЕ: '${XHTTP_DOM_INST}' не похоже на доменное имя (или длиннее 100 символов) — XHTTP пропускаю (потом: sudo bash $0 add-xhttp <имя>)."
     XHTTP_DOM_INST=""
   fi
-  read -rp "SubPath панели [по умолчанию /panel/]: " PANEL_PATH
+  read -rp "Путь панели [Enter — случайный (рекомендуется), или свой, напр. /my-path/]: " PANEL_PATH || PANEL_PATH=""
   echo
-  PANEL_PATH=${PANEL_PATH:-/panel/}
+  [[ -z "$PANEL_PATH" ]] && PANEL_PATH=$(panel_path_random)
   [[ "$PANEL_PATH" != */ ]] && PANEL_PATH="${PANEL_PATH}/"
   [[ "$PANEL_PATH" != /* ]] && PANEL_PATH="/${PANEL_PATH}"
+  if ! panel_path_valid "$PANEL_PATH"; then
+    echo "ОШИБКА: путь панели '${PANEL_PATH}' недопустим — один сегмент из латиницы, цифр, - и _ (например /my-path/)."
+    exit 1
+  fi
   PANEL_BASEPATH_NOSLASH="${PANEL_PATH#/}"
   PANEL_BASEPATH_NOSLASH="${PANEL_BASEPATH_NOSLASH%/}"
 
@@ -5417,6 +5429,10 @@ cmd_healthcheck() {
     else
       check "Панель вернула код ${panel_code}" warn
     fi
+    # v0.6.1: стандартный путь входа угадывается — подсказываем команду (на итог не влияет)
+    if [[ "$panel_path" == "/panel/" ]]; then
+      check "Путь панели стандартный /panel/ — страницу входа легко найти. Смени на случайный (≈10 секунд, с откатом): sudo bash $0 panel-path" warn
+    fi
   else
     check "Пропущено: IP не определён" warn
   fi
@@ -6088,7 +6104,8 @@ cmd_rebind_ip() {
   echo ""
   echo "========== ПАНЕЛЬ: можно / нельзя =========="
   echo "  МОЖНО:   клиентов (добавить/удалить/переименовать), подписки, Инси,"
-  echo "           порт/путь панели, x-ui update (патчи своей линии)"
+  echo "           порт панели, x-ui update (патчи своей линии); ПУТЬ панели — только"
+  echo "           командой: bash $0 panel-path (меняет и nginx, и панель вместе)"
   echo "  НЕЛЬЗЯ:  сохранять боевые инбаунды через ФОРМУ (теряются proxy protocol"
   echo "           и клиенты — правка только через «Расширенный шаблон»/JSON);"
   echo "           переключать TLS<->Reality руками (только: bash $0 add-vls |"
@@ -6098,6 +6115,204 @@ cmd_rebind_ip() {
   echo "  Подробности — в README (раздел «После установки»)."
   echo "============================================"
   echo "Проверка связки: bash $0 healthcheck (блок [2] и Decoy №2 должны быть зелёными)."
+}
+
+# ================== PANEL-PATH (v0.6.1): случайный путь панели вместо /panel/ ==================
+
+panel_path_valid() { # путь вида /abc/ — ОДИН сегмент из [A-Za-z0-9_-] (безопасно для sed/nginx; многосегментные CLI панели не подтверждены)
+  [[ "$1" =~ ^/[A-Za-z0-9_-]+/$ ]]
+}
+
+panel_path_random() { # /<16 hex>/ без зависимости от openssl
+  local r
+  r=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  echo "/${r}/"
+}
+
+cmd_panel_path() {
+  local want="" assume_yes=0 a
+  for a in "$@"; do
+    case "$a" in
+      -y|--yes) assume_yes=1 ;;
+      -*) echo "Неизвестный флаг: $a"; echo "Использование: sudo bash $0 panel-path [/свой-путь/] [--yes]"; exit 1 ;;
+      *) want="$a" ;;
+    esac
+  done
+  if [[ $EUID -ne 0 ]]; then
+    echo "Запусти от root: sudo bash $0 panel-path"
+    exit 1
+  fi
+  if command -v flock >/dev/null 2>&1 && exec 9>/var/lock/lucx-panel-path.lock; then
+    flock -n 9 || { echo "ОШИБКА: panel-path уже выполняется (другой процесс)."; exit 1; }
+  fi
+  if [[ ! -f "$CREDS_FILE" ]]; then
+    echo "ОШИБКА: ${CREDS_FILE} не найден — не откуда взять домен панели (установка не выполнялась?)."
+    exit 1
+  fi
+  read_domains
+  if [[ -z "${DOMAIN:-}" ]]; then
+    echo "ОШИБКА: домен панели не определён из ${CREDS_FILE}."
+    exit 1
+  fi
+  if [[ ! -f "$XUIDB" ]]; then
+    echo "ОШИБКА: ${XUIDB} не найдена — панель не установлена."
+    exit 1
+  fi
+
+  local XUI_CLI="/usr/local/x-ui/x-ui"
+  [[ -x "$XUI_CLI" ]] || XUI_CLI="/usr/bin/x-ui"
+  [[ -x "$XUI_CLI" ]] || XUI_CLI=$(command -v x-ui 2>/dev/null || true)
+  if [[ ! -x "$XUI_CLI" ]]; then
+    echo "ОШИБКА: x-ui CLI не найден."
+    exit 1
+  fi
+
+  local cur port ng
+  cur=$(sqlite3 "$XUIDB" "SELECT value FROM settings WHERE key='webBasePath' LIMIT 1;" 2>/dev/null || true)
+  port=$(sqlite3 "$XUIDB" "SELECT value FROM settings WHERE key='webPort' LIMIT 1;" 2>/dev/null || true)
+  if [[ -z "${cur//\//}" ]]; then
+    echo "ОШИБКА: webBasePath в БД пуст — путь панели не определить, ничего не меняю."
+    exit 1
+  fi
+  [[ "$cur" != /* ]] && cur="/${cur}"
+  [[ "$cur" != */ ]] && cur="${cur}/"
+  if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+    echo "ОШИБКА: порт панели в БД не определён ('${port}') — ничего не меняю."
+    exit 1
+  fi
+  if ! panel_path_valid "$cur"; then
+    echo "ОШИБКА: текущий путь панели '${cur}' нестандартного формата (не один сегмент из латиницы, цифр, - и _) — меняй вручную, скрипт не рискует."
+    exit 1
+  fi
+  ng="/etc/nginx/sites-available/${DOMAIN}.conf"
+  if [[ ! -f "$ng" ]]; then
+    echo "ОШИБКА: не найден ${ng} — схема развёрнута не этим скриптом? Ничего не меняю."
+    exit 1
+  fi
+  local blk
+  blk=$(grep -A1 -F "location ${cur} {" "$ng" || true)   # без пайпа в grep -q: pipefail + SIGPIPE дают ложный отказ
+  if [[ "$(grep -cF "location ${cur} {" "$ng" || true)" != "1" ]] \
+     || ! grep -qF "proxy_pass http://127.0.0.1:${port}" <<<"$blk"; then
+    echo "ОШИБКА: в ${ng} не нашёл ровно один блок 'location ${cur} {' с proxy_pass на панель (127.0.0.1:${port}). Ничего не меняю."
+    exit 1
+  fi
+
+  local new
+  if [[ -z "$want" ]]; then
+    if [[ "$cur" != "/panel/" ]]; then
+      echo "Путь панели уже нестандартный (${cur}) — ничего не меняю."
+      echo "Задать другой: sudo bash $0 panel-path /новый-путь/"
+      exit 0
+    fi
+    new=$(panel_path_random)
+  else
+    [[ "$want" != /* ]] && want="/${want}"
+    [[ "$want" != */ ]] && want="${want}/"
+    if ! panel_path_valid "$want"; then
+      echo "ОШИБКА: путь '${want}' недопустим — один сегмент из латиницы, цифр, - и _ (например /my-path/)."
+      exit 1
+    fi
+    if [[ "$want" == "$cur" ]]; then
+      echo "Путь панели уже ${cur} — ничего не меняю."
+      exit 0
+    fi
+    new="$want"
+  fi
+  if grep -qF "location ${new}" "$ng" \
+     || [[ -n "$(sqlite3 "$XUIDB" "SELECT 1 FROM settings WHERE (key LIKE '%Path' OR key LIKE '%URI') AND instr(value,'${new}')>0 LIMIT 1;" 2>/dev/null || true)" ]]; then
+    echo "ОШИБКА: путь ${new} уже занят (подписки/AWG) — выбери другой."
+    exit 1
+  fi
+
+  echo "Сейчас:  https://${DOMAIN}${cur}"
+  echo "Станет:  https://${DOMAIN}${new}"
+  echo "Старый адрес перестанет работать (будет отвечать страница-заглушка). x-ui перезапустится на несколько секунд —"
+  echo "клиенты переподключатся сами; ссылки подписок не меняются."
+  if (( ! assume_yes )); then
+    local ans=""
+    if [[ -t 0 ]]; then
+      read -rp "Продолжить? [y/N]: " ans || ans=""
+    else
+      echo "Нет терминала для вопроса — повтори с флагом --yes."
+      exit 1
+    fi
+    if [[ ! "${ans,,}" =~ ^y ]]; then
+      echo "Отменено, ничего не менял."
+      exit 0
+    fi
+  fi
+
+  local bk
+  bk="/root/.lucx-panelpath-backup/$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$bk"
+  chmod 700 /root/.lucx-panelpath-backup "$bk"
+  cp -a "$ng" "${bk}/nginx.conf"
+  cp -a "$CREDS_FILE" "${bk}/credentials"
+  sqlite3 "$XUIDB" ".backup ${bk}/x-ui.db"
+  echo "Бэкап: ${bk}"
+
+  pp_rollback() { # $1 причина
+    echo "ОТКАТ: $1"
+    cp -a "${bk}/nginx.conf" "$ng"
+    cp -a "${bk}/credentials" "$CREDS_FILE"
+    local old_nos="${cur#/}"
+    old_nos="${old_nos%/}"
+    "$XUI_CLI" setting -webBasePath "$old_nos" >/dev/null 2>&1 || true
+    if nginx -t >/dev/null 2>&1; then systemctl reload nginx || true; fi
+    systemctl restart x-ui || true
+    sleep 8
+    if systemctl is-active --quiet x-ui; then
+      echo "После отката панель на прежнем адресе: https://${DOMAIN}${cur}  (бэкап: ${bk})"
+    else
+      echo "ВНИМАНИЕ: после отката x-ui НЕ запущен. Смотри: journalctl -u x-ui -n 50 --no-pager ; восстановление из бэкапа: ${bk}"
+      journalctl -u x-ui -n 20 --no-pager 2>/dev/null || true
+    fi
+    exit 1
+  }
+
+  sed -i "s|location ${cur} {|location ${new} {|" "$ng"
+  grep -qF "location ${new} {" "$ng" || pp_rollback "правка nginx не применилась"
+  nginx -t >/dev/null 2>&1 || pp_rollback "nginx -t не прошёл"
+
+  local new_nos="${new#/}" got
+  new_nos="${new_nos%/}"
+  "$XUI_CLI" setting -webBasePath "$new_nos" >/dev/null 2>&1 || true
+  got=$(sqlite3 "$XUIDB" "SELECT value FROM settings WHERE key='webBasePath' LIMIT 1;" 2>/dev/null || true)
+  [[ "$got" != /* ]] && got="/${got}"
+  [[ "$got" != */ ]] && got="${got}/"
+  [[ "$got" == "$new" ]] || pp_rollback "панель не приняла новый путь (в БД: ${got})"
+
+  systemctl reload nginx || pp_rollback "nginx reload не прошёл"
+  systemctl restart x-ui || pp_rollback "x-ui не перезапустился"
+
+  local code="000" i
+  for i in $(seq 1 15); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:${port}${new}" 2>/dev/null || true)
+    [[ "$code" == "200" ]] && break
+    sleep 2
+  done
+  [[ "$code" == "200" ]] || pp_rollback "панель не отвечает на новом пути (код ${code})"
+
+  sed -i -E "s|^(URL: https://[^/]+)/.*|\1${new}|" "$CREDS_FILE"
+
+  local sip ext old_ext
+  sip=$(get_server_ip)
+  if [[ -n "$sip" ]]; then
+    ext=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' --resolve "${DOMAIN}:443:${sip}" "https://${DOMAIN}${new}" 2>/dev/null || true)
+    [[ "$ext" == "200" ]] || pp_rollback "снаружи новый адрес не открывается (код ${ext})"
+    old_ext=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' --resolve "${DOMAIN}:443:${sip}" "https://${DOMAIN}${cur}" 2>/dev/null || true)
+    echo "Проверка снаружи: новый адрес = ${ext}, старый = ${old_ext} (ждём 200 и не 200)"
+  else
+    echo "WARN: публичный IP не определён — проверка снаружи пропущена (смотри healthcheck)."
+  fi
+
+  echo ""
+  echo "OK: путь панели изменён."
+  echo "  Новый адрес: https://${DOMAIN}${new}"
+  echo "  Сохранён в ${CREDS_FILE} (строка URL); бэкап прежнего состояния: ${bk}"
+  echo "  Старый адрес https://${DOMAIN}${cur} теперь отдаёт страницу-заглушку. Обнови закладки."
+  echo "  Совет: в настройках панели включи двухфакторную аутентификацию (2FA)."
+  echo "Проверка: sudo bash $0 healthcheck"
 }
 
 # ================== UPGRADE (v0.4.7): патч скрипта без переустановки ==================
@@ -7359,6 +7574,10 @@ case "${1:-install}" in
   upgrade|update-script)
     cmd_upgrade
     ;;
+  panel-path|panelpath|randpath)
+    shift
+    cmd_panel_path "$@"
+    ;;
   add-swap|swap)
     shift
     cmd_add_swap "$@"
@@ -7373,6 +7592,8 @@ case "${1:-install}" in
     echo "                               ставит TLS + h2 + Reality перед TLS без вопросов)"
     echo "  sudo bash $0 upgrade       — обновить сам этот скрипт до новейшей версии"
     echo "                               с GitHub (патч без переустановки)"
+    echo "  sudo bash $0 panel-path    — сменить путь панели /panel/ на случайный (или свой: panel-path /my-path/);"
+    echo "                               nginx + панель + creds, бэкап, самотест, автооткат; --yes без вопроса"
     echo "  sudo bash $0 add-vls       — переключить 443 на vless+TLS (с Reality-"
     echo "                               сервера; ключи сохраняются в /root/.lucx-mode-backup/)"
     echo "  sudo bash $0 add-reality   — вернуть Reality (из бэкапа ключей)"

@@ -916,7 +916,15 @@
 #   (ssh -L до 127.0.0.1:порт панели; для сетей, где провайдер режет/душит TLS до иностранных IP: страница панели по
 #   https://домен/путь/ виснет, а VPN работает — issue #40). Ничего не меняет на сервере, обычный доступ остаётся;
 #   предупреждает, если sshd запрещает AllowTcpForwarding. В healthcheck [6] к WARN «Панель вернула код …» добавлена подсказка.
-VERSION="0.6.2"
+# v0.6.3 (2026-11-03) — доработка `panel-tunnel` по аудиту: (1) healthcheck [6] больше не винит провайдера при коде != 200
+#   (проверка идёт с самого сервера: подсказка про туннель перенесена в ветку OK, в WARN — systemctl status x-ui / nginx -t);
+#   (2) в команде ssh пользователь = реально вошедший (logname, иначе SUDO_USER, иначе root), предупреждение при PermitRootLogin no;
+#   (3) адрес сервера через get_server_ip (за NAT маршрут даёт внутренний IP); (4) порт SSH: ss -> sshd -T -> 22; запрет
+#   пересылки распознаётся полнее (remote, DisableForwarding, Match для пользователя), PermitOpen с портом панели не ругается;
+#   (5) предупреждения: порт панели не слушается, задан webDomain; (6) тексты: «по SSH на сервер зайти можно» вместо «VPN работает»,
+#   подсказка про -i для входа по ключу, в Termius промежуточный хост = этот же сервер; (7) лишние аргументы команды отклоняются,
+#   нет sqlite3 — понятная ошибка. Команда по-прежнему только читает.
+VERSION="0.6.3"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -5429,9 +5437,9 @@ cmd_healthcheck() {
     panel_path=$(grep -m1 '^URL:' "$CREDS_FILE" 2>/dev/null | sed -E 's|^URL: ||; s|https://[^/]+||' || echo "/panel/")
     panel_code=$(curl -sk --max-time 8 -o /dev/null -w "%{http_code}" "https://${DOMAIN}${panel_path}" --resolve "${DOMAIN}:443:${SERVER_IP}" 2>/dev/null || echo "000")
     if [[ "$panel_code" == "200" ]]; then
-      check "Панель доступна через nginx" ok
+      check "Панель доступна через nginx (проверка с самого сервера). Если с твоего компьютера не открывается — sudo bash $0 panel-tunnel" ok
     else
-      check "Панель вернула код ${panel_code}. Если с твоего компьютера она не открывается, а VPN работает — провайдер режет TLS: открой панель через SSH-туннель (sudo bash $0 panel-tunnel)" warn
+      check "Панель вернула код ${panel_code} при проверке с самого сервера (это не провайдер): systemctl status x-ui; nginx -t" warn
     fi
     # v0.6.1: стандартный путь входа угадывается — подсказываем команду (на итог не влияет)
     if [[ "$panel_path" == "/panel/" ]]; then
@@ -6124,7 +6132,7 @@ cmd_rebind_ip() {
 # ================== PANEL-TUNNEL (v0.6.2): доступ к панели через SSH-туннель ==================
 # Только читает настройки и печатает готовую инструкцию. Ничего не меняет и не перезапускает.
 # Зачем: часть провайдеров режет/душит TLS до иностранных IP — страница панели по https://домен/путь/
-# виснет, хотя VPN работает. Через ssh -L трафик идёт внутри SSH и проверку по SNI не проходит.
+# виснет, хотя по SSH на сервер зайти можно. Через ssh -L трафик идёт внутри SSH и проверку по SNI не проходит.
 
 cmd_panel_tunnel() {
   if [[ $EUID -ne 0 ]]; then
@@ -6135,10 +6143,15 @@ cmd_panel_tunnel() {
     echo "ОШИБКА: ${XUIDB} не найдена — панель не установлена."
     exit 1
   fi
-  local pport pbase pcert scheme sshport host lport=8443
-  pport=$(sqlite3 -readonly "$XUIDB" "SELECT value FROM settings WHERE key='webPort' LIMIT 1;" 2>/dev/null || true)
-  pbase=$(sqlite3 -readonly "$XUIDB" "SELECT value FROM settings WHERE key='webBasePath' LIMIT 1;" 2>/dev/null || true)
-  pcert=$(sqlite3 -readonly "$XUIDB" "SELECT value FROM settings WHERE key='webCertFile' LIMIT 1;" 2>/dev/null || true)
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    echo "ОШИБКА: не найден sqlite3 — настройки панели не прочитать (apt install sqlite3)."
+    exit 1
+  fi
+  local pport pbase pcert pwebdom scheme sshport host suser lport=8443 sshd_dump="" ssh_p="" warn_any=0
+  pport=$(sqlite3 -readonly -cmd ".timeout 2000" "$XUIDB" "SELECT value FROM settings WHERE key='webPort' LIMIT 1;" 2>/dev/null || true)
+  pbase=$(sqlite3 -readonly -cmd ".timeout 2000" "$XUIDB" "SELECT value FROM settings WHERE key='webBasePath' LIMIT 1;" 2>/dev/null || true)
+  pcert=$(sqlite3 -readonly -cmd ".timeout 2000" "$XUIDB" "SELECT value FROM settings WHERE key='webCertFile' LIMIT 1;" 2>/dev/null || true)
+  pwebdom=$(sqlite3 -readonly -cmd ".timeout 2000" "$XUIDB" "SELECT value FROM settings WHERE key='webDomain' LIMIT 1;" 2>/dev/null || true)
   if [[ ! "$pport" =~ ^[0-9]+$ ]]; then
     echo "ОШИБКА: не удалось определить порт панели (webPort) из БД."
     exit 1
@@ -6149,36 +6162,58 @@ cmd_panel_tunnel() {
   scheme="http"
   [[ -n "$pcert" ]] && scheme="https"
 
-  # порт SSH: реальный слушающий sshd, иначе 22
-  sshport=$(ss -tlnp 2>/dev/null | awk '/sshd/ {n=split($4,a,":"); print a[n]; exit}' || true)
-  [[ "$sshport" =~ ^[0-9]+$ ]] || sshport=22
+  # пользователь для ssh: тот, кто реально вошёл (logname переживает sudo/su; без tty — SUDO_USER, иначе root)
+  suser=$(logname 2>/dev/null || true)
+  [[ -n "$suser" ]] || suser="${SUDO_USER:-root}"
 
-  # адрес сервера: исходящий IP, иначе домен из creds
-  host=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src"){print $(i+1); exit}}' || true)
+  # настройки sshd (с учётом Match для этого пользователя; запасной вариант — без -C)
+  sshd_dump=$(sshd -T -C "user=${suser},host=localhost,addr=127.0.0.1" 2>/dev/null || sshd -T 2>/dev/null || true)
+
+  # порт SSH: слушающий sshd (ss), затем настройка sshd, иначе 22
+  sshport=$(ss -tlnp 2>/dev/null | awk '/sshd/ {n=split($4,a,":"); print a[n]; exit}' || true)
+  [[ "$sshport" =~ ^[0-9]+$ ]] || sshport=$(awk '$1=="port"{print $2; exit}' <<<"$sshd_dump" 2>/dev/null || true)
+  [[ "$sshport" =~ ^[0-9]+$ ]] || sshport=22
+  [[ "$sshport" != "22" ]] && ssh_p=" -p ${sshport}"
+
+  # адрес сервера: внешний IP (за NAT маршрут даёт внутренний), иначе домен из creds
+  echo "Определяю адрес сервера…"
+  host=$(get_server_ip 2>/dev/null || true)
   if [[ -z "$host" && -f "$CREDS_FILE" ]]; then
     read_domains >/dev/null 2>&1 || true
     host="${DOMAIN:-}"
   fi
   [[ -n "$host" ]] || host="IP_СЕРВЕРА"
 
-  local ssh_p=""
-  [[ "$sshport" != "22" ]] && ssh_p=" -p ${sshport}"
-
-  local sshd_dump=""
-  sshd_dump=$(sshd -T 2>/dev/null || true)
-  if grep -qi '^allowtcpforwarding no' <<<"$sshd_dump"; then
-    echo "ВНИМАНИЕ: в sshd запрещён AllowTcpForwarding — туннель не откроется (см. /etc/ssh/sshd_config)."
-    echo ""
-  elif grep -qiE '^permitopen (none|[^a]|a[^n])' <<<"$sshd_dump"; then
-    echo "ВНИМАНИЕ: в sshd задан PermitOpen — туннель на 127.0.0.1:${pport} может быть запрещён (см. /etc/ssh/sshd_config)."
-    echo ""
+  # предупреждения (только чтение)
+  if grep -qiE '^(allowtcpforwarding (no|remote)|disableforwarding yes)' <<<"$sshd_dump"; then
+    echo "ВНИМАНИЕ: в sshd запрещена пересылка портов (AllowTcpForwarding/DisableForwarding) — туннель не откроется (см. /etc/ssh/sshd_config)."
+    warn_any=1
+  elif grep -qiE '^permitopen (none|[^a]|a[^n])' <<<"$sshd_dump" && ! grep -qiE "^permitopen .*(127\.0\.0\.1|localhost|\*):(${pport}|\*)( |\$)" <<<"$sshd_dump"; then
+    echo "ВНИМАНИЕ: в sshd задан PermitOpen — туннель на 127.0.0.1:${pport} может быть запрещён (см. /etc/ssh/sshd_config; Match Address не учтён)."
+    warn_any=1
   fi
+  if [[ "$suser" == "root" ]] && grep -qiE '^permitrootlogin no' <<<"$sshd_dump"; then
+    echo "ВНИМАНИЕ: вход под root по SSH запрещён — подставь в команду своего пользователя вместо root."
+    warn_any=1
+  fi
+  if command -v ss >/dev/null 2>&1 && ! grep -qE "[:.]${pport}[[:space:]]" <<<"$(ss -tln 2>/dev/null)"; then
+    echo "ВНИМАНИЕ: порт панели ${pport} сейчас никто не слушает (x-ui остановлен?) — проверь: systemctl status x-ui"
+    warn_any=1
+  fi
+  if [[ -n "$pwebdom" ]]; then
+    echo "ВНИМАНИЕ: в настройках панели задан домен (webDomain=${pwebdom}) — панель может отвечать ошибкой на обращение по 127.0.0.1; если так — временно очисти это поле в настройках панели."
+    warn_any=1
+  fi
+  [[ "$warn_any" -eq 1 ]] && echo ""
+
   echo "========== Доступ к панели через SSH-туннель =========="
-  echo "Когда нужен: панель по https://ДОМЕН/путь/ не открывается или зависает (провайдер режет TLS),"
-  echo "а сам VPN работает. Туннель идёт внутри SSH. Эта команда ничего не меняет на сервере."
+  echo "Когда нужен: панель по https://ДОМЕН/путь/ не открывается или зависает (скорее всего, провайдер режет TLS),"
+  echo "а по SSH на сервер зайти можно. Туннель идёт внутри SSH. Эта команда ничего не меняет на сервере."
   echo ""
   echo "1) С ТВОЕГО компьютера (Windows PowerShell / macOS / Linux) запусти и оставь окно открытым:"
-  echo "     ssh -N -L ${lport}:127.0.0.1:${pport}${ssh_p} root@${host}"
+  echo "     ssh -N -L ${lport}:127.0.0.1:${pport}${ssh_p} ${suser}@${host}"
+  echo "   Адрес, порт и пользователь — те же, что для обычного входа по SSH; если у тебя другие, подставь свои."
+  echo "   Входишь по ключу — добавь -i путь_к_ключу (в Termius ключ уже задан в хосте)."
   echo "2) В браузере открой:"
   echo "     ${scheme}://127.0.0.1:${lport}${pbase}"
   if [[ "$scheme" == "https" ]]; then
@@ -6188,9 +6223,10 @@ cmd_panel_tunnel() {
   fi
   echo ""
   echo "Termius: раздел Port Forwarding -> New Forwarding -> Local (названия полей могут слегка отличаться по версиям):"
-  echo "   локальный порт ${lport}, адрес 127.0.0.1, промежуточный хост (Intermediate host) = твой сервер,"
+  echo "   локальный порт ${lport}, адрес привязки (Bind address) 127.0.0.1 (не 0.0.0.0),"
+  echo "   промежуточный хост (Intermediate host) = ТОТ ЖЕ сервер, на котором ты сейчас запустил эту команду,"
   echo "   адрес назначения (Destination/Remote) 127.0.0.1, порт назначения ${pport}; затем Start."
-  echo "Если порт ${lport} на компьютере занят — возьми другой (например 18443) и подставь его в браузер."
+  echo "Если порт ${lport} на компьютере занят (в том числе другим туннелем) — возьми другой (например 18443) и подставь его в браузер."
   echo "Закрыть туннель: Ctrl+C в окне ssh (или Stop в Termius)."
   echo "======================================================"
 }
@@ -7657,6 +7693,8 @@ case "${1:-install}" in
     cmd_panel_path "$@"
     ;;
   panel-tunnel|paneltunnel|tunnel)
+    shift
+    [[ $# -eq 0 ]] || { echo "panel-tunnel запускается без аргументов: sudo bash $0 panel-tunnel"; exit 1; }
     cmd_panel_tunnel
     ;;
   add-swap|swap)

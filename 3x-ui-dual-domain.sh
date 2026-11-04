@@ -924,7 +924,20 @@
 #   (5) предупреждения: порт панели не слушается, задан webDomain; (6) тексты: «по SSH на сервер зайти можно» вместо «VPN работает»,
 #   подсказка про -i для входа по ключу, в Termius промежуточный хост = этот же сервер; (7) лишние аргументы команды отклоняются,
 #   нет sqlite3 — понятная ошибка. Команда по-прежнему только читает.
-VERSION="0.6.3"
+# v0.6.4 (2026-11-04) — новые команды `backup` и `restore`: перенос сервера целиком (клиенты, инбаунды, подписки, настройки).
+#   backup: зашифрованный архив (AES-256, пароль), консистентная копия БД, манифест с версиями; сертификаты по --with-certs.
+#   restore: на сервер с уже выполненным install (те же домены); проверки: пароль/целостность, версия панели здесь не ниже архивной,
+#   домены совпадают (всегда стоп); страховочная копия, новый IP в stream-роутере (как rebind-ip), порты AWG в ufw, nginx -t, автооткат.
+#   rebind-ip (исправление существующей команды): sed меняет только строку `listen [IP:]443;` (раньше цеплял и `127.0.0.1:8443;`,
+#   `[::]:443;`), введённый вручную IP проверяется как IPv4, IP должен быть назначен интерфейсу сервера (иначе nginx не сможет
+#   его слушать), при провале nginx -t / restart / проверки порта прежний stream-конфиг возвращается автоматически.
+#   По итогам полного аудита (существующий код): (1) install не включает ufw, пока не определён порт SSH (ss, sshd -T, порт текущего
+#   подключения, SSH_PORT=…): вместо «открыл 22 и включил» — стоп с понятным сообщением; тот же набор источников в healthcheck [11];
+#   (2) healthcheck больше не обрывается без «Итого», если нет сертификата домена или нет копий x-ui.db.backup.*; (3) add-xhttp: откат
+#   при любом выходе (ошибка, Ctrl+C, обрыв SSH), правка stream-конфига на копии с одной подменой; (4) panel-path: откат при прерывании,
+#   возврат БД из бэкапа, если панель не вернула путь, выравнивание URL в creds по БД после прерванного запуска, проверка снаружи по
+#   адресу из listen; (5) backup не стартует во время panel-path. Заглушки: ссылки mailto: заменены на #contact.
+VERSION="0.6.4"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -1143,13 +1156,42 @@ lucx_free_port() {
   echo "$1"
 }
 
+# v0.6.4: порт(ы) SSH для правил ufw. Источники ОБЪЕДИНЯЮТСЯ (а не «первый найденный»): SSH_PORT от пользователя
+# (числа через пробел/запятую), слушатели sshd/dropbear в ss, порт текущего SSH-подключения (SSH_CONNECTION);
+# `sshd -T` — запасной, если всё пусто. Пусто = определить не удалось. Если SSH_PORT задан, но не содержит ни одного
+# порта — код 2 (вызывающий останавливается: молча терять введённое значение нельзя).
+lucx_detect_ssh_ports() {
+  local p="" x
+  if [[ -n "${SSH_PORT:-}" ]]; then
+    for x in ${SSH_PORT//,/ }; do
+      if [[ "$x" =~ ^[0-9]{1,5}$ ]] && (( 10#$x >= 1 && 10#$x <= 65535 )); then p+="$((10#$x))"$'\n'; fi
+    done
+    if [[ -z "$p" ]]; then
+      echo "SSH_PORT='${SSH_PORT}' не похоже на порт (нужны числа 1-65535 через пробел/запятую)" >&2
+      return 2
+    fi
+  fi
+  p+=$(ss -tlnp 2>/dev/null | grep -E 'sshd|dropbear' | grep -oP ':\K[0-9]+(?= )' || true)
+  p+=$'\n'
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    p+=$(echo "$SSH_CONNECTION" | awk '{print $4}')
+    p+=$'\n'
+  fi
+  if [[ -z "$(tr -d ' \n' <<<"$p")" ]] && command -v sshd >/dev/null 2>&1; then
+    p+=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' || true)
+  fi
+  p=$(grep -xE '[0-9]{1,5}' <<<"$p" | awk '$1>=1 && $1<=65535' | sort -un | tr '\n' ' ' || true)
+  echo "${p% }"
+  return 0
+}
+
 # v0.5.5 (С3): страховка «x-ui остановлен нами» — при любом выходе скрипта
 # (в т.ч. неожиданном сбое между stop и start под set -e) панель запускается обратно
 LUCX_XUI_STOPPED=0
 lucx_xui_guard_fire() {
   if [[ "${LUCX_XUI_STOPPED:-0}" == "1" ]]; then
     LUCX_XUI_STOPPED=0
-    echo "ВНИМАНИЕ: скрипт завершился при остановленном x-ui — запускаю его обратно (бэкап БД: ${XUIDB}.backup.*)"
+    echo "ВНИМАНИЕ: скрипт завершился при остановленном x-ui — запускаю его обратно (бэкап БД: ${BK_SAFE:-${XUIDB}.backup.*})"
     systemctl start x-ui 2>/dev/null || true
   fi
 }
@@ -2419,6 +2461,16 @@ cmd_install() {
 
   # --- [2/10] Проверки окружения ---
   echo "=== [2/10] Проверки окружения ==="
+  # v0.6.4: порт SSH нужен для ufw на [3/10]; определяем заранее. Не определился — стоп ДО включения ufw:
+  # лучше остановить установку, чем включить фильтр и отрезать доступ по SSH.
+  SSH_PORTS=$(lucx_detect_ssh_ports) || { echo "ОШИБКА: исправь SSH_PORT и запусти заново."; exit 1; }
+  if [[ -z "${SSH_PORTS// /}" ]]; then
+    echo "ОШИБКА: не удалось определить порт SSH (sshd/dropbear не виден в ss, sshd -T пуст, запуск не по SSH)."
+    echo "        ufw не включаю, чтобы не отрезать доступ к серверу. Укажи порт явно и запусти заново:"
+    echo "        sudo SSH_PORT=<порт> bash $0 install"
+    exit 1
+  fi
+  echo "  SSH-порт(ы): ${SSH_PORTS}"
   for d in "$DOMAIN" "$REALITY_DOMAIN"; do
     resolved=$(dig +short A "$d" @1.1.1.1 | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
     if [[ -z "$resolved" ]]; then
@@ -2536,19 +2588,17 @@ cmd_install() {
   # после "ufw --force enable". Открываются все порты, на которых sshd слушает.
   # ufw allow БЕЗ "|| true": упасть до --force enable безопаснее, чем включить
   # ufw без подтверждённого SSH-правила.
-  SSH_PORTS=$(ss -tlnp 2>/dev/null | grep 'sshd' | grep -oP ':\K[0-9]+(?= )' | sort -u || true)
-  if [[ -n "$SSH_PORTS" ]]; then
-    for p in $SSH_PORTS; do
-      ufw allow "${p}/tcp"
-      echo "  ufw: sshd слушает ${p}/tcp — открыл ${p}/tcp"
-    done
-    if [[ ! "$SSH_PORTS" =~ (^|[[:space:]])22([[:space:]]|$) ]]; then
-      echo "  ВНИМАНИЕ: SSH на нестандартном порту(ах): $(echo $SSH_PORTS) — 22 НЕ открывал."
-    fi
-  else
-    ufw allow 22/tcp || true
-    echo "  ufw: sshd не определён по ss — открыл 22/tcp по умолчанию."
-    echo "  ВНИМАНИЕ: ЕСЛИ SSH НА ДРУГОМ ПОРТУ — после enable доступ отрежется. Проверь!"
+  # v0.6.4: SSH_PORTS определены на [2/10] (ss, sshd -T, порт текущего подключения или SSH_PORT); пусто = стоп там же
+  if [[ -z "${SSH_PORTS// /}" ]]; then
+    echo "ОШИБКА: порт SSH неизвестен — ufw не включаю. sudo SSH_PORT=<порт> bash $0 install"
+    exit 1
+  fi
+  for p in $SSH_PORTS; do
+    ufw allow "${p}/tcp"
+    echo "  ufw: SSH ${p}/tcp — открыл ${p}/tcp"
+  done
+  if [[ ! "$SSH_PORTS" =~ (^|[[:space:]])22([[:space:]]|$) ]]; then
+    echo "  ВНИМАНИЕ: SSH на нестандартном порту(ах): $(echo $SSH_PORTS) — 22 НЕ открывал."
   fi
   ufw allow 80/tcp
   ufw allow 443/tcp
@@ -2973,7 +3023,7 @@ EOF
 <section class="visit" id="visit">
   <h2>Come stand at the <i>bar</i> while we brew it.</h2>
   <p>No loyalty app, no seasonal cup sizes with made-up names. Just tell us what you usually drink and we'll get you closer to something better.</p>
-  <a class="btn" href="mailto:hello@rootandridge.coffee">hello@rootandridge.coffee</a>
+  <a class="btn" href="#contact">hello@rootandridge.coffee</a>
 </section>
 </main>
 <footer><div>Root &amp; Ridge Coffee Roastery</div><div>Roasted fresh, sold slow</div></footer>
@@ -3089,7 +3139,7 @@ DECOYTPL01
 <section class="cta" id="cta">
   <h2>Point it at one queue. See if it earns the second.</h2>
   <p>No sales call required for the first workspace. Bring your own SQS or Redis connection string and you're tracing jobs in minutes.</p>
-  <a class="btn" href="mailto:team@pallet.dev">Get an API key</a>
+  <a class="btn" href="#contact">Get an API key</a>
 </section>
 </main>
 <footer><div>pallet.dev</div><div>Built by three people who got tired of grep</div></footer>
@@ -3280,7 +3330,7 @@ DECOYTPL03
 <section class="join" id="join">
   <h2>No code required anymore. Just curiosity.</h2>
   <p>We run a free study group before every license exam session — bring a radio if you have one, borrow one of ours if you don't.</p>
-  <a class="btn" href="mailto:secretary@signalhillradio.club">secretary@signalhillradio.club</a>
+  <a class="btn" href="#contact">secretary@signalhillradio.club</a>
 </section>
 </main>
 <footer><div>Signal Hill Radio Society</div><div>Clubhouse open Tuesdays, 19:00–22:00</div></footer>
@@ -3339,7 +3389,7 @@ DECOYTPL04
   <div class="cell"><div class="tag">Reception, dance floor</div></div>
 </section>
 <section class="about" id="about"><div class="label">About</div><p>I shoot the parts nobody stages — the walk between ceremony and reception, the look someone gives when they think the camera's already down.</p></section>
-<section class="book" id="book"><h2>Booking one wedding per weekend, on purpose.</h2><p>I only take one date at a time so I can actually edit properly, which means dates go fast in high season. Reach out even if it's a long way off.</p><a class="btn" href="mailto:iris@iriskovac.photo">Check my calendar</a></section>
+<section class="book" id="book"><h2>Booking one wedding per weekend, on purpose.</h2><p>I only take one date at a time so I can actually edit properly, which means dates go fast in high season. Reach out even if it's a long way off.</p><a class="btn" href="#contact">Check my calendar</a></section>
 </main>
 <footer><div>Iris Kovac Photography</div><div>Based in Split, working further out</div></footer>
 </body>
@@ -3407,7 +3457,7 @@ DECOYTPL05
 <section class="visit" id="visit">
   <h2>Come early, or come tomorrow.</h2>
   <p>No online ordering — we bake what the day needs, not what a queue predicts. Cash and card both fine.</p>
-  <a class="btn" href="mailto:hello@marshandloaf.bakery">Ask about standing orders</a>
+  <a class="btn" href="#contact">Ask about standing orders</a>
 </section>
 </main>
 <footer><div>Marsh &amp; Loaf</div><div>Open Tue–Sat, 7am until sold out</div></footer>
@@ -3558,7 +3608,7 @@ DECOYTPL07
 <section class="cta" id="register">
   <h2>We keep it to sixty people.</h2>
   <p>No sponsor booths, no recorded talks. Tell us in a couple of sentences what you actually monitor and we'll get back to you.</p>
-  <a class="btn" href="mailto:hello@fieldworkconf.org">Request an invite</a>
+  <a class="btn" href="#contact">Request an invite</a>
 </section>
 </main>
 <footer><div>Fieldwork ${CONF_YEAR}</div><div>Organized by working field ecologists, not a conference company</div></footer>
@@ -3636,7 +3686,7 @@ DECOYTPL08
 <section class="contact" id="contact">
   <h2>Bring us the room that annoys you most.</h2>
   <p>We take on a small number of projects at a time — usually four running at once, no more.</p>
-  <a class="btn" href="mailto:studio@greywacke.design">Start a project</a>
+  <a class="btn" href="#contact">Start a project</a>
 </section>
 </main>
 <footer><div>Greywacke Studio</div><div>Renovation-focused, four projects at a time</div></footer>
@@ -3709,7 +3759,7 @@ DECOYTPL09
 <section class="season" id="volunteer">
   <h2>The waiting list moves faster if you volunteer.</h2>
   <p>We run a shared compost system, a tool shed, and a Saturday work morning — showing up counts, even before you have your own plot.</p>
-  <a class="btn" href="mailto:hello@elmstreetgarden.org">Join the waiting list</a>
+  <a class="btn" href="#contact">Join the waiting list</a>
 </section>
 </main>
 <footer><div>Elm Street Community Garden</div><div>Open dawn to dusk, gate code shared with plot holders</div></footer>
@@ -3798,7 +3848,7 @@ DECOYTPL10
   <div class="eyebrow">Recruitment</div>
   <h2>Flying solo gets <span>old fast.</span></h2>
   <p>No minimum rank, no combat rating requirement. If your ship holds air, you're already qualified.</p>
-  <a class="btn" href="mailto:wing@surelite.store">wing@surelite.store</a>
+  <a class="btn" href="#contact">wing@surelite.store</a>
 </section>
 </main>
 <footer><div class="brand">SureLite Wing</div><div>Independent player squadron · not affiliated with Frontier Developments</div></footer>
@@ -3872,7 +3922,7 @@ DECOYTPL11
 </section>
 <section id="contact">
   <div class="section-head"><h2>Start a conversation</h2><p>No discovery calls, no decks. Send a couple of sentences about what's not working and we'll reply within a day or two.</p></div>
-  <a class="btn" href="mailto:hello@northfold.studio">hello@northfold.studio</a>
+  <a class="btn" href="#contact">hello@northfold.studio</a>
 </section>
 </main>
 <footer><div>Northfold Studio</div><div>Remote-first, small by design</div></footer>
@@ -5110,7 +5160,7 @@ cmd_healthcheck() {
     elif [[ -n "$NGINX443_PID" ]] && listener_cmdline_has "$NGINX443_PID" "nginx"; then
       check "nginx слушает 443 (подтверждено, pid ${NGINX443_PID})" ok
     elif [[ -n "$NGINX443_PID" ]]; then
-      NGINX443_CMD=$(tr '\0' ' ' < "/proc/${NGINX443_PID}/cmdline" 2>/dev/null | head -c 80)
+      NGINX443_CMD=$(tr '\0' ' ' < "/proc/${NGINX443_PID}/cmdline" 2>/dev/null | head -c 80 || true)
       check "На 443 слушает НЕ nginx (pid ${NGINX443_PID}: ${NGINX443_CMD})" fail
     else
       # v0.3.3: раньше здесь была отдельная ветка "ss ... 0.0.0.0:443 .*
@@ -5129,7 +5179,7 @@ cmd_healthcheck() {
   if [[ -n "$REALITY443_PID" ]] && listener_cmdline_has "$REALITY443_PID" "xray"; then
     check "Процесс слушает 127.0.0.1:443 (подтверждено xray, pid ${REALITY443_PID})" ok
   elif [[ -n "$REALITY443_PID" ]]; then
-    REALITY443_CMD=$(tr '\0' ' ' < "/proc/${REALITY443_PID}/cmdline" 2>/dev/null | head -c 80)
+    REALITY443_CMD=$(tr '\0' ' ' < "/proc/${REALITY443_PID}/cmdline" 2>/dev/null | head -c 80 || true)
     check "На 127.0.0.1:443 слушает НЕ xray (pid ${REALITY443_PID}: ${REALITY443_CMD})" fail
   else
     check "Никто не слушает 127.0.0.1:443 — Reality не поднят" fail
@@ -5189,7 +5239,7 @@ cmd_healthcheck() {
   if [[ -n "$PUBLIC80_PID" ]] && listener_cmdline_has "$PUBLIC80_PID" "nginx"; then
     check "Публичный :80 подтверждён как nginx (pid ${PUBLIC80_PID})" ok
   elif [[ -n "$PUBLIC80_PID" ]]; then
-    PUBLIC80_CMD=$(tr '\0' ' ' < "/proc/${PUBLIC80_PID}/cmdline" 2>/dev/null | head -c 80)
+    PUBLIC80_CMD=$(tr '\0' ' ' < "/proc/${PUBLIC80_PID}/cmdline" 2>/dev/null | head -c 80 || true)
     check "На публичном :80 слушает НЕ nginx (pid ${PUBLIC80_PID}: ${PUBLIC80_CMD}) — возможно Cover site" fail
   else
     check "Публичный :80 не прослушивается ни одним процессом" warn
@@ -5386,7 +5436,7 @@ cmd_healthcheck() {
   # ответ (сетевой флейк, см. legacy-wan-ip) — WARN, не FAIL.
   if [[ -n "${SERVER_IP:-}" ]]; then
     for d in "$DOMAIN" "$REALITY_DOMAIN"; do
-      disk_exp=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/${d}/fullchain.pem" 2>/dev/null | cut -d= -f2)
+      disk_exp=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/${d}/fullchain.pem" 2>/dev/null | cut -d= -f2 || true)
       live_exp=$(curl -kvsI --max-time 8 "https://${d}" --resolve "${d}:443:${SERVER_IP}" -o /dev/null 2>&1 | grep -oP 'expire date:\s*\K.*' | head -n1 || true)
       if [[ -z "$disk_exp" ]]; then
         check "Сверка серта ${d}: серта нет на диске — пропуск (поймано выше)" warn
@@ -5452,7 +5502,7 @@ cmd_healthcheck() {
 
   echo "=== [7] Reality inbound в базе ==="
   if [[ -f "$XUIDB" ]]; then
-    backup_count=$(ls -1 "${XUIDB}.backup."* 2>/dev/null | wc -l)
+    backup_count=$(ls -1 "${XUIDB}.backup."* 2>/dev/null | wc -l || true)
     [[ "$backup_count" -gt 0 ]] && check "Бэкап(ы) БД: ${backup_count} шт." ok || check "Бэкапов БД не найдено" warn
 
     cnt=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbounds WHERE protocol='vless';" 2>/dev/null || echo 0)
@@ -5819,7 +5869,8 @@ cmd_healthcheck() {
   # открывает в ufw именно те порты, на которых слушает sshd; healthcheck —
   # отдельный прогон, SSH_PORTS из install тут не существует. Детекция та же,
   # что в install; фоллбэк "22" — как в install при невидимом sshd.
-  HC11_SSH_PORTS=$(ss -tlnp 2>/dev/null | grep 'sshd' | grep -oP ':\K[0-9]+(?= )' | sort -u || true)
+  HC11_SSH_PORTS=$(lucx_detect_ssh_ports 2>/dev/null || true)   # v0.6.4: тот же набор источников, что у install (ss, sshd -T, SSH_PORT)
+  [[ -n "${HC11_SSH_PORTS// /}" ]] || HC11_SSH_PORTS=$(SSH_PORT="" lucx_detect_ssh_ports 2>/dev/null || true)   # М21: кривой SSH_PORT в окружении не должен прятать реальные порты
   HC11_ALLOW_TCP=" 80 443 "
   if [[ -n "$HC11_SSH_PORTS" ]]; then
     for HC11_P in $HC11_SSH_PORTS; do HC11_ALLOW_TCP+="${HC11_P} "; done
@@ -5863,7 +5914,7 @@ cmd_healthcheck() {
     HC11_PID=$(grep -oP 'pid=\K[0-9]+' <<<"${HC11_REST}" | head -n1 || true)
     HC11_NAME="-"
     if [[ -n "$HC11_PID" && -r "/proc/${HC11_PID}/cmdline" ]]; then
-      HC11_NAME=$(tr '\0' ' ' < "/proc/${HC11_PID}/cmdline" 2>/dev/null | awk '{print $1}')
+      HC11_NAME=$(tr '\0' ' ' < "/proc/${HC11_PID}/cmdline" 2>/dev/null | awk '{print $1}' || true)
       HC11_NAME="${HC11_NAME##*/}"
       if [[ -z "$HC11_NAME" ]]; then HC11_NAME="-"; fi
     fi
@@ -5888,7 +5939,7 @@ cmd_healthcheck() {
     HC11_PID=$(grep -oP 'pid=\K[0-9]+' <<<"${HC11_REST}" | head -n1 || true)
     HC11_NAME="-"
     if [[ -n "$HC11_PID" && -r "/proc/${HC11_PID}/cmdline" ]]; then
-      HC11_NAME=$(tr '\0' ' ' < "/proc/${HC11_PID}/cmdline" 2>/dev/null | awk '{print $1}')
+      HC11_NAME=$(tr '\0' ' ' < "/proc/${HC11_PID}/cmdline" 2>/dev/null | awk '{print $1}' || true)
       HC11_NAME="${HC11_NAME##*/}"
       if [[ -z "$HC11_NAME" ]]; then HC11_NAME="-"; fi
     fi
@@ -6051,6 +6102,13 @@ cmd_healthcheck() {
 # ещё не переключена), правит listen-строку в stream-конфиге (обе формы:
 # legacy explicit и отозванный wildcard), бэкапит конфиг, валидирует,
 # перезапускает nginx и проверяет факт бинда через ss. Идемпотентен.
+# v0.6.4: единая правка listen в stream-роутере (rebind-ip и restore): только `listen [IPv4:]443;`;
+# 0 = после правки в файле есть listen <IP>:443;
+stream_set_listen_ip() {  # $1=IPv4 $2=файл
+  sed -i -E "s/^(\s*)listen\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:)?443;/\1listen $1:443;/" "$2"
+  grep -qE "^\s*listen\s+${1//./\\.}:443;" "$2"
+}
+
 cmd_rebind_ip() {
   if [[ $EUID -ne 0 ]]; then
     echo "Запусти от root: sudo bash $0 rebind-ip"
@@ -6068,6 +6126,15 @@ cmd_rebind_ip() {
   fi
   if [[ -z "$SERVER_IP" ]]; then
     echo "ОШИБКА: не удалось определить публичный IP."
+    exit 1
+  fi
+  if ! [[ "$SERVER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "ОШИБКА: '${SERVER_IP}' — не IPv4-адрес. Ничего не изменено."
+    exit 1
+  fi
+  if command -v ip >/dev/null 2>&1 && ! ip -4 -o addr show 2>/dev/null | grep -qwF "$SERVER_IP"; then
+    echo "СТОП: ${SERVER_IP} не назначен ни одному интерфейсу сервера (NAT или другой исходящий адрес): nginx не сможет его слушать."
+    echo "      Ничего не изменено. Если нужен другой адрес — укажи тот, что виден в 'ip -4 addr'."
     exit 1
   fi
 
@@ -6090,25 +6157,35 @@ cmd_rebind_ip() {
     fi
   done
 
-  if grep -qE "listen ${SERVER_IP}:443;" "$STREAM_CONF"; then
+  if grep -qE "^\s*listen\s+${SERVER_IP//./\\.}:443;" "$STREAM_CONF"; then
     echo "listen-строка уже указывает на ${SERVER_IP} — ничего не меняю."
     exit 0
   fi
 
-  cp "$STREAM_CONF" "${STREAM_CONF}.backup.$(date +%s)"
-  # В server{} ровно одна listen-строка — меняем любую форму (explicit IP или wildcard)
-  sed -i -E "s/^\s*listen\s+[^;]*443;/        listen ${SERVER_IP}:443;/" "$STREAM_CONF"
-  if ! grep -qE "listen ${SERVER_IP}:443;" "$STREAM_CONF"; then
-    echo "ОШИБКА: sed не применился — смотри ${STREAM_CONF} (бэкап: ${STREAM_CONF}.backup.*)"
+  local rb_bak; rb_bak="${STREAM_CONF}.backup.$(date +%s)"
+  cp -p "$STREAM_CONF" "$rb_bak"
+  # меняется только строка `listen [IP:]443;` (explicit IP или wildcard); других строк sed не касается
+  if ! stream_set_listen_ip "$SERVER_IP" "$STREAM_CONF"; then
+    cp -p "$rb_bak" "$STREAM_CONF"
+    echo "ОШИБКА: в ${STREAM_CONF} нет строки listen [IP:]443; — ничего не изменено."
     exit 1
   fi
   echo "listen-строка обновлена -> ${SERVER_IP}:443"
 
-  nginx -t || { echo "ОШИБКА: nginx -t не прошёл. Откат: cp ${STREAM_CONF}.backup.* ${STREAM_CONF}"; exit 1; }
-  systemctl restart nginx
+  if ! nginx -t; then
+    cp -p "$rb_bak" "$STREAM_CONF"
+    echo "ОШИБКА: nginx -t не прошёл — прежний stream-конфиг возвращён."
+    exit 1
+  fi
+  if ! systemctl restart nginx; then
+    cp -p "$rb_bak" "$STREAM_CONF"; systemctl restart nginx || true
+    echo "ОШИБКА: nginx не перезапустился — прежний stream-конфиг возвращён."
+    exit 1
+  fi
   sleep 1
-  if ! ss -tlnp 2>/dev/null | grep -qE "${SERVER_IP//./\.}:443\b.*nginx"; then
-    echo "ОШИБКА: nginx не подтверждён на ${SERVER_IP}:443 после restart:"
+  if command -v ss >/dev/null 2>&1 && ! grep -qE "${SERVER_IP//./\.}:443\b.*nginx" <<<"$(ss -tlnp 2>/dev/null)"; then
+    cp -p "$rb_bak" "$STREAM_CONF"; systemctl restart nginx || true
+    echo "ОШИБКА: nginx не подтверждён на ${SERVER_IP}:443 после restart — прежний stream-конфиг возвращён:"
     ss -tlnp | grep ':443 ' || true
     exit 1
   fi
@@ -6314,6 +6391,16 @@ cmd_panel_path() {
   local new
   if [[ -z "$want" ]]; then
     if [[ "$cur" != "/panel/" ]]; then
+      # v0.6.4: после прерванной смены пути nginx и БД уже на новом пути, а в creds остался старый URL — выравниваем по БД
+      local cu
+      cu=$(grep -m1 '^URL:' "$CREDS_FILE" | sed -E 's|^URL: https://[^/]+||' || true)
+      [[ -n "$cu" && "$cu" != */ ]] && cu="${cu}/"
+      if [[ -n "$cu" && "$cu" != "$cur" ]]; then
+        mkdir -p /root/.lucx-panelpath-backup && chmod 700 /root/.lucx-panelpath-backup
+        cp -a "$CREDS_FILE" "/root/.lucx-panelpath-backup/credentials.pre-sync.$(date +%s)"
+        sed -i -E "s|^(URL: https://[^/]+)/.*|\1${cur}|" "$CREDS_FILE"
+        echo "Исправил строку URL в ${CREDS_FILE}: путь панели по БД и nginx — ${cur} (было ${cu})."
+      fi
       echo "Путь панели уже нестандартный (${cur}) — ничего не меняю."
       echo "Задать другой: sudo bash $0 panel-path /новый-путь/"
       exit 0
@@ -6365,24 +6452,42 @@ cmd_panel_path() {
   sqlite3 "$XUIDB" ".backup ${bk}/x-ui.db"
   echo "Бэкап: ${bk}"
 
+  # v0.6.4: откат при ЛЮБОМ выходе после начала правок (ошибка, Ctrl+C, обрыв SSH): состояние — в глобальных переменных,
+  # потому что ловушка выхода срабатывает уже после выхода из функции
+  PP_BK="$bk"; PP_NG="$ng"; PP_CUR="$cur"; PP_XUI="$XUI_CLI"; PP_DOMAIN="$DOMAIN"; PP_ARMED=0
   pp_rollback() { # $1 причина
-    echo "ОТКАТ: $1"
-    cp -a "${bk}/nginx.conf" "$ng"
-    cp -a "${bk}/credentials" "$CREDS_FILE"
-    local old_nos="${cur#/}"
+    set +e
+    PP_ARMED=0
+    echo "ОТКАТ: $1" 2>/dev/null
+    cp -a "${PP_BK}/nginx.conf" "$PP_NG"
+    cp -a "${PP_BK}/credentials" "$CREDS_FILE"
+    local old_nos="${PP_CUR#/}"
     old_nos="${old_nos%/}"
-    "$XUI_CLI" setting -webBasePath "$old_nos" >/dev/null 2>&1 || true
-    if nginx -t >/dev/null 2>&1; then systemctl reload nginx || true; fi
-    systemctl restart x-ui || true
+    "$PP_XUI" setting -webBasePath "$old_nos" >/dev/null 2>&1
+    # если CLI не вернул путь (он же мог отказать и в прошлый раз) — возвращаем БД из бэкапа
+    local g
+    g=$(sqlite3 "$XUIDB" "SELECT value FROM settings WHERE key='webBasePath' LIMIT 1;" 2>/dev/null)
+    g="/${g#/}"; g="${g%/}/"
+    if [[ "$g" != "$PP_CUR" && -f "${PP_BK}/x-ui.db" ]]; then
+      systemctl stop x-ui
+      cp -a "${PP_BK}/x-ui.db" "$XUIDB"
+      rm -f "${XUIDB}-wal" "${XUIDB}-shm"
+    fi
+    if nginx -t >/dev/null 2>&1; then systemctl reload nginx; fi
+    systemctl restart x-ui
     sleep 8
     if systemctl is-active --quiet x-ui; then
-      echo "После отката панель на прежнем адресе: https://${DOMAIN}${cur}  (бэкап: ${bk})"
+      echo "После отката панель на прежнем адресе: https://${PP_DOMAIN}${PP_CUR}  (бэкап: ${PP_BK})" 2>/dev/null
     else
-      echo "ВНИМАНИЕ: после отката x-ui НЕ запущен. Смотри: journalctl -u x-ui -n 50 --no-pager ; восстановление из бэкапа: ${bk}"
-      journalctl -u x-ui -n 20 --no-pager 2>/dev/null || true
+      echo "ВНИМАНИЕ: после отката x-ui НЕ запущен. Смотри: journalctl -u x-ui -n 50 --no-pager ; восстановление из бэкапа: ${PP_BK}" 2>/dev/null
+      journalctl -u x-ui -n 20 --no-pager 2>/dev/null
     fi
     exit 1
   }
+  trap '' HUP PIPE
+  trap 'pp_rollback "прервано (Ctrl+C/сигнал)"' INT TERM
+  trap '[[ "${PP_ARMED:-0}" == "1" ]] && pp_rollback "неожиданный сбой"; lucx_xui_guard_fire' EXIT
+  PP_ARMED=1
 
   sed -i "s|location ${cur} {|location ${new} {|" "$ng"
   grep -qF "location ${new} {" "$ng" || pp_rollback "правка nginx не применилась"
@@ -6410,16 +6515,22 @@ cmd_panel_path() {
   sed -i -E "s|^(URL: https://[^/]+)/.*|\1${new}|" "$CREDS_FILE"
 
   local sip ext old_ext
-  sip=$(get_server_ip)
+  # IP для проверки снаружи — адрес, на котором реально слушает nginx (на сервере с несколькими IP ipify даёт другой)
+  sip=$(grep -oP '^\s*listen\s+\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(?=:443;)' /etc/nginx/stream-sni-router.conf 2>/dev/null | grep -v '^0\.0\.0\.0$' | head -n1 || true)
+  [[ -n "$sip" ]] || sip=$(get_server_ip)
   if [[ -n "$sip" ]]; then
     ext=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' --resolve "${DOMAIN}:443:${sip}" "https://${DOMAIN}${new}" 2>/dev/null || true)
     [[ "$ext" == "200" ]] || pp_rollback "снаружи новый адрес не открывается (код ${ext})"
     old_ext=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' --resolve "${DOMAIN}:443:${sip}" "https://${DOMAIN}${cur}" 2>/dev/null || true)
     echo "Проверка снаружи: новый адрес = ${ext}, старый = ${old_ext} (ждём 200 и не 200)"
+    [[ "$old_ext" == "200" ]] && echo "WARN: старый адрес всё ещё открывает панель — проверь: nginx -t && systemctl reload nginx"
   else
     echo "WARN: публичный IP не определён — проверка снаружи пропущена (смотри healthcheck)."
   fi
 
+  PP_ARMED=0              # всё проверено: откат больше не нужен
+  trap - HUP PIPE INT TERM
+  trap lucx_xui_guard_fire EXIT
   echo ""
   echo "OK: путь панели изменён."
   echo "  Новый адрес: https://${DOMAIN}${new}"
@@ -7264,7 +7375,8 @@ create_xhttp_inbound() {
   sleep 1
   XH_BAK="${XUIDB}.backup.$(date +%s)"
   if ! cp -a "$XUIDB" "$XH_BAK"; then
-    echo "  ОШИБКА: не удалось сделать бэкап БД (${XH_BAK}) — диск полон? БД не тронута."
+    rm -f "$XH_BAK"; XH_BAK=""   # частичную копию не оставляем: откат из ловушки не должен ставить её поверх рабочей БД
+    echo "  ОШИБКА: не удалось сделать бэкап БД — диск полон? БД не тронута."
     lucx_xui_start || true
     return 1
   fi
@@ -7305,19 +7417,41 @@ create_xhttp_inbound() {
 # откат целиком: stream-конфиг из бэкапа, БД из бэкапа (без XHTTP-инбаунда), вхосты nginx убраны.
 # Сертификат Let's Encrypt остаётся (безвреден, переиспользуется при повторе).
 xhttp_rollback_all() { # stream_backup db_backup
+  set +e   # v0.6.4: откат не должен обрываться на первой ошибке (вызывается и из ловушки выхода)
   local sbak="$1" dbak="${2:-}"
   [[ -n "$sbak" && -f "$sbak" ]] && cp -a "$sbak" /etc/nginx/stream-sni-router.conf
+  rm -f /etc/nginx/stream-sni-router.conf.new
   xhttp_remove_vhosts
+  # возвращаем только целую копию БД: недописанная (диск полон) не должна затереть рабочую
+  if [[ -n "$dbak" && -f "$dbak" && "$(sqlite3 "$dbak" 'PRAGMA integrity_check;' 2>/dev/null)" != "ok" ]]; then
+    echo "  ВНИМАНИЕ: бэкап БД ${dbak} повреждён — БД не трогаю"
+    dbak=""
+  fi
   if [[ -n "$dbak" && -f "$dbak" ]]; then
     lucx_xui_stop
     sleep 1
     cp -a "$dbak" "$XUIDB"
+    rm -f "${XUIDB}-wal" "${XUIDB}-shm"
     lucx_xui_start || echo "  ВНИМАНИЕ: x-ui не запустился после отката — journalctl -u x-ui -n 50"
     sleep 2
   fi
   if nginx -t >/dev/null 2>&1; then
     systemctl reload nginx 2>/dev/null || true
   fi
+}
+
+# v0.6.4: откат add-xhttp при ЛЮБОМ выходе после начала правок (ошибка, Ctrl+C, обрыв SSH): без него сбой между двумя
+# правками stream-конфига оставлял на диске конфиг, с которым nginx не поднимется после перезагрузки.
+XH_ARMED=0; XH_SBAK=""
+xhttp_exit_trap() {
+  set +e
+  if [[ "${XH_ARMED:-0}" == "1" ]]; then
+    XH_ARMED=0
+    echo "Откат add-xhttp: возвращаю nginx-конфиг, БД и вхосты (схема как была; сертификат оставлен)."
+    xhttp_rollback_all "$XH_SBAK" "${XH_BAK:-}"
+    systemctl is-active --quiet x-ui && echo "x-ui active, схема как была." || echo "ВНИМАНИЕ: x-ui не active после отката — journalctl -u x-ui -n 50"
+  fi
+  lucx_xui_guard_fire
 }
 
 cmd_add_xhttp() {
@@ -7408,6 +7542,9 @@ cmd_add_xhttp() {
   sbak="/root/stream-sni-router.conf.pre-xhttp-${stamp}"
   cp -a "$stream_conf" "$sbak"
   echo "Бэкап nginx-конфига: ${sbak}"
+  XH_SBAK="$sbak"; XH_ARMED=1
+  trap '' HUP PIPE            # обрыв SSH → откат (ловушка ниже вернёт прежнее состояние)
+  trap xhttp_exit_trap EXIT
 
   # 1) nginx :80 — ACME и редирект для нового имени (отдельный файл, 80-redirect.conf не трогаем)
   mkdir -p "${webroot}/.well-known/acme-challenge"
@@ -7488,17 +7625,18 @@ EOF
   # 4) инбаунд + клиент
   create_xhttp_inbound || { xhttp_remove_vhosts; exit 1; }
   # 5) stream: имя -> xhttp_backend
-  sed -i "/^[[:space:]]*default[[:space:]]\+reality_backend;/i\\        ${xdom}        xhttp_backend;" "$stream_conf"
-  sed -i "/^[[:space:]]*upstream reality_backend[[:space:]]*{/a\\    upstream xhttp_backend { server 127.0.0.1:${XHTTP_PORT}; }" "$stream_conf"
+  # обе правки на копии, подмена одной операцией: сбой между ними не оставит полуготовый конфиг
+  cp -a "$stream_conf" "${stream_conf}.new"
+  sed -i "/^[[:space:]]*default[[:space:]]\+reality_backend;/i\\        ${xdom}        xhttp_backend;" "${stream_conf}.new"
+  sed -i "/^[[:space:]]*upstream reality_backend[[:space:]]*{/a\\    upstream xhttp_backend { server 127.0.0.1:${XHTTP_PORT}; }" "${stream_conf}.new"
+  mv -f "${stream_conf}.new" "$stream_conf"
   if ! nginx -t >/dev/null 2>&1; then
     echo "ОШИБКА: nginx -t не прошёл после правки stream-конфига — откатываю всё."
     { nginx -t 2>&1 | tail -3 | sed 's/^/    /'; } || true
-    xhttp_rollback_all "$sbak" "$XH_BAK"
     exit 1
   fi
   if ! systemctl reload nginx; then
     echo "ОШИБКА: reload nginx не прошёл после правки stream-конфига — откатываю всё."
-    xhttp_rollback_all "$sbak" "$XH_BAK"
     exit 1
   fi
   sleep 1
@@ -7522,10 +7660,12 @@ EOF
   selftest_443 0 "$fuuid" "$fpbk" "$fsid" || ok=1
   if [[ "$ok" != "0" ]]; then
     echo "ОШИБКА: самотест не прошёл — возвращаю nginx-конфиг, БД и вхосты (схема как была; сертификат ${xdom} оставлен)."
-    xhttp_rollback_all "$sbak" "$XH_BAK"
-    systemctl is-active --quiet x-ui && echo "x-ui active, схема как была." || echo "ВНИМАНИЕ: x-ui не active после отката — journalctl -u x-ui -n 50"
+    echo "  (БД возвращается на момент до add-xhttp: изменения за последние минуты — трафик, новые клиенты — не сохранятся.)"
     exit 1
   fi
+  XH_ARMED=0                  # самотест пройден: откат больше не нужен
+  trap - HUP PIPE
+  trap lucx_xui_guard_fire EXIT
   echo "$VERSION" > /root/.lucx-script-version
   local penc link
   penc="%2F${XH_PATH#/}"
@@ -7639,6 +7779,455 @@ cmd_remove_xhttp() {
   fi
 }
 
+# ================== BACKUP / RESTORE (v0.6.4): перенос сервера целиком ==================
+# backup  — зашифрованный архив: БД панели (клиенты, инбаунды, настройки), creds, конфиги nginx схемы, конфиги AWG.
+#           НЕ входит: сертификаты (на новом сервере install выпустит свои; --with-certs кладёт и их), заглушки (их ставит install),
+#           бот управления (add-bot заново), сам x-ui/xray/AWG-модуль (ставит install).
+# restore — на сервер, где УЖЕ выполнен install с теми же доменами. Порядок переноса: backup -> A-записи на новый IP ->
+#           install на новом сервере (те же домены) -> restore. Версия панели на новом сервере должна быть не ниже архивной.
+
+BK_FORMAT="1"
+
+bk_get_pass() {  # $1 = confirm(1|0)
+  local p1 p2
+  if [[ -n "${LUCX_BACKUP_PASS:-}" ]]; then
+    if [[ "${1:-0}" == "1" && ${#LUCX_BACKUP_PASS} -lt 8 ]]; then echo "ОШИБКА: пароль короче 8 символов."; return 1; fi
+    return 0
+  fi
+  read -rsp "Пароль архива: " p1 || p1=""; echo
+  [[ -n "$p1" ]] || { echo "ОШИБКА: пустой пароль."; return 1; }
+  if [[ "${1:-0}" == "1" ]]; then
+    read -rsp "Повтори пароль: " p2 || p2=""; echo
+    [[ "$p1" == "$p2" ]] || { echo "ОШИБКА: пароли не совпали."; return 1; }
+    [[ ${#p1} -ge 8 ]] || { echo "ОШИБКА: пароль короче 8 символов."; return 1; }
+  fi
+  LUCX_BACKUP_PASS="$p1"
+  export LUCX_BACKUP_PASS
+}
+
+bk_xui_version() { /usr/local/x-ui/x-ui -v 2>/dev/null | head -1 | tr -d '\r' || true; }
+
+# bk_ver_ge A B: истина, если версия A >= B (sort -V)
+bk_ver_ge() { [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" == "$2" ]]; }
+
+bk_man_get() { grep -m1 "^$2=" "$1" 2>/dev/null | cut -d= -f2- || true; }
+
+# Состояние restore в глобальных переменных: ловушка EXIT должна видеть их после exit внутри функции
+BK_STAGE=""; BK_PART=""; BK_SAFE=""; BK_ARMED=0
+
+# вывод, который не падает при закрытом терминале (обрыв SSH) и дублируется в журнал
+bk_say() {
+  [[ -n "$BK_SAFE" && -d "$BK_SAFE" ]] && { echo "$*" >> "$BK_SAFE/restore.log"; } 2>/dev/null || true
+  echo "$*" 2>/dev/null || true
+}
+
+bk_cleanup() {
+  set +e
+  [[ -n "$BK_STAGE" ]] && rm -rf "$BK_STAGE"
+  [[ -n "$BK_PART" ]] && rm -f "$BK_PART"
+  if [[ "$BK_ARMED" == "1" ]]; then BK_ARMED=0; bk_rollback; fi
+  lucx_xui_guard_fire
+}
+
+# Откат: возвращает каталоги ЗАМЕНОЙ (файлы, появившиеся из архива, удаляются). Не падает на первой ошибке.
+bk_rollback() {
+  set +e
+  local rb_bad=0
+  bk_say "Откат из ${BK_SAFE} ... (последняя ошибка команды: ${BK_ERR:-нет})"
+  lucx_xui_stop 2>/dev/null
+  cp -p "$BK_SAFE/x-ui.db" "${XUIDB}.rb" && mv -f "${XUIDB}.rb" "$XUIDB" || { rb_bad=1; bk_say "ВНИМАНИЕ: не удалось вернуть БД — возьми вручную ${BK_SAFE}/x-ui.db"; }
+  rm -f "${XUIDB}-wal" "${XUIDB}-shm"
+  cp -p "$BK_SAFE/lucx-credentials" "${CREDS_FILE}.rb" && mv -f "${CREDS_FILE}.rb" "$CREDS_FILE" || { rb_bad=1; bk_say "ВНИМАНИЕ: не удалось вернуть creds — возьми вручную ${BK_SAFE}/lucx-credentials"; }
+  local d
+  for d in sites-available sites-enabled conf.d; do
+    [[ -d "$BK_SAFE/nginx/$d" ]] && { rm -rf "/etc/nginx/$d"; cp -a "$BK_SAFE/nginx/$d" /etc/nginx/ || rb_bad=1; }
+  done
+  if [[ -f "$BK_SAFE/nginx/stream-sni-router.conf" ]]; then cp -p "$BK_SAFE/nginx/stream-sni-router.conf" /etc/nginx/
+  elif [[ -f "$BK_SAFE/no-stream" ]]; then rm -f /etc/nginx/stream-sni-router.conf; fi
+  if [[ -d "$BK_SAFE/amneziawg" ]]; then rm -rf /etc/amnezia/amneziawg; cp -a "$BK_SAFE/amneziawg" /etc/amnezia/amneziawg
+  elif [[ -f "$BK_SAFE/no-amneziawg" ]]; then rm -rf /etc/amnezia/amneziawg; fi
+  rm -f /root/.lucx-public-tcp-ports.txt /root/.lucx-public-udp-ports.txt; rm -rf /root/.lucx-mode-backup
+  local sf
+  for sf in .lucx-public-tcp-ports.txt .lucx-public-udp-ports.txt; do
+    [[ -f "$BK_SAFE/state/$sf" ]] && cp -p "$BK_SAFE/state/$sf" /root/
+  done
+  [[ -d "$BK_SAFE/state/lucx-mode-backup" ]] && cp -a "$BK_SAFE/state/lucx-mode-backup" /root/.lucx-mode-backup
+  [[ -f "$BK_SAFE/letsencrypt.tar" ]] && { rm -rf /etc/letsencrypt; tar -C /etc -xf "$BK_SAFE/letsencrypt.tar" || rb_bad=1; }
+  lucx_xui_start
+  if nginx -t >/dev/null 2>&1; then
+    systemctl restart nginx
+    if [[ $rb_bad -eq 0 ]]; then bk_say "Откат выполнен: конфиги и БД возвращены."; else bk_say "Откат выполнен НЕ полностью — см. ВНИМАНИЕ выше; копии в ${BK_SAFE}"; fi
+  else
+    bk_say "ВНИМАНИЕ: после отката nginx -t НЕ проходит — не перезагружай сервер, смотри ${BK_SAFE}"
+  fi
+}
+
+cmd_backup() {
+  local out="" with_certs=0 a
+  for a in "$@"; do
+    case "$a" in
+      --with-certs) with_certs=1 ;;
+      -*) echo "Неизвестный флаг: $a"; echo "Использование: sudo bash $0 backup [файл.lucxbak] [--with-certs]"; exit 1 ;;
+      *) out="$a" ;;
+    esac
+  done
+  if [[ $EUID -ne 0 ]]; then echo "Запусти от root: sudo bash $0 backup"; exit 1; fi
+  if command -v flock >/dev/null 2>&1 && exec 9>/var/lock/lucx-backup.lock; then
+    flock -n 9 || { echo "ОШИБКА: backup/restore уже выполняется."; exit 1; }
+  fi
+  # panel-path меняет nginx, БД и creds по очереди: архив, снятый посередине, получится смешанным
+  if command -v flock >/dev/null 2>&1 && exec 8>/var/lock/lucx-panel-path.lock; then
+    flock -n 8 || { echo "ОШИБКА: сейчас выполняется panel-path — дождись и повтори backup."; exit 1; }
+  fi
+  local t
+  for t in sqlite3 openssl tar sha256sum; do
+    command -v "$t" >/dev/null 2>&1 || { echo "ОШИБКА: не найден ${t}."; exit 1; }
+  done
+  [[ -f "$XUIDB" && -f "$CREDS_FILE" ]] || { echo "ОШИБКА: панель не установлена (${XUIDB} или ${CREDS_FILE} нет)."; exit 1; }
+  read_domains
+  [[ -n "${DOMAIN:-}" ]] || { echo "ОШИБКА: домен панели не определён из ${CREDS_FILE}."; exit 1; }
+
+  local ts host stage
+  ts=$(date +%Y%m%d-%H%M%S); host=$(hostname -s 2>/dev/null || echo host)
+  [[ -n "$out" ]] || out="/root/lucx-backup-${host}-${ts}.lucxbak"
+  [[ -e "$out" ]] && { echo "ОШИБКА: ${out} уже существует."; exit 1; }
+  bk_get_pass 1 || exit 1
+
+  umask 077
+  rm -rf /root/.lucx-bk.* 2>/dev/null || true   # остатки прерванных запусков (там расшифрованные данные)
+  stage=$(mktemp -d /root/.lucx-bk.XXXXXX) || { echo "ОШИБКА: не создать временный каталог."; exit 1; }
+  BK_STAGE="$stage"; BK_PART="${out}.part"
+  trap bk_cleanup EXIT
+  mkdir -p "$stage/data"
+
+  # консистентная копия БД (панель может писать в неё прямо сейчас)
+  sqlite3 "$XUIDB" ".backup '$stage/data/x-ui.db'" || { echo "ОШИБКА: не удалось скопировать БД."; exit 1; }
+  [[ "$(sqlite3 "$stage/data/x-ui.db" 'PRAGMA integrity_check;' 2>/dev/null)" == "ok" ]] \
+    || { echo "ОШИБКА: копия БД не прошла integrity_check — архив не создан."; exit 1; }
+
+  cp -p "$CREDS_FILE" "$stage/data/lucx-credentials"
+  [[ -f /root/.lucx-script-version ]] && cp -p /root/.lucx-script-version "$stage/data/script-version"
+  mkdir -p "$stage/data/nginx/sites-available" "$stage/data/nginx/conf.d"
+  [[ -f /etc/nginx/stream-sni-router.conf ]] && cp -p /etc/nginx/stream-sni-router.conf "$stage/data/nginx/"
+  [[ -f /etc/nginx/conf.d/00-lucx-hash.conf ]] && cp -p /etc/nginx/conf.d/00-lucx-hash.conf "$stage/data/nginx/conf.d/"
+  local f enabled=""
+  for f in /etc/nginx/sites-available/*.conf; do
+    [[ -f "$f" ]] || continue
+    cp -p "$f" "$stage/data/nginx/sites-available/"
+    [[ -L "/etc/nginx/sites-enabled/$(basename "$f")" ]] && enabled+="$(basename "$f") "
+  done
+  local awg_ports=""
+  if [[ -d /etc/amnezia/amneziawg ]]; then
+    cp -a /etc/amnezia/amneziawg "$stage/data/amneziawg"
+    awg_ports=$(grep -hE '^\s*ListenPort\s*=' /etc/amnezia/amneziawg/*.conf 2>/dev/null | sed -E 's/.*=\s*//; s/\s+$//' | sort -u | tr '\n' ' ' || true)
+  fi
+  [[ -f /etc/x-ui/.awg-module-version ]] && cp -p /etc/x-ui/.awg-module-version "$stage/data/awg-module-version"
+  # состояние, которое читают другие команды: осознанно открытые порты (hc [11]) и копии Reality-ключей (add-reality)
+  mkdir -p "$stage/data/state"
+  for f in /root/.lucx-public-tcp-ports.txt /root/.lucx-public-udp-ports.txt; do
+    [[ -f "$f" ]] && cp -p "$f" "$stage/data/state/"
+  done
+  [[ -d /root/.lucx-mode-backup ]] && cp -a /root/.lucx-mode-backup "$stage/data/state/lucx-mode-backup"
+  if [[ $with_certs -eq 1 && -d /etc/letsencrypt/live ]]; then
+    tar -C /etc -cf "$stage/data/letsencrypt.tar" letsencrypt 2>/dev/null || { echo "ОШИБКА: не упаковались сертификаты."; exit 1; }
+  fi
+
+  local xbin xv=""
+  xbin="/usr/local/x-ui/bin/xray-linux-$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')"
+  [[ -x "$xbin" ]] && xv=$("$xbin" -version 2>/dev/null | head -1 | awk '{print $2}' || true)
+  {
+    echo "format=${BK_FORMAT}"
+    echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "host=${host}"
+    echo "script_version=${VERSION}"
+    echo "lucx_version=$(bk_xui_version)"
+    echo "xray_version=${xv}"
+    echo "awg_module_version=$(cat /etc/x-ui/.awg-module-version 2>/dev/null || true)"
+    echo "kernel=$(uname -r)"
+    echo "server_ip=$(get_server_ip 2>/dev/null || true)"
+    echo "domain=${DOMAIN}"
+    echo "reality_domain=${REALITY_DOMAIN:-}"
+    echo "xhttp_domain=$(xhttp_domain_cfg 2>/dev/null || true)"
+    echo "awg_ports=${awg_ports% }"
+    echo "with_certs=${with_certs}"
+    echo "enabled_sites=${enabled% }"
+    echo "db_sha256=$(sha256sum "$stage/data/x-ui.db" | awk '{print $1}')"
+  } > "$stage/MANIFEST"
+  # контрольные суммы всех файлов данных (AES-CBC без MAC: так видна порча/подмена)
+  (cd "$stage/data" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$stage/FILES.sha256"
+
+  tar -C "$stage" -czf "$stage/payload.tgz" MANIFEST FILES.sha256 data || { echo "ОШИБКА: tar."; exit 1; }
+  openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -pass env:LUCX_BACKUP_PASS \
+    -in "$stage/payload.tgz" -out "${out}.part" || { echo "ОШИБКА: шифрование."; exit 1; }
+  chmod 600 "${out}.part"
+  mv "${out}.part" "$out"; BK_PART=""
+
+  local u="${SUDO_USER:-$(logname 2>/dev/null || echo root)}" uh=""
+  uh=$(getent passwd "$u" 2>/dev/null | cut -d: -f6 || true)
+  echo "OK: архив создан: ${out} ($(du -h "$out" | cut -f1))"
+  echo "  панель: $(bk_man_get "$stage/MANIFEST" lucx_version), домен: ${DOMAIN}, сертификаты в архиве: $([[ $with_certs -eq 1 ]] && echo да || echo нет)"
+  echo "  Внутри ключи и клиенты — храни как секрет; пароль архива восстановить нельзя."
+  if [[ "$u" != "root" && -n "$uh" ]]; then
+    echo "  Архив лежит в ${out} (доступен только root). Чтобы скачать под пользователем ${u}:"
+    echo "    sudo cp '${out}' '${uh}/' && sudo chown ${u}: '${uh}/$(basename "$out")'"
+    echo "    scp ${u}@${DOMAIN}:$(basename "$out") .   (порт SSH — свой, если не 22: scp -P)"
+  else
+    echo "  Скачать на свой компьютер:  scp root@${DOMAIN}:${out} .   (или через Termius/SFTP)"
+  fi
+  echo "  Перенос: A-записи на новый IP -> install на новом сервере с теми же доменами -> sudo bash $0 restore <файл>"
+}
+
+cmd_restore() {
+  local in="" assume_yes=0 force=0 use_certs=0 a ans
+  for a in "$@"; do
+    case "$a" in
+      -y|--yes) assume_yes=1 ;;
+      --force) force=1 ;;
+      --certs) use_certs=1 ;;
+      -*) echo "Неизвестный флаг: $a"; echo "Использование: sudo bash $0 restore <файл.lucxbak> [--yes] [--certs] [--force]"; exit 1 ;;
+      *) in="$a" ;;
+    esac
+  done
+  if [[ $EUID -ne 0 ]]; then echo "Запусти от root: sudo bash $0 restore <файл>"; exit 1; fi
+  [[ -n "$in" && -f "$in" ]] || { echo "Использование: sudo bash $0 restore <файл.lucxbak> [--yes] [--certs] [--force]"; exit 1; }
+  if command -v flock >/dev/null 2>&1 && exec 9>/var/lock/lucx-backup.lock; then
+    flock -n 9 || { echo "ОШИБКА: backup/restore уже выполняется."; exit 1; }
+  fi
+  if command -v flock >/dev/null 2>&1 && exec 8>/var/lock/lucx-panel-path.lock; then
+    flock -n 8 || { echo "ОШИБКА: сейчас выполняется panel-path — дождись и повтори."; exit 1; }
+  fi
+  local t
+  for t in sqlite3 openssl tar sha256sum nginx; do
+    command -v "$t" >/dev/null 2>&1 || { echo "ОШИБКА: не найден ${t}."; exit 1; }
+  done
+  [[ -f "$XUIDB" && -f "$CREDS_FILE" && -x /usr/local/x-ui/x-ui ]] \
+    || { echo "ОШИБКА: на этом сервере нет установки. Сначала: sudo bash $0 install (те же домены), потом restore."; exit 1; }
+  read_domains
+
+  bk_get_pass 0 || exit 1
+  umask 077
+  rm -rf /root/.lucx-bk.* 2>/dev/null || true
+  local stage
+  stage=$(mktemp -d /root/.lucx-bk.XXXXXX) || { echo "ОШИБКА: не создать временный каталог."; exit 1; }
+  BK_STAGE="$stage"
+  trap bk_cleanup EXIT
+  if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -pass env:LUCX_BACKUP_PASS -in "$in" -out "$stage/payload.tgz" 2>/dev/null \
+     || ! tar -tzf "$stage/payload.tgz" >/dev/null 2>&1; then
+    echo "ОШИБКА: неверный пароль или повреждённый архив. Сервер не тронут."; exit 1
+  fi
+  if tar -tzf "$stage/payload.tgz" | grep -qE '(^/|(^|/)\.\.(/|$))'; then
+    echo "ОШИБКА: в архиве недопустимые пути (абсолютные или с ..). Сервер не тронут."; exit 1
+  fi
+  mkdir -p "$stage/x"
+  tar -C "$stage/x" --no-same-owner -xzf "$stage/payload.tgz" || { echo "ОШИБКА: распаковка."; exit 1; }
+  local M="$stage/x/MANIFEST" D="$stage/x/data"
+  [[ -f "$M" && -f "$D/x-ui.db" && -f "$stage/x/FILES.sha256" ]] || { echo "ОШИБКА: это не архив lucx backup."; exit 1; }
+  [[ "$(bk_man_get "$M" format)" == "$BK_FORMAT" ]] || { echo "ОШИБКА: формат архива $(bk_man_get "$M" format), эта версия скрипта понимает ${BK_FORMAT}. Обнови скрипт: upgrade."; exit 1; }
+  (cd "$D" && sha256sum -c --quiet "$stage/x/FILES.sha256" >/dev/null 2>&1) \
+    || { echo "ОШИБКА: контрольные суммы файлов в архиве не совпали — архив повреждён. Сервер не тронут."; exit 1; }
+  [[ "$(sha256sum "$D/x-ui.db" | awk '{print $1}')" == "$(bk_man_get "$M" db_sha256)" ]] \
+    || { echo "ОШИБКА: контрольная сумма БД не совпала — архив повреждён."; exit 1; }
+  [[ "$(sqlite3 "$D/x-ui.db" 'PRAGMA integrity_check;' 2>/dev/null)" == "ok" ]] \
+    || { echo "ОШИБКА: БД в архиве не проходит integrity_check."; exit 1; }
+
+  # вложенный tar сертификатов и симлинки: проверяем пути до изменений
+  if [[ -n "$(find "$stage/x" -type l 2>/dev/null)" ]]; then
+    echo "ОШИБКА: в архиве есть симлинки — так не делает скрипт backup. Сервер не тронут."; exit 1
+  fi
+  if [[ -f "$D/letsencrypt.tar" ]] && tar -tf "$D/letsencrypt.tar" | grep -qvE '^letsencrypt(/[^/]+)*/?$|(^|/)\.\.(/|$)'; then
+    echo "ОШИБКА: недопустимые пути в сертификатах архива. Сервер не тронут."; exit 1
+  fi
+  if [[ -f "$D/letsencrypt.tar" ]] && tar -tf "$D/letsencrypt.tar" | grep -qE '(^|/)\.\.(/|$)'; then
+    echo "ОШИБКА: недопустимые пути в сертификатах архива. Сервер не тронут."; exit 1
+  fi
+
+  # значения из манифеста — данные, не команды: оставляем только безопасные формы
+  local sites_ok="" ports_ok="" s p
+  local -a arr=()
+  read -ra arr <<<"$(bk_man_get "$M" enabled_sites)"   # read -a: слова без раскрытия шаблонов
+  for s in "${arr[@]}"; do
+    [[ "$s" =~ ^[A-Za-z0-9._-]+\.conf$ ]] && sites_ok+="$s "
+  done
+  arr=(); read -ra arr <<<"$(bk_man_get "$M" awg_ports)"
+  for p in "${arr[@]}"; do
+    [[ "$p" =~ ^[0-9]{1,5}$ ]] && (( 10#$p >= 1 && 10#$p <= 65535 )) && ports_ok+="$((10#$p)) "
+  done
+
+  # --- проверки совместимости ---
+  local b_ver n_ver b_dom b_rd b_xh n_xh
+  b_ver=$(bk_man_get "$M" lucx_version); n_ver=$(bk_xui_version)
+  b_dom=$(bk_man_get "$M" domain); b_rd=$(bk_man_get "$M" reality_domain); b_xh=$(bk_man_get "$M" xhttp_domain)
+  n_xh=$(xhttp_domain_cfg 2>/dev/null || true)
+  echo "Архив: создан $(bk_man_get "$M" created) на $(bk_man_get "$M" host), скрипт $(bk_man_get "$M" script_version), панель '${b_ver}', xray $(bk_man_get "$M" xray_version)"
+  echo "Здесь: скрипт ${VERSION}, панель '${n_ver}'"
+  # домены: всегда стоп (--force их не обходит: конфиги из архива привязаны к старым именам и сертификатам)
+  local dom_bad=0
+  if [[ "${DOMAIN:-}" != "$b_dom" ]] || { [[ -n "$b_rd" ]] && [[ "${REALITY_DOMAIN:-$DOMAIN}" != "$b_rd" ]]; }; then
+    echo "СТОП: домены установки (${DOMAIN:-?} / ${REALITY_DOMAIN:-?}) не совпадают с архивом (${b_dom} / ${b_rd})."
+    echo "      Ставь скрипт с теми же именами, что были на старом сервере (клиенты привязаны к ним)."
+    dom_bad=1
+  fi
+  if [[ -n "$b_xh" && "$b_xh" != "$n_xh" ]]; then
+    echo "СТОП: в архиве есть XHTTP-домен ${b_xh}, а здесь он не настроен (${n_xh:-нет}). Поставь: sudo bash $0 add-xhttp ${b_xh} — и повтори restore."
+    dom_bad=1
+  fi
+  [[ $dom_bad -eq 0 ]] || { echo "Сервер не тронут."; exit 1; }
+  [[ -z "$b_xh" && -n "$n_xh" ]] && echo "WARN: здесь настроен XHTTP (${n_xh}), в архиве его нет: restore уберёт его vhost'ы nginx. Сертификат этого имени удали сам: certbot delete --cert-name ${n_xh}"
+  # версия панели: пустая или ниже архивной — стоп (обходится только --force)
+  local ver_bad=0
+  if [[ -z "$b_ver" || -z "$n_ver" ]]; then
+    echo "СТОП: версию панели определить не удалось (архив: '${b_ver}', здесь: '${n_ver}'), совместимость БД проверить нельзя."
+    ver_bad=1
+  elif ! bk_ver_ge "$n_ver" "$b_ver"; then
+    echo "СТОП: версия панели здесь (${n_ver}) НИЖЕ архивной (${b_ver}): схема БД может не открыться. Обнови панель (x-ui update) и повтори."
+    ver_bad=1
+  fi
+  if [[ $ver_bad -eq 1 ]]; then
+    [[ $force -eq 1 ]] && echo "--force: проверку версии пропускаю на твою ответственность." || { echo "Сервер не тронут."; exit 1; }
+  fi
+  local b_xv n_xv xbin
+  b_xv=$(bk_man_get "$M" xray_version)
+  xbin="/usr/local/x-ui/bin/xray-linux-$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')"
+  n_xv=""; [[ -x "$xbin" ]] && n_xv=$("$xbin" -version 2>/dev/null | head -1 | awk '{print $2}' || true)
+  if [[ -n "$b_xv" && -n "$n_xv" ]] && ! bk_ver_ge "$n_xv" "$b_xv"; then
+    echo "WARN: xray здесь (${n_xv}) старее, чем в архиве (${b_xv}); часть настроек инбаундов может не примениться."
+  fi
+  local b_aw n_aw; b_aw=$(bk_man_get "$M" awg_module_version); n_aw=$(cat /etc/x-ui/.awg-module-version 2>/dev/null || true)
+  [[ -n "$b_aw" && -n "$n_aw" && "$b_aw" != "$n_aw" ]] && echo "WARN: версия модуля AWG отличается (архив ${b_aw:0:8}, здесь ${n_aw:0:8}): после restore проверь подключение AWG-клиента."
+  local d
+  for d in "$b_dom" "$b_rd" "$b_xh"; do
+    [[ -n "$d" ]] || continue
+    [[ -d "/etc/letsencrypt/live/$d" || $use_certs -eq 1 ]] \
+      || echo "WARN: сертификата для ${d} здесь нет (install выпускает их; без него nginx -t не пройдёт). Используй --certs, если архив делался с --with-certs."
+  done
+
+  # IP для listen: адрес из РАБОЧЕЙ установки (stream-конфиг после install), а не от внешнего сервиса
+  local SERVER_IP="" ipre='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+  SERVER_IP=$(grep -oP '^\s*listen\s+\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(?=:443;)' /etc/nginx/stream-sni-router.conf 2>/dev/null | grep -v '^0\.0\.0\.0$' | head -n1 || true)
+  [[ "$SERVER_IP" =~ $ipre ]] || SERVER_IP=$(get_server_ip)
+  [[ "$SERVER_IP" =~ $ipre ]] || { echo "ОШИБКА: не определить IP сервера (нет listen в stream-конфиге и внешний сервис недоступен). Сервер не тронут."; exit 1; }
+  echo "IP для nginx здесь: ${SERVER_IP} (в архиве был $(bk_man_get "$M" server_ip))."
+  if [[ $assume_yes -ne 1 ]]; then
+    echo "Будет ЗАМЕНЕНО: БД панели (клиенты/инбаунды/настройки), ${CREDS_FILE}, конфиги nginx схемы, конфиги AWG."
+    echo "Текущие версии сохраняются в /root/.lucx-restore-backup-*/ (там секреты — удали после проверки)."
+    read -rp "Продолжить? [y/N]: " ans || ans=""
+    [[ "$ans" =~ ^[YyДд] ]] || { echo "Отменено."; exit 0; }
+  fi
+
+  # --- остановка панели и полная страховочная копия ---
+  lucx_xui_stop || { echo "ОШИБКА: x-ui не остановился. Ничего не изменено."; exit 1; }
+  BK_SAFE="/root/.lucx-restore-backup-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$BK_SAFE/nginx" || { echo "ОШИБКА: не создать ${BK_SAFE}."; exit 1; }
+  sqlite3 "$XUIDB" ".backup '$BK_SAFE/x-ui.db'" \
+    && [[ "$(sqlite3 "$BK_SAFE/x-ui.db" 'PRAGMA integrity_check;' 2>/dev/null)" == "ok" ]] \
+    || { echo "ОШИБКА: страховочная копия БД не создана. Ничего не изменено."; exit 1; }
+  cp -p "$CREDS_FILE" "$BK_SAFE/lucx-credentials" || { echo "ОШИБКА: страховочная копия creds. Ничего не изменено."; exit 1; }
+  for d in sites-available sites-enabled conf.d; do
+    cp -a "/etc/nginx/$d" "$BK_SAFE/nginx/" || { echo "ОШИБКА: страховочная копия nginx/${d}. Ничего не изменено."; exit 1; }
+  done
+  if [[ -f /etc/nginx/stream-sni-router.conf ]]; then
+    cp -p /etc/nginx/stream-sni-router.conf "$BK_SAFE/nginx/" || { echo "ОШИБКА: страховочная копия stream-конфига. Ничего не изменено."; exit 1; }
+  else
+    : > "$BK_SAFE/no-stream"
+  fi
+  if [[ -d /etc/amnezia/amneziawg ]]; then
+    cp -a /etc/amnezia/amneziawg "$BK_SAFE/amneziawg" || { echo "ОШИБКА: страховочная копия AWG. Ничего не изменено."; exit 1; }
+  else
+    : > "$BK_SAFE/no-amneziawg"
+  fi
+  mkdir -p "$BK_SAFE/state"
+  for f in /root/.lucx-public-tcp-ports.txt /root/.lucx-public-udp-ports.txt; do
+    [[ -f "$f" ]] && { cp -p "$f" "$BK_SAFE/state/" || { echo "ОШИБКА: страховочная копия состояния. Ничего не изменено."; exit 1; }; }
+  done
+  if [[ -d /root/.lucx-mode-backup ]]; then
+    cp -a /root/.lucx-mode-backup "$BK_SAFE/state/lucx-mode-backup" || { echo "ОШИБКА: страховочная копия lucx-mode-backup. Ничего не изменено."; exit 1; }
+  fi
+  if [[ $use_certs -eq 1 && -f "$D/letsencrypt.tar" && -d /etc/letsencrypt ]]; then
+    tar -C /etc -cf "$BK_SAFE/letsencrypt.tar" letsencrypt || { echo "ОШИБКА: страховочная копия сертификатов. Ничего не изменено."; exit 1; }
+  fi
+  echo "Страховочная копия: ${BK_SAFE}"
+
+  # --- применение: с этого места любой сбой/обрыв откатывает всё (ловушка EXIT) ---
+  set -E; trap 'BK_ERR="строка $LINENO: $BASH_COMMAND"' ERR   # причина сбоя попадёт в журнал отката
+  trap '' HUP PIPE     # обрыв SSH и закрытый канал вывода не должны прервать применение посередине
+  BK_ARMED=1
+  if [[ $use_certs -eq 1 && -f "$D/letsencrypt.tar" ]]; then
+    bk_say "Сертификаты из архива -> /etc/letsencrypt (поверх существующих)"
+    tar -C /etc -xf "$D/letsencrypt.tar"
+  fi
+  # отдельные команды (не &&-цепочки): сбой любой из них под set -e останавливает скрипт и запускает откат
+  cp -p "$D/x-ui.db" "${XUIDB}.new"
+  mv -f "${XUIDB}.new" "$XUIDB"
+  rm -f "${XUIDB}-wal" "${XUIDB}-shm"
+  cp -p "$D/lucx-credentials" "${CREDS_FILE}.new"
+  chmod 600 "${CREDS_FILE}.new"
+  mv -f "${CREDS_FILE}.new" "$CREDS_FILE"
+  if [[ -d "$D/amneziawg" ]]; then
+    rm -rf /etc/amnezia/amneziawg          # заменой целиком: второй интерфейс от install остаться не должен
+    mkdir -p /etc/amnezia
+    cp -a "$D/amneziawg" /etc/amnezia/amneziawg
+  fi
+  [[ -f "$D/nginx/stream-sni-router.conf" ]] && cp -p "$D/nginx/stream-sni-router.conf" /etc/nginx/
+  [[ -d "$D/nginx/conf.d" ]] && cp -a "$D/nginx/conf.d/." /etc/nginx/conf.d/
+  if [[ -d "$D/nginx/sites-available" ]]; then
+    cp -a "$D/nginx/sites-available/." /etc/nginx/sites-available/
+    for s in $sites_ok; do
+      [[ -f "/etc/nginx/sites-available/$s" ]] && ln -sf "/etc/nginx/sites-available/$s" "/etc/nginx/sites-enabled/$s"
+    done
+  fi
+
+  # состояние (осознанные порты, копии Reality-ключей): заменой, чтобы не осталось следов нового сервера
+  rm -f /root/.lucx-public-tcp-ports.txt /root/.lucx-public-udp-ports.txt
+  rm -rf /root/.lucx-mode-backup
+  [[ -f "$D/state/.lucx-public-tcp-ports.txt" ]] && cp -p "$D/state/.lucx-public-tcp-ports.txt" /root/
+  [[ -f "$D/state/.lucx-public-udp-ports.txt" ]] && cp -p "$D/state/.lucx-public-udp-ports.txt" /root/
+  [[ -d "$D/state/lucx-mode-backup" ]] && cp -a "$D/state/lucx-mode-backup" /root/.lucx-mode-backup
+  # XHTTP: в архиве его не было, а здесь настроен — убираем vhost'ы (remove-xhttp после restore ничего не найдёт)
+  if [[ -z "$b_xh" ]]; then
+    rm -f /etc/nginx/sites-enabled/xhttp-80.conf /etc/nginx/sites-available/xhttp-80.conf \
+          /etc/nginx/sites-enabled/xhttp-decoy-tls.conf /etc/nginx/sites-available/xhttp-decoy-tls.conf
+  fi
+
+  # listen stream-роутера -> IP этого сервера (явный адрес, как в rebind-ip; wildcard тоже приводим к явному)
+  local SC="/etc/nginx/stream-sni-router.conf"
+  if [[ -f "$SC" ]] && ! grep -qE "^\s*listen\s+${SERVER_IP//./\\.}:443;" "$SC"; then
+    stream_set_listen_ip "$SERVER_IP" "$SC" || { bk_say "ОШИБКА: listen-строка stream-роутера не обновилась."; exit 1; }
+    bk_say "stream-роутер: listen -> ${SERVER_IP}:443"
+  fi
+  if ! nginx -t >/dev/null 2>&1; then
+    bk_say "ОШИБКА: nginx -t не прошёл после подстановки конфигов:"; { nginx -t 2>&1 | tail -5 | while read -r l; do bk_say "$l"; done; } || true
+    exit 1
+  fi
+
+  # порты: install уже открыл 22/80/443 и свой AWG-порт; добавляем порты AWG из архива (повтор безопасен)
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    for p in $ports_ok; do
+      ufw allow "${p}/udp" >/dev/null 2>&1 && bk_say "ufw: ${p}/udp открыт (порт AWG из архива)"
+    done
+  fi
+
+  systemctl restart nginx || { bk_say "ОШИБКА: nginx не перезапустился."; exit 1; }
+  sleep 1
+  if command -v ss >/dev/null 2>&1 && ! grep -qE "${SERVER_IP//./\\.}:443\b.*nginx" <<<"$(ss -tlnp 2>/dev/null)"; then
+    bk_say "ОШИБКА: nginx не слушает ${SERVER_IP}:443 после restart."; exit 1
+  fi
+  systemctl stop x-ui 2>/dev/null || true   # если кто-то успел запустить x-ui на старой БД во время применения
+  lucx_xui_start || { bk_say "ОШИБКА: x-ui не стартовал после восстановления."; exit 1; }
+  sleep 3
+  systemctl is-active --quiet x-ui || { bk_say "ОШИБКА: x-ui не работает после восстановления."; exit 1; }
+  BK_ARMED=0
+  trap - HUP PIPE        # сброс игнорирования: дальше обычное поведение
+  trap bk_cleanup EXIT
+
+  bk_say "OK: восстановлено (панель и nginx запущены). Работу клиентов проверь сам: sudo bash $0 healthcheck и подключение с телефона."
+  if pgrep -f 'xray-linux' >/dev/null 2>&1; then bk_say "  xray запущен."; else bk_say "  WARN: процесс xray не найден — подожди минуту, затем смотри: journalctl -u x-ui -n 50"; fi
+  local pl
+  pl=$(sqlite3 -readonly "$XUIDB" "SELECT port||'/'||protocol FROM inbounds WHERE enable=1 AND (listen IS NULL OR listen='' OR listen NOT LIKE '127.%') ORDER BY port;" 2>/dev/null | tr '\n' ' ' || true)
+  [[ -n "$pl" ]] && bk_say "  Порты инбаундов из БД, доступные снаружи: ${pl}— сверь с 'ufw status' (скрипт открывает только 22/80/443 и порты AWG)."
+  bk_say "  Старый сервер выключи или останови там бота: один токен Telegram у двух серверов мешает; удали ${BK_SAFE} после проверки (там секреты)."
+  bk_say "  Если у старого сервера был бот: sudo bash $0 add-bot. AWG: проверь подключение клиента; при необходимости перезагрузи сервер."
+}
+
 # ================== РАЗБОР АРГУМЕНТОВ ==================
 
 case "${1:-install}" in
@@ -7697,6 +8286,14 @@ case "${1:-install}" in
     [[ $# -eq 0 ]] || { echo "panel-tunnel запускается без аргументов: sudo bash $0 panel-tunnel"; exit 1; }
     cmd_panel_tunnel
     ;;
+  backup)
+    shift
+    cmd_backup "$@"
+    ;;
+  restore)
+    shift
+    cmd_restore "$@"
+    ;;
   add-swap|swap)
     shift
     cmd_add_swap "$@"
@@ -7732,6 +8329,10 @@ case "${1:-install}" in
     echo "  sudo bash $0 healthcheck   — проверить текущую связку"
     echo "  sudo bash $0 rebind-ip     — сменить IP в stream-роутере"
     echo "                               (после смены IP у провайдера)"
+    echo "  sudo bash $0 backup        — зашифрованный архив сервера (клиенты, инбаунды, настройки, конфиги; --with-certs"
+    echo "                               кладёт и сертификаты); перенос: A-записи -> install -> restore"
+    echo "  sudo bash $0 restore <файл> — восстановить архив на сервер с уже выполненным install (те же домены;"
+    echo "                               версия панели не ниже архивной; страховочная копия, автооткат)"
     echo "  sudo bash $0 add-swap      — (опц.) swap-файл против OOM на нодах с 1 ГБ ОЗУ"
     echo "                               (--size 512M|1G|2G; не включай на ВМ с подвисающим диском)"
     echo "  sudo bash $0 remove-swap   — убрать swap-файл, созданный add-swap"

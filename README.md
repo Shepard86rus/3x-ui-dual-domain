@@ -92,6 +92,7 @@ bash 3x-ui-dual-domain.sh healthcheck
 | `bash 3x-ui-dual-domain.sh upgrade` | Обновить сам скрипт до последнего релиза (с проверкой sha256). Запускайте, когда вышла новая версия |
 | `bash 3x-ui-dual-domain.sh panel-path` | Сменить путь страницы входа в панель со стандартного `/panel/` на случайный (≈10 секунд, с бэкапом и автооткатом, подписки клиентов не меняются). **Нужна всем серверам, поставленным версией 0.6.0 и старше**: после `upgrade` запустите её один раз (healthcheck подскажет). Новые установки получают случайный путь сразу |
 | `bash 3x-ui-dual-domain.sh panel-tunnel` | Если панель по `https://домен/путь/` не открывается или зависает (часть провайдеров режет TLS до иностранных IP), а по SSH на сервер зайти можно: печатает готовую команду `ssh -L` и настройку Termius для входа через SSH-туннель. Ничего не меняет на сервере, обычный доступ остаётся |
+| `bash 3x-ui-dual-domain.sh backup` / `restore файл` | Перенос установки на другой сервер или откат к снимку: зашифрованный архив (клиенты, инбаунды, настройки, конфиги) и восстановление из него на сервере с уже выполненным `install` (те же домены). Порядок, предупреждения и ошибки: [docs/migration.md](docs/migration.md) |
 
 #### Путь панели (`panel-path`): кому нужно и почему
 
@@ -192,6 +193,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-doma
 | [docs/telegram-bot.md](docs/telegram-bot.md) | Telegram-бот, управление клиентами, безопасность |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | если что-то не так |
 | [docs/ip-change.md](docs/ip-change.md) | сервер сменил IP: DNS и `rebind-ip` по шагам |
+| [docs/migration.md](docs/migration.md) | перенос на другой сервер: `backup` и `restore` по шагам |
 | [tools/hub/README.md](tools/hub/README.md) | один бот на весь флот (для продвинутых) |
 | [RELEASING.md](RELEASING.md) | как выпустить релиз (для мейнтейнера) |
 

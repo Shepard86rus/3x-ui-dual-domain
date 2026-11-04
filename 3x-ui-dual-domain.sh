@@ -5870,6 +5870,7 @@ cmd_healthcheck() {
   # отдельный прогон, SSH_PORTS из install тут не существует. Детекция та же,
   # что в install; фоллбэк "22" — как в install при невидимом sshd.
   HC11_SSH_PORTS=$(lucx_detect_ssh_ports 2>/dev/null || true)   # v0.6.4: тот же набор источников, что у install (ss, sshd -T, SSH_PORT)
+  [[ -n "${HC11_SSH_PORTS// /}" ]] || HC11_SSH_PORTS=$(SSH_PORT="" lucx_detect_ssh_ports 2>/dev/null || true)   # М21: кривой SSH_PORT в окружении не должен прятать реальные порты
   HC11_ALLOW_TCP=" 80 443 "
   if [[ -n "$HC11_SSH_PORTS" ]]; then
     for HC11_P in $HC11_SSH_PORTS; do HC11_ALLOW_TCP+="${HC11_P} "; done

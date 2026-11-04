@@ -6088,7 +6088,7 @@ cmd_rebind_ip() {
     echo "ОШИБКА: '${SERVER_IP}' — не IPv4-адрес. Ничего не изменено."
     exit 1
   fi
-  if command -v ip >/dev/null 2>&1 && ! ip -4 -o addr show 2>/dev/null | grep -qw "$SERVER_IP"; then
+  if command -v ip >/dev/null 2>&1 && ! ip -4 -o addr show 2>/dev/null | grep -qwF "$SERVER_IP"; then
     echo "СТОП: ${SERVER_IP} не назначен ни одному интерфейсу сервера (NAT или другой исходящий адрес): nginx не сможет его слушать."
     echo "      Ничего не изменено. Если нужен другой адрес — укажи тот, что виден в 'ip -4 addr'."
     exit 1
@@ -6139,7 +6139,7 @@ cmd_rebind_ip() {
     exit 1
   fi
   sleep 1
-  if ! ss -tlnp 2>/dev/null | grep -qE "${SERVER_IP//./\.}:443\b.*nginx"; then
+  if command -v ss >/dev/null 2>&1 && ! grep -qE "${SERVER_IP//./\.}:443\b.*nginx" <<<"$(ss -tlnp 2>/dev/null)"; then
     cp -p "$rb_bak" "$STREAM_CONF"; systemctl restart nginx || true
     echo "ОШИБКА: nginx не подтверждён на ${SERVER_IP}:443 после restart — прежний stream-конфиг возвращён:"
     ss -tlnp | grep ':443 ' || true
@@ -7710,9 +7710,8 @@ BK_STAGE=""; BK_PART=""; BK_SAFE=""; BK_ARMED=0
 
 # вывод, который не падает при закрытом терминале (обрыв SSH) и дублируется в журнал
 bk_say() {
-  [[ -n "$BK_SAFE" && -d "$BK_SAFE" ]] && echo "$*" >> "$BK_SAFE/restore.log" 2>/dev/null
-  echo "$*" 2>/dev/null
-  return 0
+  [[ -n "$BK_SAFE" && -d "$BK_SAFE" ]] && { echo "$*" >> "$BK_SAFE/restore.log"; } 2>/dev/null || true
+  echo "$*" 2>/dev/null || true
 }
 
 bk_cleanup() {
@@ -7734,13 +7733,13 @@ bk_rollback() {
   cp -p "$BK_SAFE/lucx-credentials" "${CREDS_FILE}.rb" && mv -f "${CREDS_FILE}.rb" "$CREDS_FILE" || { rb_bad=1; bk_say "ВНИМАНИЕ: не удалось вернуть creds — возьми вручную ${BK_SAFE}/lucx-credentials"; }
   local d
   for d in sites-available sites-enabled conf.d; do
-    [[ -d "$BK_SAFE/nginx/$d" ]] && { rm -rf "/etc/nginx/$d"; cp -a "$BK_SAFE/nginx/$d" /etc/nginx/; }
+    [[ -d "$BK_SAFE/nginx/$d" ]] && { rm -rf "/etc/nginx/$d"; cp -a "$BK_SAFE/nginx/$d" /etc/nginx/ || rb_bad=1; }
   done
   if [[ -f "$BK_SAFE/nginx/stream-sni-router.conf" ]]; then cp -p "$BK_SAFE/nginx/stream-sni-router.conf" /etc/nginx/
   elif [[ -f "$BK_SAFE/no-stream" ]]; then rm -f /etc/nginx/stream-sni-router.conf; fi
   if [[ -d "$BK_SAFE/amneziawg" ]]; then rm -rf /etc/amnezia/amneziawg; cp -a "$BK_SAFE/amneziawg" /etc/amnezia/amneziawg
   elif [[ -f "$BK_SAFE/no-amneziawg" ]]; then rm -rf /etc/amnezia/amneziawg; fi
-  [[ -f "$BK_SAFE/letsencrypt.tar" ]] && { rm -rf /etc/letsencrypt; tar -C /etc -xf "$BK_SAFE/letsencrypt.tar"; }
+  [[ -f "$BK_SAFE/letsencrypt.tar" ]] && { rm -rf /etc/letsencrypt; tar -C /etc -xf "$BK_SAFE/letsencrypt.tar" || rb_bad=1; }
   lucx_xui_start
   if nginx -t >/dev/null 2>&1; then
     systemctl restart nginx
@@ -8016,7 +8015,7 @@ cmd_restore() {
   echo "Страховочная копия: ${BK_SAFE}"
 
   # --- применение: с этого места любой сбой/обрыв откатывает всё (ловушка EXIT) ---
-  trap '' HUP          # обрыв SSH не должен прервать применение посередине
+  trap '' HUP PIPE     # обрыв SSH и закрытый канал вывода не должны прервать применение посередине
   BK_ARMED=1
   if [[ $use_certs -eq 1 && -f "$D/letsencrypt.tar" ]]; then
     bk_say "Сертификаты из архива -> /etc/letsencrypt (поверх существующих)"
@@ -8050,7 +8049,7 @@ cmd_restore() {
     bk_say "stream-роутер: listen -> ${SERVER_IP}:443"
   fi
   if ! nginx -t >/dev/null 2>&1; then
-    bk_say "ОШИБКА: nginx -t не прошёл после подстановки конфигов:"; { nginx -t 2>&1 | tail -5; } || true
+    bk_say "ОШИБКА: nginx -t не прошёл после подстановки конфигов:"; { nginx -t 2>&1 | tail -5 | while read -r l; do bk_say "$l"; done; } || true
     exit 1
   fi
 
@@ -8070,7 +8069,7 @@ cmd_restore() {
   sleep 3
   systemctl is-active --quiet x-ui || { bk_say "ОШИБКА: x-ui не работает после восстановления."; exit 1; }
   BK_ARMED=0
-  trap - HUP             # сброс игнорирования HUP: дальше обычное поведение
+  trap - HUP PIPE        # сброс игнорирования: дальше обычное поведение
   trap bk_cleanup EXIT
 
   bk_say "OK: восстановлено (панель и nginx запущены). Работу клиентов проверь сам: sudo bash $0 healthcheck и подключение с телефона."

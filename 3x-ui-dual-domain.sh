@@ -1156,7 +1156,7 @@ LUCX_XUI_STOPPED=0
 lucx_xui_guard_fire() {
   if [[ "${LUCX_XUI_STOPPED:-0}" == "1" ]]; then
     LUCX_XUI_STOPPED=0
-    echo "ВНИМАНИЕ: скрипт завершился при остановленном x-ui — запускаю его обратно (бэкап БД: ${XUIDB}.backup.*)"
+    echo "ВНИМАНИЕ: скрипт завершился при остановленном x-ui — запускаю его обратно (бэкап БД: ${BK_SAFE:-${XUIDB}.backup.*})"
     systemctl start x-ui 2>/dev/null || true
   fi
 }
@@ -7726,7 +7726,7 @@ bk_cleanup() {
 bk_rollback() {
   set +e
   local rb_bad=0
-  bk_say "Откат из ${BK_SAFE} ..."
+  bk_say "Откат из ${BK_SAFE} ... (последняя ошибка команды: ${BK_ERR:-нет})"
   lucx_xui_stop 2>/dev/null
   cp -p "$BK_SAFE/x-ui.db" "${XUIDB}.rb" && mv -f "${XUIDB}.rb" "$XUIDB" || { rb_bad=1; bk_say "ВНИМАНИЕ: не удалось вернуть БД — возьми вручную ${BK_SAFE}/x-ui.db"; }
   rm -f "${XUIDB}-wal" "${XUIDB}-shm"
@@ -7739,6 +7739,12 @@ bk_rollback() {
   elif [[ -f "$BK_SAFE/no-stream" ]]; then rm -f /etc/nginx/stream-sni-router.conf; fi
   if [[ -d "$BK_SAFE/amneziawg" ]]; then rm -rf /etc/amnezia/amneziawg; cp -a "$BK_SAFE/amneziawg" /etc/amnezia/amneziawg
   elif [[ -f "$BK_SAFE/no-amneziawg" ]]; then rm -rf /etc/amnezia/amneziawg; fi
+  rm -f /root/.lucx-public-tcp-ports.txt /root/.lucx-public-udp-ports.txt; rm -rf /root/.lucx-mode-backup
+  local sf
+  for sf in .lucx-public-tcp-ports.txt .lucx-public-udp-ports.txt; do
+    [[ -f "$BK_SAFE/state/$sf" ]] && cp -p "$BK_SAFE/state/$sf" /root/
+  done
+  [[ -d "$BK_SAFE/state/lucx-mode-backup" ]] && cp -a "$BK_SAFE/state/lucx-mode-backup" /root/.lucx-mode-backup
   [[ -f "$BK_SAFE/letsencrypt.tar" ]] && { rm -rf /etc/letsencrypt; tar -C /etc -xf "$BK_SAFE/letsencrypt.tar" || rb_bad=1; }
   lucx_xui_start
   if nginx -t >/dev/null 2>&1; then
@@ -7805,6 +7811,12 @@ cmd_backup() {
     awg_ports=$(grep -hE '^\s*ListenPort\s*=' /etc/amnezia/amneziawg/*.conf 2>/dev/null | sed -E 's/.*=\s*//; s/\s+$//' | sort -u | tr '\n' ' ' || true)
   fi
   [[ -f /etc/x-ui/.awg-module-version ]] && cp -p /etc/x-ui/.awg-module-version "$stage/data/awg-module-version"
+  # состояние, которое читают другие команды: осознанно открытые порты (hc [11]) и копии Reality-ключей (add-reality)
+  mkdir -p "$stage/data/state"
+  for f in /root/.lucx-public-tcp-ports.txt /root/.lucx-public-udp-ports.txt; do
+    [[ -f "$f" ]] && cp -p "$f" "$stage/data/state/"
+  done
+  [[ -d /root/.lucx-mode-backup ]] && cp -a /root/.lucx-mode-backup "$stage/data/state/lucx-mode-backup"
   if [[ $with_certs -eq 1 && -d /etc/letsencrypt/live ]]; then
     tar -C /etc -cf "$stage/data/letsencrypt.tar" letsencrypt 2>/dev/null || { echo "ОШИБКА: не упаковались сертификаты."; exit 1; }
   fi
@@ -7869,6 +7881,9 @@ cmd_restore() {
   [[ -n "$in" && -f "$in" ]] || { echo "Использование: sudo bash $0 restore <файл.lucxbak> [--yes] [--certs] [--force]"; exit 1; }
   if command -v flock >/dev/null 2>&1 && exec 9>/var/lock/lucx-backup.lock; then
     flock -n 9 || { echo "ОШИБКА: backup/restore уже выполняется."; exit 1; }
+  fi
+  if command -v flock >/dev/null 2>&1 && exec 8>/var/lock/lucx-panel-path.lock; then
+    flock -n 8 || { echo "ОШИБКА: сейчас выполняется panel-path — дождись и повтори."; exit 1; }
   fi
   local t
   for t in sqlite3 openssl tar sha256sum nginx; do
@@ -7946,7 +7961,7 @@ cmd_restore() {
     dom_bad=1
   fi
   [[ $dom_bad -eq 0 ]] || { echo "Сервер не тронут."; exit 1; }
-  [[ -z "$b_xh" && -n "$n_xh" ]] && echo "WARN: здесь настроен XHTTP (${n_xh}), в архиве его нет. После restore выполни: sudo bash $0 remove-xhttp (или add-xhttp заново)."
+  [[ -z "$b_xh" && -n "$n_xh" ]] && echo "WARN: здесь настроен XHTTP (${n_xh}), в архиве его нет: restore уберёт его vhost'ы nginx. Сертификат этого имени удали сам: certbot delete --cert-name ${n_xh}"
   # версия панели: пустая или ниже архивной — стоп (обходится только --force)
   local ver_bad=0
   if [[ -z "$b_ver" || -z "$n_ver" ]]; then
@@ -8009,12 +8024,20 @@ cmd_restore() {
   else
     : > "$BK_SAFE/no-amneziawg"
   fi
+  mkdir -p "$BK_SAFE/state"
+  for f in /root/.lucx-public-tcp-ports.txt /root/.lucx-public-udp-ports.txt; do
+    [[ -f "$f" ]] && { cp -p "$f" "$BK_SAFE/state/" || { echo "ОШИБКА: страховочная копия состояния. Ничего не изменено."; exit 1; }; }
+  done
+  if [[ -d /root/.lucx-mode-backup ]]; then
+    cp -a /root/.lucx-mode-backup "$BK_SAFE/state/lucx-mode-backup" || { echo "ОШИБКА: страховочная копия lucx-mode-backup. Ничего не изменено."; exit 1; }
+  fi
   if [[ $use_certs -eq 1 && -f "$D/letsencrypt.tar" && -d /etc/letsencrypt ]]; then
     tar -C /etc -cf "$BK_SAFE/letsencrypt.tar" letsencrypt || { echo "ОШИБКА: страховочная копия сертификатов. Ничего не изменено."; exit 1; }
   fi
   echo "Страховочная копия: ${BK_SAFE}"
 
   # --- применение: с этого места любой сбой/обрыв откатывает всё (ловушка EXIT) ---
+  set -E; trap 'BK_ERR="строка $LINENO: $BASH_COMMAND"' ERR   # причина сбоя попадёт в журнал отката
   trap '' HUP PIPE     # обрыв SSH и закрытый канал вывода не должны прервать применение посередине
   BK_ARMED=1
   if [[ $use_certs -eq 1 && -f "$D/letsencrypt.tar" ]]; then
@@ -8042,6 +8065,18 @@ cmd_restore() {
     done
   fi
 
+  # состояние (осознанные порты, копии Reality-ключей): заменой, чтобы не осталось следов нового сервера
+  rm -f /root/.lucx-public-tcp-ports.txt /root/.lucx-public-udp-ports.txt
+  rm -rf /root/.lucx-mode-backup
+  [[ -f "$D/state/.lucx-public-tcp-ports.txt" ]] && cp -p "$D/state/.lucx-public-tcp-ports.txt" /root/
+  [[ -f "$D/state/.lucx-public-udp-ports.txt" ]] && cp -p "$D/state/.lucx-public-udp-ports.txt" /root/
+  [[ -d "$D/state/lucx-mode-backup" ]] && cp -a "$D/state/lucx-mode-backup" /root/.lucx-mode-backup
+  # XHTTP: в архиве его не было, а здесь настроен — убираем vhost'ы (remove-xhttp после restore ничего не найдёт)
+  if [[ -z "$b_xh" ]]; then
+    rm -f /etc/nginx/sites-enabled/xhttp-80.conf /etc/nginx/sites-available/xhttp-80.conf \
+          /etc/nginx/sites-enabled/xhttp-decoy-tls.conf /etc/nginx/sites-available/xhttp-decoy-tls.conf
+  fi
+
   # listen stream-роутера -> IP этого сервера (явный адрес, как в rebind-ip; wildcard тоже приводим к явному)
   local SC="/etc/nginx/stream-sni-router.conf"
   if [[ -f "$SC" ]] && ! grep -qE "^\s*listen\s+${SERVER_IP//./\\.}:443;" "$SC"; then
@@ -8065,6 +8100,7 @@ cmd_restore() {
   if command -v ss >/dev/null 2>&1 && ! grep -qE "${SERVER_IP//./\\.}:443\b.*nginx" <<<"$(ss -tlnp 2>/dev/null)"; then
     bk_say "ОШИБКА: nginx не слушает ${SERVER_IP}:443 после restart."; exit 1
   fi
+  systemctl stop x-ui 2>/dev/null || true   # если кто-то успел запустить x-ui на старой БД во время применения
   lucx_xui_start || { bk_say "ОШИБКА: x-ui не стартовал после восстановления."; exit 1; }
   sleep 3
   systemctl is-active --quiet x-ui || { bk_say "ОШИБКА: x-ui не работает после восстановления."; exit 1; }

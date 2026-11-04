@@ -931,6 +931,12 @@
 #   rebind-ip (исправление существующей команды): sed меняет только строку `listen [IP:]443;` (раньше цеплял и `127.0.0.1:8443;`,
 #   `[::]:443;`), введённый вручную IP проверяется как IPv4, IP должен быть назначен интерфейсу сервера (иначе nginx не сможет
 #   его слушать), при провале nginx -t / restart / проверки порта прежний stream-конфиг возвращается автоматически.
+#   По итогам полного аудита (существующий код): (1) install не включает ufw, пока не определён порт SSH (ss, sshd -T, порт текущего
+#   подключения, SSH_PORT=…): вместо «открыл 22 и включил» — стоп с понятным сообщением; тот же набор источников в healthcheck [11];
+#   (2) healthcheck больше не обрывается без «Итого», если нет сертификата домена или нет копий x-ui.db.backup.*; (3) add-xhttp: откат
+#   при любом выходе (ошибка, Ctrl+C, обрыв SSH), правка stream-конфига на копии с одной подменой; (4) panel-path: откат при прерывании,
+#   возврат БД из бэкапа, если панель не вернула путь, выравнивание URL в creds по БД после прерванного запуска, проверка снаружи по
+#   адресу из listen; (5) backup не стартует во время panel-path. Заглушки: ссылки mailto: заменены на #contact.
 VERSION="0.6.4"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
@@ -1148,6 +1154,28 @@ lucx_free_port() {
     p=$((p+1)); n=$((n+1))
   done
   echo "$1"
+}
+
+# v0.6.4: порт(ы) SSH для правил ufw. Источники по порядку: SSH_PORT от пользователя (числа через пробел/запятую),
+# слушатели sshd/dropbear в ss, `sshd -T`, порт текущего SSH-подключения (SSH_CONNECTION). Пусто = определить не удалось.
+lucx_detect_ssh_ports() {
+  local p="" x
+  if [[ -n "${SSH_PORT:-}" ]]; then
+    for x in ${SSH_PORT//,/ }; do
+      [[ "$x" =~ ^[0-9]{1,5}$ ]] && (( 10#$x >= 1 && 10#$x <= 65535 )) && p+="$((10#$x)) "
+    done
+    if [[ -n "$p" ]]; then echo "$p"; return 0; fi
+  fi
+  p=$(ss -tlnp 2>/dev/null | grep -E 'sshd|dropbear' | grep -oP ':\K[0-9]+(?= )' | sort -u | tr '\n' ' ' || true)
+  if [[ -z "${p// /}" ]] && command -v sshd >/dev/null 2>&1; then
+    p=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -u | tr '\n' ' ' || true)
+  fi
+  if [[ -z "${p// /}" && -n "${SSH_CONNECTION:-}" ]]; then
+    x=$(echo "$SSH_CONNECTION" | awk '{print $4}')
+    [[ "$x" =~ ^[0-9]{1,5}$ ]] && p="$x "
+  fi
+  echo "${p% }"
+  return 0
 }
 
 # v0.5.5 (С3): страховка «x-ui остановлен нами» — при любом выходе скрипта
@@ -2426,6 +2454,16 @@ cmd_install() {
 
   # --- [2/10] Проверки окружения ---
   echo "=== [2/10] Проверки окружения ==="
+  # v0.6.4: порт SSH нужен для ufw на [3/10]; определяем заранее. Не определился — стоп ДО включения ufw:
+  # лучше остановить установку, чем включить фильтр и отрезать доступ по SSH.
+  SSH_PORTS=$(lucx_detect_ssh_ports)
+  if [[ -z "${SSH_PORTS// /}" ]]; then
+    echo "ОШИБКА: не удалось определить порт SSH (sshd/dropbear не виден в ss, sshd -T пуст, запуск не по SSH)."
+    echo "        ufw не включаю, чтобы не отрезать доступ к серверу. Укажи порт явно и запусти заново:"
+    echo "        sudo SSH_PORT=<порт> bash $0 install"
+    exit 1
+  fi
+  echo "  SSH-порт(ы): ${SSH_PORTS}"
   for d in "$DOMAIN" "$REALITY_DOMAIN"; do
     resolved=$(dig +short A "$d" @1.1.1.1 | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
     if [[ -z "$resolved" ]]; then
@@ -2543,19 +2581,17 @@ cmd_install() {
   # после "ufw --force enable". Открываются все порты, на которых sshd слушает.
   # ufw allow БЕЗ "|| true": упасть до --force enable безопаснее, чем включить
   # ufw без подтверждённого SSH-правила.
-  SSH_PORTS=$(ss -tlnp 2>/dev/null | grep 'sshd' | grep -oP ':\K[0-9]+(?= )' | sort -u || true)
-  if [[ -n "$SSH_PORTS" ]]; then
-    for p in $SSH_PORTS; do
-      ufw allow "${p}/tcp"
-      echo "  ufw: sshd слушает ${p}/tcp — открыл ${p}/tcp"
-    done
-    if [[ ! "$SSH_PORTS" =~ (^|[[:space:]])22([[:space:]]|$) ]]; then
-      echo "  ВНИМАНИЕ: SSH на нестандартном порту(ах): $(echo $SSH_PORTS) — 22 НЕ открывал."
-    fi
-  else
-    ufw allow 22/tcp || true
-    echo "  ufw: sshd не определён по ss — открыл 22/tcp по умолчанию."
-    echo "  ВНИМАНИЕ: ЕСЛИ SSH НА ДРУГОМ ПОРТУ — после enable доступ отрежется. Проверь!"
+  # v0.6.4: SSH_PORTS определены на [2/10] (ss, sshd -T, порт текущего подключения или SSH_PORT); пусто = стоп там же
+  if [[ -z "${SSH_PORTS// /}" ]]; then
+    echo "ОШИБКА: порт SSH неизвестен — ufw не включаю. sudo SSH_PORT=<порт> bash $0 install"
+    exit 1
+  fi
+  for p in $SSH_PORTS; do
+    ufw allow "${p}/tcp"
+    echo "  ufw: SSH ${p}/tcp — открыл ${p}/tcp"
+  done
+  if [[ ! "$SSH_PORTS" =~ (^|[[:space:]])22([[:space:]]|$) ]]; then
+    echo "  ВНИМАНИЕ: SSH на нестандартном порту(ах): $(echo $SSH_PORTS) — 22 НЕ открывал."
   fi
   ufw allow 80/tcp
   ufw allow 443/tcp
@@ -2980,7 +3016,7 @@ EOF
 <section class="visit" id="visit">
   <h2>Come stand at the <i>bar</i> while we brew it.</h2>
   <p>No loyalty app, no seasonal cup sizes with made-up names. Just tell us what you usually drink and we'll get you closer to something better.</p>
-  <a class="btn" href="mailto:hello@rootandridge.coffee">hello@rootandridge.coffee</a>
+  <a class="btn" href="#contact">hello@rootandridge.coffee</a>
 </section>
 </main>
 <footer><div>Root &amp; Ridge Coffee Roastery</div><div>Roasted fresh, sold slow</div></footer>
@@ -3096,7 +3132,7 @@ DECOYTPL01
 <section class="cta" id="cta">
   <h2>Point it at one queue. See if it earns the second.</h2>
   <p>No sales call required for the first workspace. Bring your own SQS or Redis connection string and you're tracing jobs in minutes.</p>
-  <a class="btn" href="mailto:team@pallet.dev">Get an API key</a>
+  <a class="btn" href="#contact">Get an API key</a>
 </section>
 </main>
 <footer><div>pallet.dev</div><div>Built by three people who got tired of grep</div></footer>
@@ -3287,7 +3323,7 @@ DECOYTPL03
 <section class="join" id="join">
   <h2>No code required anymore. Just curiosity.</h2>
   <p>We run a free study group before every license exam session — bring a radio if you have one, borrow one of ours if you don't.</p>
-  <a class="btn" href="mailto:secretary@signalhillradio.club">secretary@signalhillradio.club</a>
+  <a class="btn" href="#contact">secretary@signalhillradio.club</a>
 </section>
 </main>
 <footer><div>Signal Hill Radio Society</div><div>Clubhouse open Tuesdays, 19:00–22:00</div></footer>
@@ -3346,7 +3382,7 @@ DECOYTPL04
   <div class="cell"><div class="tag">Reception, dance floor</div></div>
 </section>
 <section class="about" id="about"><div class="label">About</div><p>I shoot the parts nobody stages — the walk between ceremony and reception, the look someone gives when they think the camera's already down.</p></section>
-<section class="book" id="book"><h2>Booking one wedding per weekend, on purpose.</h2><p>I only take one date at a time so I can actually edit properly, which means dates go fast in high season. Reach out even if it's a long way off.</p><a class="btn" href="mailto:iris@iriskovac.photo">Check my calendar</a></section>
+<section class="book" id="book"><h2>Booking one wedding per weekend, on purpose.</h2><p>I only take one date at a time so I can actually edit properly, which means dates go fast in high season. Reach out even if it's a long way off.</p><a class="btn" href="#contact">Check my calendar</a></section>
 </main>
 <footer><div>Iris Kovac Photography</div><div>Based in Split, working further out</div></footer>
 </body>
@@ -3414,7 +3450,7 @@ DECOYTPL05
 <section class="visit" id="visit">
   <h2>Come early, or come tomorrow.</h2>
   <p>No online ordering — we bake what the day needs, not what a queue predicts. Cash and card both fine.</p>
-  <a class="btn" href="mailto:hello@marshandloaf.bakery">Ask about standing orders</a>
+  <a class="btn" href="#contact">Ask about standing orders</a>
 </section>
 </main>
 <footer><div>Marsh &amp; Loaf</div><div>Open Tue–Sat, 7am until sold out</div></footer>
@@ -3565,7 +3601,7 @@ DECOYTPL07
 <section class="cta" id="register">
   <h2>We keep it to sixty people.</h2>
   <p>No sponsor booths, no recorded talks. Tell us in a couple of sentences what you actually monitor and we'll get back to you.</p>
-  <a class="btn" href="mailto:hello@fieldworkconf.org">Request an invite</a>
+  <a class="btn" href="#contact">Request an invite</a>
 </section>
 </main>
 <footer><div>Fieldwork ${CONF_YEAR}</div><div>Organized by working field ecologists, not a conference company</div></footer>
@@ -3643,7 +3679,7 @@ DECOYTPL08
 <section class="contact" id="contact">
   <h2>Bring us the room that annoys you most.</h2>
   <p>We take on a small number of projects at a time — usually four running at once, no more.</p>
-  <a class="btn" href="mailto:studio@greywacke.design">Start a project</a>
+  <a class="btn" href="#contact">Start a project</a>
 </section>
 </main>
 <footer><div>Greywacke Studio</div><div>Renovation-focused, four projects at a time</div></footer>
@@ -3716,7 +3752,7 @@ DECOYTPL09
 <section class="season" id="volunteer">
   <h2>The waiting list moves faster if you volunteer.</h2>
   <p>We run a shared compost system, a tool shed, and a Saturday work morning — showing up counts, even before you have your own plot.</p>
-  <a class="btn" href="mailto:hello@elmstreetgarden.org">Join the waiting list</a>
+  <a class="btn" href="#contact">Join the waiting list</a>
 </section>
 </main>
 <footer><div>Elm Street Community Garden</div><div>Open dawn to dusk, gate code shared with plot holders</div></footer>
@@ -3805,7 +3841,7 @@ DECOYTPL10
   <div class="eyebrow">Recruitment</div>
   <h2>Flying solo gets <span>old fast.</span></h2>
   <p>No minimum rank, no combat rating requirement. If your ship holds air, you're already qualified.</p>
-  <a class="btn" href="mailto:wing@surelite.store">wing@surelite.store</a>
+  <a class="btn" href="#contact">wing@surelite.store</a>
 </section>
 </main>
 <footer><div class="brand">SureLite Wing</div><div>Independent player squadron · not affiliated with Frontier Developments</div></footer>
@@ -3879,7 +3915,7 @@ DECOYTPL11
 </section>
 <section id="contact">
   <div class="section-head"><h2>Start a conversation</h2><p>No discovery calls, no decks. Send a couple of sentences about what's not working and we'll reply within a day or two.</p></div>
-  <a class="btn" href="mailto:hello@northfold.studio">hello@northfold.studio</a>
+  <a class="btn" href="#contact">hello@northfold.studio</a>
 </section>
 </main>
 <footer><div>Northfold Studio</div><div>Remote-first, small by design</div></footer>
@@ -5117,7 +5153,7 @@ cmd_healthcheck() {
     elif [[ -n "$NGINX443_PID" ]] && listener_cmdline_has "$NGINX443_PID" "nginx"; then
       check "nginx слушает 443 (подтверждено, pid ${NGINX443_PID})" ok
     elif [[ -n "$NGINX443_PID" ]]; then
-      NGINX443_CMD=$(tr '\0' ' ' < "/proc/${NGINX443_PID}/cmdline" 2>/dev/null | head -c 80)
+      NGINX443_CMD=$(tr '\0' ' ' < "/proc/${NGINX443_PID}/cmdline" 2>/dev/null | head -c 80 || true)
       check "На 443 слушает НЕ nginx (pid ${NGINX443_PID}: ${NGINX443_CMD})" fail
     else
       # v0.3.3: раньше здесь была отдельная ветка "ss ... 0.0.0.0:443 .*
@@ -5136,7 +5172,7 @@ cmd_healthcheck() {
   if [[ -n "$REALITY443_PID" ]] && listener_cmdline_has "$REALITY443_PID" "xray"; then
     check "Процесс слушает 127.0.0.1:443 (подтверждено xray, pid ${REALITY443_PID})" ok
   elif [[ -n "$REALITY443_PID" ]]; then
-    REALITY443_CMD=$(tr '\0' ' ' < "/proc/${REALITY443_PID}/cmdline" 2>/dev/null | head -c 80)
+    REALITY443_CMD=$(tr '\0' ' ' < "/proc/${REALITY443_PID}/cmdline" 2>/dev/null | head -c 80 || true)
     check "На 127.0.0.1:443 слушает НЕ xray (pid ${REALITY443_PID}: ${REALITY443_CMD})" fail
   else
     check "Никто не слушает 127.0.0.1:443 — Reality не поднят" fail
@@ -5196,7 +5232,7 @@ cmd_healthcheck() {
   if [[ -n "$PUBLIC80_PID" ]] && listener_cmdline_has "$PUBLIC80_PID" "nginx"; then
     check "Публичный :80 подтверждён как nginx (pid ${PUBLIC80_PID})" ok
   elif [[ -n "$PUBLIC80_PID" ]]; then
-    PUBLIC80_CMD=$(tr '\0' ' ' < "/proc/${PUBLIC80_PID}/cmdline" 2>/dev/null | head -c 80)
+    PUBLIC80_CMD=$(tr '\0' ' ' < "/proc/${PUBLIC80_PID}/cmdline" 2>/dev/null | head -c 80 || true)
     check "На публичном :80 слушает НЕ nginx (pid ${PUBLIC80_PID}: ${PUBLIC80_CMD}) — возможно Cover site" fail
   else
     check "Публичный :80 не прослушивается ни одним процессом" warn
@@ -5393,7 +5429,7 @@ cmd_healthcheck() {
   # ответ (сетевой флейк, см. legacy-wan-ip) — WARN, не FAIL.
   if [[ -n "${SERVER_IP:-}" ]]; then
     for d in "$DOMAIN" "$REALITY_DOMAIN"; do
-      disk_exp=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/${d}/fullchain.pem" 2>/dev/null | cut -d= -f2)
+      disk_exp=$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/${d}/fullchain.pem" 2>/dev/null | cut -d= -f2 || true)
       live_exp=$(curl -kvsI --max-time 8 "https://${d}" --resolve "${d}:443:${SERVER_IP}" -o /dev/null 2>&1 | grep -oP 'expire date:\s*\K.*' | head -n1 || true)
       if [[ -z "$disk_exp" ]]; then
         check "Сверка серта ${d}: серта нет на диске — пропуск (поймано выше)" warn
@@ -5459,7 +5495,7 @@ cmd_healthcheck() {
 
   echo "=== [7] Reality inbound в базе ==="
   if [[ -f "$XUIDB" ]]; then
-    backup_count=$(ls -1 "${XUIDB}.backup."* 2>/dev/null | wc -l)
+    backup_count=$(ls -1 "${XUIDB}.backup."* 2>/dev/null | wc -l || true)
     [[ "$backup_count" -gt 0 ]] && check "Бэкап(ы) БД: ${backup_count} шт." ok || check "Бэкапов БД не найдено" warn
 
     cnt=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbounds WHERE protocol='vless';" 2>/dev/null || echo 0)
@@ -5826,7 +5862,7 @@ cmd_healthcheck() {
   # открывает в ufw именно те порты, на которых слушает sshd; healthcheck —
   # отдельный прогон, SSH_PORTS из install тут не существует. Детекция та же,
   # что в install; фоллбэк "22" — как в install при невидимом sshd.
-  HC11_SSH_PORTS=$(ss -tlnp 2>/dev/null | grep 'sshd' | grep -oP ':\K[0-9]+(?= )' | sort -u || true)
+  HC11_SSH_PORTS=$(lucx_detect_ssh_ports)   # v0.6.4: тот же набор источников, что у install (ss, sshd -T, SSH_PORT)
   HC11_ALLOW_TCP=" 80 443 "
   if [[ -n "$HC11_SSH_PORTS" ]]; then
     for HC11_P in $HC11_SSH_PORTS; do HC11_ALLOW_TCP+="${HC11_P} "; done
@@ -5870,7 +5906,7 @@ cmd_healthcheck() {
     HC11_PID=$(grep -oP 'pid=\K[0-9]+' <<<"${HC11_REST}" | head -n1 || true)
     HC11_NAME="-"
     if [[ -n "$HC11_PID" && -r "/proc/${HC11_PID}/cmdline" ]]; then
-      HC11_NAME=$(tr '\0' ' ' < "/proc/${HC11_PID}/cmdline" 2>/dev/null | awk '{print $1}')
+      HC11_NAME=$(tr '\0' ' ' < "/proc/${HC11_PID}/cmdline" 2>/dev/null | awk '{print $1}' || true)
       HC11_NAME="${HC11_NAME##*/}"
       if [[ -z "$HC11_NAME" ]]; then HC11_NAME="-"; fi
     fi
@@ -5895,7 +5931,7 @@ cmd_healthcheck() {
     HC11_PID=$(grep -oP 'pid=\K[0-9]+' <<<"${HC11_REST}" | head -n1 || true)
     HC11_NAME="-"
     if [[ -n "$HC11_PID" && -r "/proc/${HC11_PID}/cmdline" ]]; then
-      HC11_NAME=$(tr '\0' ' ' < "/proc/${HC11_PID}/cmdline" 2>/dev/null | awk '{print $1}')
+      HC11_NAME=$(tr '\0' ' ' < "/proc/${HC11_PID}/cmdline" 2>/dev/null | awk '{print $1}' || true)
       HC11_NAME="${HC11_NAME##*/}"
       if [[ -z "$HC11_NAME" ]]; then HC11_NAME="-"; fi
     fi
@@ -6347,6 +6383,16 @@ cmd_panel_path() {
   local new
   if [[ -z "$want" ]]; then
     if [[ "$cur" != "/panel/" ]]; then
+      # v0.6.4: после прерванной смены пути nginx и БД уже на новом пути, а в creds остался старый URL — выравниваем по БД
+      local cu
+      cu=$(grep -m1 '^URL:' "$CREDS_FILE" | sed -E 's|^URL: https://[^/]+||' || true)
+      [[ -n "$cu" && "$cu" != */ ]] && cu="${cu}/"
+      if [[ -n "$cu" && "$cu" != "$cur" ]]; then
+        mkdir -p /root/.lucx-panelpath-backup && chmod 700 /root/.lucx-panelpath-backup
+        cp -a "$CREDS_FILE" "/root/.lucx-panelpath-backup/credentials.pre-sync.$(date +%s)"
+        sed -i -E "s|^(URL: https://[^/]+)/.*|\1${cur}|" "$CREDS_FILE"
+        echo "Исправил строку URL в ${CREDS_FILE}: путь панели по БД и nginx — ${cur} (было ${cu})."
+      fi
       echo "Путь панели уже нестандартный (${cur}) — ничего не меняю."
       echo "Задать другой: sudo bash $0 panel-path /новый-путь/"
       exit 0
@@ -6398,24 +6444,42 @@ cmd_panel_path() {
   sqlite3 "$XUIDB" ".backup ${bk}/x-ui.db"
   echo "Бэкап: ${bk}"
 
+  # v0.6.4: откат при ЛЮБОМ выходе после начала правок (ошибка, Ctrl+C, обрыв SSH): состояние — в глобальных переменных,
+  # потому что ловушка выхода срабатывает уже после выхода из функции
+  PP_BK="$bk"; PP_NG="$ng"; PP_CUR="$cur"; PP_XUI="$XUI_CLI"; PP_DOMAIN="$DOMAIN"; PP_ARMED=0
   pp_rollback() { # $1 причина
-    echo "ОТКАТ: $1"
-    cp -a "${bk}/nginx.conf" "$ng"
-    cp -a "${bk}/credentials" "$CREDS_FILE"
-    local old_nos="${cur#/}"
+    set +e
+    PP_ARMED=0
+    echo "ОТКАТ: $1" 2>/dev/null
+    cp -a "${PP_BK}/nginx.conf" "$PP_NG"
+    cp -a "${PP_BK}/credentials" "$CREDS_FILE"
+    local old_nos="${PP_CUR#/}"
     old_nos="${old_nos%/}"
-    "$XUI_CLI" setting -webBasePath "$old_nos" >/dev/null 2>&1 || true
-    if nginx -t >/dev/null 2>&1; then systemctl reload nginx || true; fi
-    systemctl restart x-ui || true
+    "$PP_XUI" setting -webBasePath "$old_nos" >/dev/null 2>&1
+    # если CLI не вернул путь (он же мог отказать и в прошлый раз) — возвращаем БД из бэкапа
+    local g
+    g=$(sqlite3 "$XUIDB" "SELECT value FROM settings WHERE key='webBasePath' LIMIT 1;" 2>/dev/null)
+    g="/${g#/}"; g="${g%/}/"
+    if [[ "$g" != "$PP_CUR" && -f "${PP_BK}/x-ui.db" ]]; then
+      systemctl stop x-ui
+      cp -a "${PP_BK}/x-ui.db" "$XUIDB"
+      rm -f "${XUIDB}-wal" "${XUIDB}-shm"
+    fi
+    if nginx -t >/dev/null 2>&1; then systemctl reload nginx; fi
+    systemctl restart x-ui
     sleep 8
     if systemctl is-active --quiet x-ui; then
-      echo "После отката панель на прежнем адресе: https://${DOMAIN}${cur}  (бэкап: ${bk})"
+      echo "После отката панель на прежнем адресе: https://${PP_DOMAIN}${PP_CUR}  (бэкап: ${PP_BK})" 2>/dev/null
     else
-      echo "ВНИМАНИЕ: после отката x-ui НЕ запущен. Смотри: journalctl -u x-ui -n 50 --no-pager ; восстановление из бэкапа: ${bk}"
-      journalctl -u x-ui -n 20 --no-pager 2>/dev/null || true
+      echo "ВНИМАНИЕ: после отката x-ui НЕ запущен. Смотри: journalctl -u x-ui -n 50 --no-pager ; восстановление из бэкапа: ${PP_BK}" 2>/dev/null
+      journalctl -u x-ui -n 20 --no-pager 2>/dev/null
     fi
     exit 1
   }
+  trap '' HUP
+  trap 'pp_rollback "прервано (Ctrl+C/сигнал)"' INT TERM
+  trap '[[ "${PP_ARMED:-0}" == "1" ]] && pp_rollback "неожиданный сбой"; lucx_xui_guard_fire' EXIT
+  PP_ARMED=1
 
   sed -i "s|location ${cur} {|location ${new} {|" "$ng"
   grep -qF "location ${new} {" "$ng" || pp_rollback "правка nginx не применилась"
@@ -6443,16 +6507,22 @@ cmd_panel_path() {
   sed -i -E "s|^(URL: https://[^/]+)/.*|\1${new}|" "$CREDS_FILE"
 
   local sip ext old_ext
-  sip=$(get_server_ip)
+  # IP для проверки снаружи — адрес, на котором реально слушает nginx (на сервере с несколькими IP ipify даёт другой)
+  sip=$(grep -oP '^\s*listen\s+\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(?=:443;)' /etc/nginx/stream-sni-router.conf 2>/dev/null | grep -v '^0\.0\.0\.0$' | head -n1 || true)
+  [[ -n "$sip" ]] || sip=$(get_server_ip)
   if [[ -n "$sip" ]]; then
     ext=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' --resolve "${DOMAIN}:443:${sip}" "https://${DOMAIN}${new}" 2>/dev/null || true)
     [[ "$ext" == "200" ]] || pp_rollback "снаружи новый адрес не открывается (код ${ext})"
     old_ext=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' --resolve "${DOMAIN}:443:${sip}" "https://${DOMAIN}${cur}" 2>/dev/null || true)
     echo "Проверка снаружи: новый адрес = ${ext}, старый = ${old_ext} (ждём 200 и не 200)"
+    [[ "$old_ext" == "200" ]] && echo "WARN: старый адрес всё ещё открывает панель — проверь: nginx -t && systemctl reload nginx"
   else
     echo "WARN: публичный IP не определён — проверка снаружи пропущена (смотри healthcheck)."
   fi
 
+  PP_ARMED=0              # всё проверено: откат больше не нужен
+  trap - HUP INT TERM
+  trap lucx_xui_guard_fire EXIT
   echo ""
   echo "OK: путь панели изменён."
   echo "  Новый адрес: https://${DOMAIN}${new}"
@@ -7338,6 +7408,7 @@ create_xhttp_inbound() {
 # откат целиком: stream-конфиг из бэкапа, БД из бэкапа (без XHTTP-инбаунда), вхосты nginx убраны.
 # Сертификат Let's Encrypt остаётся (безвреден, переиспользуется при повторе).
 xhttp_rollback_all() { # stream_backup db_backup
+  set +e   # v0.6.4: откат не должен обрываться на первой ошибке (вызывается и из ловушки выхода)
   local sbak="$1" dbak="${2:-}"
   [[ -n "$sbak" && -f "$sbak" ]] && cp -a "$sbak" /etc/nginx/stream-sni-router.conf
   xhttp_remove_vhosts
@@ -7345,12 +7416,27 @@ xhttp_rollback_all() { # stream_backup db_backup
     lucx_xui_stop
     sleep 1
     cp -a "$dbak" "$XUIDB"
+    rm -f "${XUIDB}-wal" "${XUIDB}-shm"
     lucx_xui_start || echo "  ВНИМАНИЕ: x-ui не запустился после отката — journalctl -u x-ui -n 50"
     sleep 2
   fi
   if nginx -t >/dev/null 2>&1; then
     systemctl reload nginx 2>/dev/null || true
   fi
+}
+
+# v0.6.4: откат add-xhttp при ЛЮБОМ выходе после начала правок (ошибка, Ctrl+C, обрыв SSH): без него сбой между двумя
+# правками stream-конфига оставлял на диске конфиг, с которым nginx не поднимется после перезагрузки.
+XH_ARMED=0; XH_SBAK=""
+xhttp_exit_trap() {
+  set +e
+  if [[ "${XH_ARMED:-0}" == "1" ]]; then
+    XH_ARMED=0
+    echo "Откат add-xhttp: возвращаю nginx-конфиг, БД и вхосты (схема как была; сертификат оставлен)."
+    xhttp_rollback_all "$XH_SBAK" "${XH_BAK:-}"
+    systemctl is-active --quiet x-ui && echo "x-ui active, схема как была." || echo "ВНИМАНИЕ: x-ui не active после отката — journalctl -u x-ui -n 50"
+  fi
+  lucx_xui_guard_fire
 }
 
 cmd_add_xhttp() {
@@ -7441,6 +7527,9 @@ cmd_add_xhttp() {
   sbak="/root/stream-sni-router.conf.pre-xhttp-${stamp}"
   cp -a "$stream_conf" "$sbak"
   echo "Бэкап nginx-конфига: ${sbak}"
+  XH_SBAK="$sbak"; XH_ARMED=1
+  trap '' HUP PIPE            # обрыв SSH не прерывает команду; любой выход откатывает (ловушка ниже)
+  trap xhttp_exit_trap EXIT
 
   # 1) nginx :80 — ACME и редирект для нового имени (отдельный файл, 80-redirect.conf не трогаем)
   mkdir -p "${webroot}/.well-known/acme-challenge"
@@ -7521,17 +7610,18 @@ EOF
   # 4) инбаунд + клиент
   create_xhttp_inbound || { xhttp_remove_vhosts; exit 1; }
   # 5) stream: имя -> xhttp_backend
-  sed -i "/^[[:space:]]*default[[:space:]]\+reality_backend;/i\\        ${xdom}        xhttp_backend;" "$stream_conf"
-  sed -i "/^[[:space:]]*upstream reality_backend[[:space:]]*{/a\\    upstream xhttp_backend { server 127.0.0.1:${XHTTP_PORT}; }" "$stream_conf"
+  # обе правки на копии, подмена одной операцией: сбой между ними не оставит полуготовый конфиг
+  cp -a "$stream_conf" "${stream_conf}.new"
+  sed -i "/^[[:space:]]*default[[:space:]]\+reality_backend;/i\\        ${xdom}        xhttp_backend;" "${stream_conf}.new"
+  sed -i "/^[[:space:]]*upstream reality_backend[[:space:]]*{/a\\    upstream xhttp_backend { server 127.0.0.1:${XHTTP_PORT}; }" "${stream_conf}.new"
+  mv -f "${stream_conf}.new" "$stream_conf"
   if ! nginx -t >/dev/null 2>&1; then
     echo "ОШИБКА: nginx -t не прошёл после правки stream-конфига — откатываю всё."
     { nginx -t 2>&1 | tail -3 | sed 's/^/    /'; } || true
-    xhttp_rollback_all "$sbak" "$XH_BAK"
     exit 1
   fi
   if ! systemctl reload nginx; then
     echo "ОШИБКА: reload nginx не прошёл после правки stream-конфига — откатываю всё."
-    xhttp_rollback_all "$sbak" "$XH_BAK"
     exit 1
   fi
   sleep 1
@@ -7555,10 +7645,12 @@ EOF
   selftest_443 0 "$fuuid" "$fpbk" "$fsid" || ok=1
   if [[ "$ok" != "0" ]]; then
     echo "ОШИБКА: самотест не прошёл — возвращаю nginx-конфиг, БД и вхосты (схема как была; сертификат ${xdom} оставлен)."
-    xhttp_rollback_all "$sbak" "$XH_BAK"
-    systemctl is-active --quiet x-ui && echo "x-ui active, схема как была." || echo "ВНИМАНИЕ: x-ui не active после отката — journalctl -u x-ui -n 50"
+    echo "  (БД возвращается на момент до add-xhttp: изменения за последние минуты — трафик, новые клиенты — не сохранятся.)"
     exit 1
   fi
+  XH_ARMED=0                  # самотест пройден: откат больше не нужен
+  trap - HUP PIPE
+  trap lucx_xui_guard_fire EXIT
   echo "$VERSION" > /root/.lucx-script-version
   local penc link
   penc="%2F${XH_PATH#/}"
@@ -7767,6 +7859,10 @@ cmd_backup() {
   if [[ $EUID -ne 0 ]]; then echo "Запусти от root: sudo bash $0 backup"; exit 1; fi
   if command -v flock >/dev/null 2>&1 && exec 9>/var/lock/lucx-backup.lock; then
     flock -n 9 || { echo "ОШИБКА: backup/restore уже выполняется."; exit 1; }
+  fi
+  # panel-path меняет nginx, БД и creds по очереди: архив, снятый посередине, получится смешанным
+  if command -v flock >/dev/null 2>&1 && exec 8>/var/lock/lucx-panel-path.lock; then
+    flock -n 8 || { echo "ОШИБКА: сейчас выполняется panel-path — дождись и повтори backup."; exit 1; }
   fi
   local t
   for t in sqlite3 openssl tar sha256sum; do

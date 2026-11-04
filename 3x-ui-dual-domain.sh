@@ -1156,24 +1156,31 @@ lucx_free_port() {
   echo "$1"
 }
 
-# v0.6.4: порт(ы) SSH для правил ufw. Источники по порядку: SSH_PORT от пользователя (числа через пробел/запятую),
-# слушатели sshd/dropbear в ss, `sshd -T`, порт текущего SSH-подключения (SSH_CONNECTION). Пусто = определить не удалось.
+# v0.6.4: порт(ы) SSH для правил ufw. Источники ОБЪЕДИНЯЮТСЯ (а не «первый найденный»): SSH_PORT от пользователя
+# (числа через пробел/запятую), слушатели sshd/dropbear в ss, порт текущего SSH-подключения (SSH_CONNECTION);
+# `sshd -T` — запасной, если всё пусто. Пусто = определить не удалось. Если SSH_PORT задан, но не содержит ни одного
+# порта — код 2 (вызывающий останавливается: молча терять введённое значение нельзя).
 lucx_detect_ssh_ports() {
   local p="" x
   if [[ -n "${SSH_PORT:-}" ]]; then
     for x in ${SSH_PORT//,/ }; do
-      [[ "$x" =~ ^[0-9]{1,5}$ ]] && (( 10#$x >= 1 && 10#$x <= 65535 )) && p+="$((10#$x)) "
+      if [[ "$x" =~ ^[0-9]{1,5}$ ]] && (( 10#$x >= 1 && 10#$x <= 65535 )); then p+="$((10#$x))"$'\n'; fi
     done
-    if [[ -n "$p" ]]; then echo "$p"; return 0; fi
+    if [[ -z "$p" ]]; then
+      echo "SSH_PORT='${SSH_PORT}' не похоже на порт (нужны числа 1-65535 через пробел/запятую)" >&2
+      return 2
+    fi
   fi
-  p=$(ss -tlnp 2>/dev/null | grep -E 'sshd|dropbear' | grep -oP ':\K[0-9]+(?= )' | sort -u | tr '\n' ' ' || true)
-  if [[ -z "${p// /}" ]] && command -v sshd >/dev/null 2>&1; then
-    p=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | sort -u | tr '\n' ' ' || true)
+  p+=$(ss -tlnp 2>/dev/null | grep -E 'sshd|dropbear' | grep -oP ':\K[0-9]+(?= )' || true)
+  p+=$'\n'
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    p+=$(echo "$SSH_CONNECTION" | awk '{print $4}')
+    p+=$'\n'
   fi
-  if [[ -z "${p// /}" && -n "${SSH_CONNECTION:-}" ]]; then
-    x=$(echo "$SSH_CONNECTION" | awk '{print $4}')
-    [[ "$x" =~ ^[0-9]{1,5}$ ]] && p="$x "
+  if [[ -z "$(tr -d ' \n' <<<"$p")" ]] && command -v sshd >/dev/null 2>&1; then
+    p+=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' || true)
   fi
+  p=$(grep -xE '[0-9]{1,5}' <<<"$p" | awk '$1>=1 && $1<=65535' | sort -un | tr '\n' ' ' || true)
   echo "${p% }"
   return 0
 }
@@ -2456,7 +2463,7 @@ cmd_install() {
   echo "=== [2/10] Проверки окружения ==="
   # v0.6.4: порт SSH нужен для ufw на [3/10]; определяем заранее. Не определился — стоп ДО включения ufw:
   # лучше остановить установку, чем включить фильтр и отрезать доступ по SSH.
-  SSH_PORTS=$(lucx_detect_ssh_ports)
+  SSH_PORTS=$(lucx_detect_ssh_ports) || { echo "ОШИБКА: ${SSH_PORT_ERR_HINT:-исправь SSH_PORT и запусти заново}"; exit 1; }
   if [[ -z "${SSH_PORTS// /}" ]]; then
     echo "ОШИБКА: не удалось определить порт SSH (sshd/dropbear не виден в ss, sshd -T пуст, запуск не по SSH)."
     echo "        ufw не включаю, чтобы не отрезать доступ к серверу. Укажи порт явно и запусти заново:"
@@ -5862,7 +5869,7 @@ cmd_healthcheck() {
   # открывает в ufw именно те порты, на которых слушает sshd; healthcheck —
   # отдельный прогон, SSH_PORTS из install тут не существует. Детекция та же,
   # что в install; фоллбэк "22" — как в install при невидимом sshd.
-  HC11_SSH_PORTS=$(lucx_detect_ssh_ports)   # v0.6.4: тот же набор источников, что у install (ss, sshd -T, SSH_PORT)
+  HC11_SSH_PORTS=$(lucx_detect_ssh_ports 2>/dev/null || true)   # v0.6.4: тот же набор источников, что у install (ss, sshd -T, SSH_PORT)
   HC11_ALLOW_TCP=" 80 443 "
   if [[ -n "$HC11_SSH_PORTS" ]]; then
     for HC11_P in $HC11_SSH_PORTS; do HC11_ALLOW_TCP+="${HC11_P} "; done
@@ -6476,7 +6483,7 @@ cmd_panel_path() {
     fi
     exit 1
   }
-  trap '' HUP
+  trap '' HUP PIPE
   trap 'pp_rollback "прервано (Ctrl+C/сигнал)"' INT TERM
   trap '[[ "${PP_ARMED:-0}" == "1" ]] && pp_rollback "неожиданный сбой"; lucx_xui_guard_fire' EXIT
   PP_ARMED=1
@@ -6521,7 +6528,7 @@ cmd_panel_path() {
   fi
 
   PP_ARMED=0              # всё проверено: откат больше не нужен
-  trap - HUP INT TERM
+  trap - HUP PIPE INT TERM
   trap lucx_xui_guard_fire EXIT
   echo ""
   echo "OK: путь панели изменён."
@@ -7367,7 +7374,8 @@ create_xhttp_inbound() {
   sleep 1
   XH_BAK="${XUIDB}.backup.$(date +%s)"
   if ! cp -a "$XUIDB" "$XH_BAK"; then
-    echo "  ОШИБКА: не удалось сделать бэкап БД (${XH_BAK}) — диск полон? БД не тронута."
+    rm -f "$XH_BAK"; XH_BAK=""   # частичную копию не оставляем: откат из ловушки не должен ставить её поверх рабочей БД
+    echo "  ОШИБКА: не удалось сделать бэкап БД — диск полон? БД не тронута."
     lucx_xui_start || true
     return 1
   fi
@@ -7411,7 +7419,13 @@ xhttp_rollback_all() { # stream_backup db_backup
   set +e   # v0.6.4: откат не должен обрываться на первой ошибке (вызывается и из ловушки выхода)
   local sbak="$1" dbak="${2:-}"
   [[ -n "$sbak" && -f "$sbak" ]] && cp -a "$sbak" /etc/nginx/stream-sni-router.conf
+  rm -f /etc/nginx/stream-sni-router.conf.new
   xhttp_remove_vhosts
+  # возвращаем только целую копию БД: недописанная (диск полон) не должна затереть рабочую
+  if [[ -n "$dbak" && -f "$dbak" && "$(sqlite3 "$dbak" 'PRAGMA integrity_check;' 2>/dev/null)" != "ok" ]]; then
+    echo "  ВНИМАНИЕ: бэкап БД ${dbak} повреждён — БД не трогаю"
+    dbak=""
+  fi
   if [[ -n "$dbak" && -f "$dbak" ]]; then
     lucx_xui_stop
     sleep 1
@@ -7528,7 +7542,7 @@ cmd_add_xhttp() {
   cp -a "$stream_conf" "$sbak"
   echo "Бэкап nginx-конфига: ${sbak}"
   XH_SBAK="$sbak"; XH_ARMED=1
-  trap '' HUP PIPE            # обрыв SSH не прерывает команду; любой выход откатывает (ловушка ниже)
+  trap '' HUP PIPE            # обрыв SSH → откат (ловушка ниже вернёт прежнее состояние)
   trap xhttp_exit_trap EXIT
 
   # 1) nginx :80 — ACME и редирект для нового имени (отдельный файл, 80-redirect.conf не трогаем)

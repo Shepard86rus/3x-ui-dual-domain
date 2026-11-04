@@ -926,8 +926,11 @@
 #   нет sqlite3 — понятная ошибка. Команда по-прежнему только читает.
 # v0.6.4 (2026-11-04) — новые команды `backup` и `restore`: перенос сервера целиком (клиенты, инбаунды, подписки, настройки).
 #   backup: зашифрованный архив (AES-256, пароль), консистентная копия БД, манифест с версиями; сертификаты по --with-certs.
-#   restore: на сервер с уже выполненным install (те же домены); проверки: пароль/целостность, панель здесь не старше архивной,
+#   restore: на сервер с уже выполненным install (те же домены); проверки: пароль/целостность, версия панели здесь не ниже архивной,
 #   домены совпадают (всегда стоп); страховочная копия, новый IP в stream-роутере (как rebind-ip), порты AWG в ufw, nginx -t, автооткат.
+#   rebind-ip (исправление существующей команды): sed меняет только строку `listen [IP:]443;` (раньше цеплял и `127.0.0.1:8443;`,
+#   `[::]:443;`), введённый вручную IP проверяется как IPv4, IP должен быть назначен интерфейсу сервера (иначе nginx не сможет
+#   его слушать), при провале nginx -t / restart / проверки порта прежний stream-конфиг возвращается автоматически.
 VERSION="0.6.4"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
@@ -6055,6 +6058,13 @@ cmd_healthcheck() {
 # ещё не переключена), правит listen-строку в stream-конфиге (обе формы:
 # legacy explicit и отозванный wildcard), бэкапит конфиг, валидирует,
 # перезапускает nginx и проверяет факт бинда через ss. Идемпотентен.
+# v0.6.4: единая правка listen в stream-роутере (rebind-ip и restore): только `listen [IPv4:]443;`;
+# 0 = после правки в файле есть listen <IP>:443;
+stream_set_listen_ip() {  # $1=IPv4 $2=файл
+  sed -i -E "s/^(\s*)listen\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:)?443;/\1listen $1:443;/" "$2"
+  grep -qE "^\s*listen\s+${1//./\\.}:443;" "$2"
+}
+
 cmd_rebind_ip() {
   if [[ $EUID -ne 0 ]]; then
     echo "Запусти от root: sudo bash $0 rebind-ip"
@@ -6072,6 +6082,15 @@ cmd_rebind_ip() {
   fi
   if [[ -z "$SERVER_IP" ]]; then
     echo "ОШИБКА: не удалось определить публичный IP."
+    exit 1
+  fi
+  if ! [[ "$SERVER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "ОШИБКА: '${SERVER_IP}' — не IPv4-адрес. Ничего не изменено."
+    exit 1
+  fi
+  if command -v ip >/dev/null 2>&1 && ! ip -4 -o addr show 2>/dev/null | grep -qw "$SERVER_IP"; then
+    echo "СТОП: ${SERVER_IP} не назначен ни одному интерфейсу сервера (NAT или другой исходящий адрес): nginx не сможет его слушать."
+    echo "      Ничего не изменено. Если нужен другой адрес — укажи тот, что виден в 'ip -4 addr'."
     exit 1
   fi
 
@@ -6094,25 +6113,35 @@ cmd_rebind_ip() {
     fi
   done
 
-  if grep -qE "listen ${SERVER_IP}:443;" "$STREAM_CONF"; then
+  if grep -qE "^\s*listen\s+${SERVER_IP//./\\.}:443;" "$STREAM_CONF"; then
     echo "listen-строка уже указывает на ${SERVER_IP} — ничего не меняю."
     exit 0
   fi
 
-  cp "$STREAM_CONF" "${STREAM_CONF}.backup.$(date +%s)"
-  # В server{} ровно одна listen-строка — меняем любую форму (explicit IP или wildcard)
-  sed -i -E "s/^\s*listen\s+[^;]*443;/        listen ${SERVER_IP}:443;/" "$STREAM_CONF"
-  if ! grep -qE "listen ${SERVER_IP}:443;" "$STREAM_CONF"; then
-    echo "ОШИБКА: sed не применился — смотри ${STREAM_CONF} (бэкап: ${STREAM_CONF}.backup.*)"
+  local rb_bak; rb_bak="${STREAM_CONF}.backup.$(date +%s)"
+  cp -p "$STREAM_CONF" "$rb_bak"
+  # меняется только строка `listen [IP:]443;` (explicit IP или wildcard); других строк sed не касается
+  if ! stream_set_listen_ip "$SERVER_IP" "$STREAM_CONF"; then
+    cp -p "$rb_bak" "$STREAM_CONF"
+    echo "ОШИБКА: в ${STREAM_CONF} нет строки listen [IP:]443; — ничего не изменено."
     exit 1
   fi
   echo "listen-строка обновлена -> ${SERVER_IP}:443"
 
-  nginx -t || { echo "ОШИБКА: nginx -t не прошёл. Откат: cp ${STREAM_CONF}.backup.* ${STREAM_CONF}"; exit 1; }
-  systemctl restart nginx
+  if ! nginx -t; then
+    cp -p "$rb_bak" "$STREAM_CONF"
+    echo "ОШИБКА: nginx -t не прошёл — прежний stream-конфиг возвращён."
+    exit 1
+  fi
+  if ! systemctl restart nginx; then
+    cp -p "$rb_bak" "$STREAM_CONF"; systemctl restart nginx || true
+    echo "ОШИБКА: nginx не перезапустился — прежний stream-конфиг возвращён."
+    exit 1
+  fi
   sleep 1
   if ! ss -tlnp 2>/dev/null | grep -qE "${SERVER_IP//./\.}:443\b.*nginx"; then
-    echo "ОШИБКА: nginx не подтверждён на ${SERVER_IP}:443 после restart:"
+    cp -p "$rb_bak" "$STREAM_CONF"; systemctl restart nginx || true
+    echo "ОШИБКА: nginx не подтверждён на ${SERVER_IP}:443 после restart — прежний stream-конфиг возвращён:"
     ss -tlnp | grep ':443 ' || true
     exit 1
   fi
@@ -7679,7 +7708,15 @@ bk_man_get() { grep -m1 "^$2=" "$1" 2>/dev/null | cut -d= -f2- || true; }
 # Состояние restore в глобальных переменных: ловушка EXIT должна видеть их после exit внутри функции
 BK_STAGE=""; BK_PART=""; BK_SAFE=""; BK_ARMED=0
 
+# вывод, который не падает при закрытом терминале (обрыв SSH) и дублируется в журнал
+bk_say() {
+  [[ -n "$BK_SAFE" && -d "$BK_SAFE" ]] && echo "$*" >> "$BK_SAFE/restore.log" 2>/dev/null
+  echo "$*" 2>/dev/null
+  return 0
+}
+
 bk_cleanup() {
+  set +e
   [[ -n "$BK_STAGE" ]] && rm -rf "$BK_STAGE"
   [[ -n "$BK_PART" ]] && rm -f "$BK_PART"
   if [[ "$BK_ARMED" == "1" ]]; then BK_ARMED=0; bk_rollback; fi
@@ -7689,24 +7726,27 @@ bk_cleanup() {
 # Откат: возвращает каталоги ЗАМЕНОЙ (файлы, появившиеся из архива, удаляются). Не падает на первой ошибке.
 bk_rollback() {
   set +e
-  echo "Откат из ${BK_SAFE} ..."
+  local rb_bad=0
+  bk_say "Откат из ${BK_SAFE} ..."
   lucx_xui_stop 2>/dev/null
-  cp -p "$BK_SAFE/x-ui.db" "${XUIDB}.rb" && mv -f "${XUIDB}.rb" "$XUIDB"; rm -f "${XUIDB}-wal" "${XUIDB}-shm"
-  cp -p "$BK_SAFE/lucx-credentials" "${CREDS_FILE}.rb" && mv -f "${CREDS_FILE}.rb" "$CREDS_FILE"
+  cp -p "$BK_SAFE/x-ui.db" "${XUIDB}.rb" && mv -f "${XUIDB}.rb" "$XUIDB" || { rb_bad=1; bk_say "ВНИМАНИЕ: не удалось вернуть БД — возьми вручную ${BK_SAFE}/x-ui.db"; }
+  rm -f "${XUIDB}-wal" "${XUIDB}-shm"
+  cp -p "$BK_SAFE/lucx-credentials" "${CREDS_FILE}.rb" && mv -f "${CREDS_FILE}.rb" "$CREDS_FILE" || { rb_bad=1; bk_say "ВНИМАНИЕ: не удалось вернуть creds — возьми вручную ${BK_SAFE}/lucx-credentials"; }
   local d
   for d in sites-available sites-enabled conf.d; do
     [[ -d "$BK_SAFE/nginx/$d" ]] && { rm -rf "/etc/nginx/$d"; cp -a "$BK_SAFE/nginx/$d" /etc/nginx/; }
   done
-  [[ -f "$BK_SAFE/nginx/stream-sni-router.conf" ]] && cp -p "$BK_SAFE/nginx/stream-sni-router.conf" /etc/nginx/
+  if [[ -f "$BK_SAFE/nginx/stream-sni-router.conf" ]]; then cp -p "$BK_SAFE/nginx/stream-sni-router.conf" /etc/nginx/
+  elif [[ -f "$BK_SAFE/no-stream" ]]; then rm -f /etc/nginx/stream-sni-router.conf; fi
   if [[ -d "$BK_SAFE/amneziawg" ]]; then rm -rf /etc/amnezia/amneziawg; cp -a "$BK_SAFE/amneziawg" /etc/amnezia/amneziawg
   elif [[ -f "$BK_SAFE/no-amneziawg" ]]; then rm -rf /etc/amnezia/amneziawg; fi
-  [[ -f "$BK_SAFE/letsencrypt.tar" ]] && tar -C /etc -xf "$BK_SAFE/letsencrypt.tar"
+  [[ -f "$BK_SAFE/letsencrypt.tar" ]] && { rm -rf /etc/letsencrypt; tar -C /etc -xf "$BK_SAFE/letsencrypt.tar"; }
   lucx_xui_start
   if nginx -t >/dev/null 2>&1; then
     systemctl restart nginx
-    echo "Откат выполнен: конфиги и БД возвращены."
+    if [[ $rb_bad -eq 0 ]]; then bk_say "Откат выполнен: конфиги и БД возвращены."; else bk_say "Откат выполнен НЕ полностью — см. ВНИМАНИЕ выше; копии в ${BK_SAFE}"; fi
   else
-    echo "ВНИМАНИЕ: после отката nginx -t НЕ проходит — не перезагружай сервер, смотри ${BK_SAFE}"
+    bk_say "ВНИМАНИЕ: после отката nginx -t НЕ проходит — не перезагружай сервер, смотри ${BK_SAFE}"
   fi
 }
 
@@ -7800,13 +7840,14 @@ cmd_backup() {
   chmod 600 "${out}.part"
   mv "${out}.part" "$out"; BK_PART=""
 
-  local u="${SUDO_USER:-root}"
+  local u="${SUDO_USER:-$(logname 2>/dev/null || echo root)}" uh=""
+  uh=$(getent passwd "$u" 2>/dev/null | cut -d: -f6 || true)
   echo "OK: архив создан: ${out} ($(du -h "$out" | cut -f1))"
   echo "  панель: $(bk_man_get "$stage/MANIFEST" lucx_version), домен: ${DOMAIN}, сертификаты в архиве: $([[ $with_certs -eq 1 ]] && echo да || echo нет)"
   echo "  Внутри ключи и клиенты — храни как секрет; пароль архива восстановить нельзя."
-  if [[ "$u" != "root" ]]; then
-    echo "  Архив лежит в /root. Чтобы скачать под пользователем ${u}:"
-    echo "    sudo cp '${out}' /home/${u}/ && sudo chown ${u}: '/home/${u}/$(basename "$out")'"
+  if [[ "$u" != "root" && -n "$uh" ]]; then
+    echo "  Архив лежит в ${out} (доступен только root). Чтобы скачать под пользователем ${u}:"
+    echo "    sudo cp '${out}' '${uh}/' && sudo chown ${u}: '${uh}/$(basename "$out")'"
     echo "    scp ${u}@${DOMAIN}:$(basename "$out") .   (порт SSH — свой, если не 22: scp -P)"
   else
     echo "  Скачать на свой компьютер:  scp root@${DOMAIN}:${out} .   (или через Termius/SFTP)"
@@ -7864,12 +7905,26 @@ cmd_restore() {
   [[ "$(sqlite3 "$D/x-ui.db" 'PRAGMA integrity_check;' 2>/dev/null)" == "ok" ]] \
     || { echo "ОШИБКА: БД в архиве не проходит integrity_check."; exit 1; }
 
+  # вложенный tar сертификатов и симлинки: проверяем пути до изменений
+  if [[ -n "$(find "$stage/x" -type l 2>/dev/null)" ]]; then
+    echo "ОШИБКА: в архиве есть симлинки — так не делает скрипт backup. Сервер не тронут."; exit 1
+  fi
+  if [[ -f "$D/letsencrypt.tar" ]] && tar -tf "$D/letsencrypt.tar" | grep -qvE '^letsencrypt(/[^/]+)*/?$|(^|/)\.\.(/|$)'; then
+    echo "ОШИБКА: недопустимые пути в сертификатах архива. Сервер не тронут."; exit 1
+  fi
+  if [[ -f "$D/letsencrypt.tar" ]] && tar -tf "$D/letsencrypt.tar" | grep -qE '(^|/)\.\.(/|$)'; then
+    echo "ОШИБКА: недопустимые пути в сертификатах архива. Сервер не тронут."; exit 1
+  fi
+
   # значения из манифеста — данные, не команды: оставляем только безопасные формы
   local sites_ok="" ports_ok="" s p
-  for s in $(set -f; bk_man_get "$M" enabled_sites); do
+  local -a arr=()
+  read -ra arr <<<"$(bk_man_get "$M" enabled_sites)"   # read -a: слова без раскрытия шаблонов
+  for s in "${arr[@]}"; do
     [[ "$s" =~ ^[A-Za-z0-9._-]+\.conf$ ]] && sites_ok+="$s "
   done
-  for p in $(set -f; bk_man_get "$M" awg_ports); do
+  arr=(); read -ra arr <<<"$(bk_man_get "$M" awg_ports)"
+  for p in "${arr[@]}"; do
     [[ "$p" =~ ^[0-9]{1,5}$ ]] && (( 10#$p >= 1 && 10#$p <= 65535 )) && ports_ok+="$((10#$p)) "
   done
 
@@ -7945,7 +8000,11 @@ cmd_restore() {
   for d in sites-available sites-enabled conf.d; do
     cp -a "/etc/nginx/$d" "$BK_SAFE/nginx/" || { echo "ОШИБКА: страховочная копия nginx/${d}. Ничего не изменено."; exit 1; }
   done
-  cp -p /etc/nginx/stream-sni-router.conf "$BK_SAFE/nginx/" 2>/dev/null || true
+  if [[ -f /etc/nginx/stream-sni-router.conf ]]; then
+    cp -p /etc/nginx/stream-sni-router.conf "$BK_SAFE/nginx/" || { echo "ОШИБКА: страховочная копия stream-конфига. Ничего не изменено."; exit 1; }
+  else
+    : > "$BK_SAFE/no-stream"
+  fi
   if [[ -d /etc/amnezia/amneziawg ]]; then
     cp -a /etc/amnezia/amneziawg "$BK_SAFE/amneziawg" || { echo "ОШИБКА: страховочная копия AWG. Ничего не изменено."; exit 1; }
   else
@@ -7960,15 +8019,20 @@ cmd_restore() {
   trap '' HUP          # обрыв SSH не должен прервать применение посередине
   BK_ARMED=1
   if [[ $use_certs -eq 1 && -f "$D/letsencrypt.tar" ]]; then
-    echo "Сертификаты из архива -> /etc/letsencrypt (поверх существующих)"
+    bk_say "Сертификаты из архива -> /etc/letsencrypt (поверх существующих)"
     tar -C /etc -xf "$D/letsencrypt.tar"
   fi
-  cp -p "$D/x-ui.db" "${XUIDB}.new" && mv -f "${XUIDB}.new" "$XUIDB"
+  # отдельные команды (не &&-цепочки): сбой любой из них под set -e останавливает скрипт и запускает откат
+  cp -p "$D/x-ui.db" "${XUIDB}.new"
+  mv -f "${XUIDB}.new" "$XUIDB"
   rm -f "${XUIDB}-wal" "${XUIDB}-shm"
-  cp -p "$D/lucx-credentials" "${CREDS_FILE}.new" && chmod 600 "${CREDS_FILE}.new" && mv -f "${CREDS_FILE}.new" "$CREDS_FILE"
+  cp -p "$D/lucx-credentials" "${CREDS_FILE}.new"
+  chmod 600 "${CREDS_FILE}.new"
+  mv -f "${CREDS_FILE}.new" "$CREDS_FILE"
   if [[ -d "$D/amneziawg" ]]; then
-    mkdir -p /etc/amnezia/amneziawg
-    cp -a "$D/amneziawg/." /etc/amnezia/amneziawg/
+    rm -rf /etc/amnezia/amneziawg          # заменой целиком: второй интерфейс от install остаться не должен
+    mkdir -p /etc/amnezia
+    cp -a "$D/amneziawg" /etc/amnezia/amneziawg
   fi
   [[ -f "$D/nginx/stream-sni-router.conf" ]] && cp -p "$D/nginx/stream-sni-router.conf" /etc/nginx/
   [[ -d "$D/nginx/conf.d" ]] && cp -a "$D/nginx/conf.d/." /etc/nginx/conf.d/
@@ -7982,38 +8046,40 @@ cmd_restore() {
   # listen stream-роутера -> IP этого сервера (явный адрес, как в rebind-ip; wildcard тоже приводим к явному)
   local SC="/etc/nginx/stream-sni-router.conf"
   if [[ -f "$SC" ]] && ! grep -qE "^\s*listen\s+${SERVER_IP//./\\.}:443;" "$SC"; then
-    sed -i -E "s/^(\s*)listen\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:)?443;/\1listen ${SERVER_IP}:443;/" "$SC"
-    grep -qE "^\s*listen\s+${SERVER_IP//./\\.}:443;" "$SC" || { echo "ОШИБКА: listen-строка stream-роутера не обновилась."; exit 1; }
-    echo "stream-роутер: listen -> ${SERVER_IP}:443"
+    stream_set_listen_ip "$SERVER_IP" "$SC" || { bk_say "ОШИБКА: listen-строка stream-роутера не обновилась."; exit 1; }
+    bk_say "stream-роутер: listen -> ${SERVER_IP}:443"
   fi
   if ! nginx -t >/dev/null 2>&1; then
-    echo "ОШИБКА: nginx -t не прошёл после подстановки конфигов:"; { nginx -t 2>&1 | tail -5; } || true
+    bk_say "ОШИБКА: nginx -t не прошёл после подстановки конфигов:"; { nginx -t 2>&1 | tail -5; } || true
     exit 1
   fi
 
   # порты: install уже открыл 22/80/443 и свой AWG-порт; добавляем порты AWG из архива (повтор безопасен)
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
     for p in $ports_ok; do
-      ufw allow "${p}/udp" >/dev/null 2>&1 && echo "ufw: ${p}/udp открыт (порт AWG из архива)"
+      ufw allow "${p}/udp" >/dev/null 2>&1 && bk_say "ufw: ${p}/udp открыт (порт AWG из архива)"
     done
   fi
 
-  systemctl restart nginx || { echo "ОШИБКА: nginx не перезапустился."; exit 1; }
+  systemctl restart nginx || { bk_say "ОШИБКА: nginx не перезапустился."; exit 1; }
   sleep 1
-  ss -tlnp 2>/dev/null | grep -qE "${SERVER_IP//./\\.}:443\b.*nginx" || { echo "ОШИБКА: nginx не слушает ${SERVER_IP}:443 после restart."; exit 1; }
-  lucx_xui_start || { echo "ОШИБКА: x-ui не стартовал после восстановления."; exit 1; }
+  if command -v ss >/dev/null 2>&1 && ! grep -qE "${SERVER_IP//./\\.}:443\b.*nginx" <<<"$(ss -tlnp 2>/dev/null)"; then
+    bk_say "ОШИБКА: nginx не слушает ${SERVER_IP}:443 после restart."; exit 1
+  fi
+  lucx_xui_start || { bk_say "ОШИБКА: x-ui не стартовал после восстановления."; exit 1; }
   sleep 3
-  systemctl is-active --quiet x-ui || { echo "ОШИБКА: x-ui не работает после восстановления."; exit 1; }
+  systemctl is-active --quiet x-ui || { bk_say "ОШИБКА: x-ui не работает после восстановления."; exit 1; }
   BK_ARMED=0
-  trap bk_cleanup EXIT   # сброс HUP: дальше обычное поведение
+  trap - HUP             # сброс игнорирования HUP: дальше обычное поведение
+  trap bk_cleanup EXIT
 
-  echo "OK: восстановлено (панель и nginx запущены). Работу клиентов проверь сам: sudo bash $0 healthcheck и подключение с телефона."
-  if pgrep -f 'xray-linux' >/dev/null 2>&1; then echo "  xray запущен."; else echo "  WARN: процесс xray не найден — подожди минуту, затем смотри: journalctl -u x-ui -n 50"; fi
+  bk_say "OK: восстановлено (панель и nginx запущены). Работу клиентов проверь сам: sudo bash $0 healthcheck и подключение с телефона."
+  if pgrep -f 'xray-linux' >/dev/null 2>&1; then bk_say "  xray запущен."; else bk_say "  WARN: процесс xray не найден — подожди минуту, затем смотри: journalctl -u x-ui -n 50"; fi
   local pl
   pl=$(sqlite3 -readonly "$XUIDB" "SELECT port||'/'||protocol FROM inbounds WHERE enable=1 AND (listen IS NULL OR listen='' OR listen NOT LIKE '127.%') ORDER BY port;" 2>/dev/null | tr '\n' ' ' || true)
-  [[ -n "$pl" ]] && echo "  Порты инбаундов из БД, доступные снаружи: ${pl}— сверь с 'ufw status' (скрипт открывает только 22/80/443 и порты AWG)."
-  echo "  Старый сервер выключи или останови там бота: один токен Telegram у двух серверов мешает; удали ${BK_SAFE} после проверки (там секреты)."
-  echo "  Если у старого сервера был бот: sudo bash $0 add-bot. AWG: проверь подключение клиента; при необходимости перезагрузи сервер."
+  [[ -n "$pl" ]] && bk_say "  Порты инбаундов из БД, доступные снаружи: ${pl}— сверь с 'ufw status' (скрипт открывает только 22/80/443 и порты AWG)."
+  bk_say "  Старый сервер выключи или останови там бота: один токен Telegram у двух серверов мешает; удали ${BK_SAFE} после проверки (там секреты)."
+  bk_say "  Если у старого сервера был бот: sudo bash $0 add-bot. AWG: проверь подключение клиента; при необходимости перезагрузи сервер."
 }
 
 # ================== РАЗБОР АРГУМЕНТОВ ==================

@@ -927,7 +927,7 @@
 # v0.6.4 (2026-11-04) — новые команды `backup` и `restore`: перенос сервера целиком (клиенты, инбаунды, подписки, настройки).
 #   backup: зашифрованный архив (AES-256, пароль), консистентная копия БД, манифест с версиями; сертификаты по --with-certs.
 #   restore: на сервер с уже выполненным install (те же домены); проверки: пароль/целостность, панель здесь не старше архивной,
-#   домены совпадают; страховочная копия, новый IP в stream-роутере (как rebind-ip), порты AWG в ufw, nginx -t, автооткат.
+#   домены совпадают (всегда стоп); страховочная копия, новый IP в stream-роутере (как rebind-ip), порты AWG в ufw, nginx -t, автооткат.
 VERSION="0.6.4"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
@@ -7648,17 +7648,20 @@ cmd_remove_xhttp() {
 #           НЕ входит: сертификаты (на новом сервере install выпустит свои; --with-certs кладёт и их), заглушки (их ставит install),
 #           бот управления (add-bot заново), сам x-ui/xray/AWG-модуль (ставит install).
 # restore — на сервер, где УЖЕ выполнен install с теми же доменами. Порядок переноса: backup -> A-записи на новый IP ->
-#           install на новом сервере (те же домены) -> restore. Версия панели на новом сервере должна быть не старше архивной.
+#           install на новом сервере (те же домены) -> restore. Версия панели на новом сервере должна быть не ниже архивной.
 
 BK_FORMAT="1"
 
 bk_get_pass() {  # $1 = confirm(1|0)
-  if [[ -n "${LUCX_BACKUP_PASS:-}" ]]; then return 0; fi
   local p1 p2
-  read -rsp "Пароль архива: " p1; echo
+  if [[ -n "${LUCX_BACKUP_PASS:-}" ]]; then
+    if [[ "${1:-0}" == "1" && ${#LUCX_BACKUP_PASS} -lt 8 ]]; then echo "ОШИБКА: пароль короче 8 символов."; return 1; fi
+    return 0
+  fi
+  read -rsp "Пароль архива: " p1 || p1=""; echo
   [[ -n "$p1" ]] || { echo "ОШИБКА: пустой пароль."; return 1; }
   if [[ "${1:-0}" == "1" ]]; then
-    read -rsp "Повтори пароль: " p2; echo
+    read -rsp "Повтори пароль: " p2 || p2=""; echo
     [[ "$p1" == "$p2" ]] || { echo "ОШИБКА: пароли не совпали."; return 1; }
     [[ ${#p1} -ge 8 ]] || { echo "ОШИБКА: пароль короче 8 символов."; return 1; }
   fi
@@ -7673,6 +7676,40 @@ bk_ver_ge() { [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" == "$2" ]
 
 bk_man_get() { grep -m1 "^$2=" "$1" 2>/dev/null | cut -d= -f2- || true; }
 
+# Состояние restore в глобальных переменных: ловушка EXIT должна видеть их после exit внутри функции
+BK_STAGE=""; BK_PART=""; BK_SAFE=""; BK_ARMED=0
+
+bk_cleanup() {
+  [[ -n "$BK_STAGE" ]] && rm -rf "$BK_STAGE"
+  [[ -n "$BK_PART" ]] && rm -f "$BK_PART"
+  if [[ "$BK_ARMED" == "1" ]]; then BK_ARMED=0; bk_rollback; fi
+  lucx_xui_guard_fire
+}
+
+# Откат: возвращает каталоги ЗАМЕНОЙ (файлы, появившиеся из архива, удаляются). Не падает на первой ошибке.
+bk_rollback() {
+  set +e
+  echo "Откат из ${BK_SAFE} ..."
+  lucx_xui_stop 2>/dev/null
+  cp -p "$BK_SAFE/x-ui.db" "${XUIDB}.rb" && mv -f "${XUIDB}.rb" "$XUIDB"; rm -f "${XUIDB}-wal" "${XUIDB}-shm"
+  cp -p "$BK_SAFE/lucx-credentials" "${CREDS_FILE}.rb" && mv -f "${CREDS_FILE}.rb" "$CREDS_FILE"
+  local d
+  for d in sites-available sites-enabled conf.d; do
+    [[ -d "$BK_SAFE/nginx/$d" ]] && { rm -rf "/etc/nginx/$d"; cp -a "$BK_SAFE/nginx/$d" /etc/nginx/; }
+  done
+  [[ -f "$BK_SAFE/nginx/stream-sni-router.conf" ]] && cp -p "$BK_SAFE/nginx/stream-sni-router.conf" /etc/nginx/
+  if [[ -d "$BK_SAFE/amneziawg" ]]; then rm -rf /etc/amnezia/amneziawg; cp -a "$BK_SAFE/amneziawg" /etc/amnezia/amneziawg
+  elif [[ -f "$BK_SAFE/no-amneziawg" ]]; then rm -rf /etc/amnezia/amneziawg; fi
+  [[ -f "$BK_SAFE/letsencrypt.tar" ]] && tar -C /etc -xf "$BK_SAFE/letsencrypt.tar"
+  lucx_xui_start
+  if nginx -t >/dev/null 2>&1; then
+    systemctl restart nginx
+    echo "Откат выполнен: конфиги и БД возвращены."
+  else
+    echo "ВНИМАНИЕ: после отката nginx -t НЕ проходит — не перезагружай сервер, смотри ${BK_SAFE}"
+  fi
+}
+
 cmd_backup() {
   local out="" with_certs=0 a
   for a in "$@"; do
@@ -7683,6 +7720,10 @@ cmd_backup() {
     esac
   done
   if [[ $EUID -ne 0 ]]; then echo "Запусти от root: sudo bash $0 backup"; exit 1; fi
+  if command -v flock >/dev/null 2>&1 && exec 9>/var/lock/lucx-backup.lock; then
+    flock -n 9 || { echo "ОШИБКА: backup/restore уже выполняется."; exit 1; }
+  fi
+  local t
   for t in sqlite3 openssl tar sha256sum; do
     command -v "$t" >/dev/null 2>&1 || { echo "ОШИБКА: не найден ${t}."; exit 1; }
   done
@@ -7697,9 +7738,10 @@ cmd_backup() {
   bk_get_pass 1 || exit 1
 
   umask 077
+  rm -rf /root/.lucx-bk.* 2>/dev/null || true   # остатки прерванных запусков (там расшифрованные данные)
   stage=$(mktemp -d /root/.lucx-bk.XXXXXX) || { echo "ОШИБКА: не создать временный каталог."; exit 1; }
-  # shellcheck disable=SC2064
-  trap "rm -rf '$stage'; lucx_xui_guard_fire" EXIT
+  BK_STAGE="$stage"; BK_PART="${out}.part"
+  trap bk_cleanup EXIT
   mkdir -p "$stage/data"
 
   # консистентная копия БД (панель может писать в неё прямо сейчас)
@@ -7730,7 +7772,7 @@ cmd_backup() {
 
   local xbin xv=""
   xbin="/usr/local/x-ui/bin/xray-linux-$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')"
-  [[ -x "$xbin" ]] && xv=$("$xbin" -version 2>/dev/null | head -1 | awk '{print $2}')
+  [[ -x "$xbin" ]] && xv=$("$xbin" -version 2>/dev/null | head -1 | awk '{print $2}' || true)
   {
     echo "format=${BK_FORMAT}"
     echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -7749,21 +7791,31 @@ cmd_backup() {
     echo "enabled_sites=${enabled% }"
     echo "db_sha256=$(sha256sum "$stage/data/x-ui.db" | awk '{print $1}')"
   } > "$stage/MANIFEST"
+  # контрольные суммы всех файлов данных (AES-CBC без MAC: так видна порча/подмена)
+  (cd "$stage/data" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$stage/FILES.sha256"
 
-  tar -C "$stage" -czf "$stage/payload.tgz" MANIFEST data || { echo "ОШИБКА: tar."; exit 1; }
+  tar -C "$stage" -czf "$stage/payload.tgz" MANIFEST FILES.sha256 data || { echo "ОШИБКА: tar."; exit 1; }
   openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -pass env:LUCX_BACKUP_PASS \
-    -in "$stage/payload.tgz" -out "$out" || { echo "ОШИБКА: шифрование."; rm -f "$out"; exit 1; }
-  chmod 600 "$out"
+    -in "$stage/payload.tgz" -out "${out}.part" || { echo "ОШИБКА: шифрование."; exit 1; }
+  chmod 600 "${out}.part"
+  mv "${out}.part" "$out"; BK_PART=""
 
+  local u="${SUDO_USER:-root}"
   echo "OK: архив создан: ${out} ($(du -h "$out" | cut -f1))"
   echo "  панель: $(bk_man_get "$stage/MANIFEST" lucx_version), домен: ${DOMAIN}, сертификаты в архиве: $([[ $with_certs -eq 1 ]] && echo да || echo нет)"
   echo "  Внутри ключи и клиенты — храни как секрет; пароль архива восстановить нельзя."
-  echo "  Скачать на свой компьютер:  scp root@${DOMAIN}:${out} .   (или через Termius/SFTP)"
+  if [[ "$u" != "root" ]]; then
+    echo "  Архив лежит в /root. Чтобы скачать под пользователем ${u}:"
+    echo "    sudo cp '${out}' /home/${u}/ && sudo chown ${u}: '/home/${u}/$(basename "$out")'"
+    echo "    scp ${u}@${DOMAIN}:$(basename "$out") .   (порт SSH — свой, если не 22: scp -P)"
+  else
+    echo "  Скачать на свой компьютер:  scp root@${DOMAIN}:${out} .   (или через Termius/SFTP)"
+  fi
   echo "  Перенос: A-записи на новый IP -> install на новом сервере с теми же доменами -> sudo bash $0 restore <файл>"
 }
 
 cmd_restore() {
-  local in="" assume_yes=0 force=0 use_certs=0 a
+  local in="" assume_yes=0 force=0 use_certs=0 a ans
   for a in "$@"; do
     case "$a" in
       -y|--yes) assume_yes=1 ;;
@@ -7775,9 +7827,10 @@ cmd_restore() {
   done
   if [[ $EUID -ne 0 ]]; then echo "Запусти от root: sudo bash $0 restore <файл>"; exit 1; fi
   [[ -n "$in" && -f "$in" ]] || { echo "Использование: sudo bash $0 restore <файл.lucxbak> [--yes] [--certs] [--force]"; exit 1; }
-  if command -v flock >/dev/null 2>&1 && exec 9>/var/lock/lucx-restore.lock; then
-    flock -n 9 || { echo "ОШИБКА: restore уже выполняется."; exit 1; }
+  if command -v flock >/dev/null 2>&1 && exec 9>/var/lock/lucx-backup.lock; then
+    flock -n 9 || { echo "ОШИБКА: backup/restore уже выполняется."; exit 1; }
   fi
+  local t
   for t in sqlite3 openssl tar sha256sum nginx; do
     command -v "$t" >/dev/null 2>&1 || { echo "ОШИБКА: не найден ${t}."; exit 1; }
   done
@@ -7787,96 +7840,132 @@ cmd_restore() {
 
   bk_get_pass 0 || exit 1
   umask 077
+  rm -rf /root/.lucx-bk.* 2>/dev/null || true
   local stage
   stage=$(mktemp -d /root/.lucx-bk.XXXXXX) || { echo "ОШИБКА: не создать временный каталог."; exit 1; }
-  # shellcheck disable=SC2064
-  trap "rm -rf '$stage'; lucx_xui_guard_fire" EXIT
+  BK_STAGE="$stage"
+  trap bk_cleanup EXIT
   if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -pass env:LUCX_BACKUP_PASS -in "$in" -out "$stage/payload.tgz" 2>/dev/null \
      || ! tar -tzf "$stage/payload.tgz" >/dev/null 2>&1; then
     echo "ОШИБКА: неверный пароль или повреждённый архив. Сервер не тронут."; exit 1
   fi
+  if tar -tzf "$stage/payload.tgz" | grep -qE '(^/|(^|/)\.\.(/|$))'; then
+    echo "ОШИБКА: в архиве недопустимые пути (абсолютные или с ..). Сервер не тронут."; exit 1
+  fi
   mkdir -p "$stage/x"
-  tar -C "$stage/x" -xzf "$stage/payload.tgz" || { echo "ОШИБКА: распаковка."; exit 1; }
+  tar -C "$stage/x" --no-same-owner -xzf "$stage/payload.tgz" || { echo "ОШИБКА: распаковка."; exit 1; }
   local M="$stage/x/MANIFEST" D="$stage/x/data"
-  [[ -f "$M" && -f "$D/x-ui.db" ]] || { echo "ОШИБКА: это не архив lucx backup."; exit 1; }
+  [[ -f "$M" && -f "$D/x-ui.db" && -f "$stage/x/FILES.sha256" ]] || { echo "ОШИБКА: это не архив lucx backup."; exit 1; }
   [[ "$(bk_man_get "$M" format)" == "$BK_FORMAT" ]] || { echo "ОШИБКА: формат архива $(bk_man_get "$M" format), эта версия скрипта понимает ${BK_FORMAT}. Обнови скрипт: upgrade."; exit 1; }
+  (cd "$D" && sha256sum -c --quiet "$stage/x/FILES.sha256" >/dev/null 2>&1) \
+    || { echo "ОШИБКА: контрольные суммы файлов в архиве не совпали — архив повреждён. Сервер не тронут."; exit 1; }
   [[ "$(sha256sum "$D/x-ui.db" | awk '{print $1}')" == "$(bk_man_get "$M" db_sha256)" ]] \
     || { echo "ОШИБКА: контрольная сумма БД не совпала — архив повреждён."; exit 1; }
   [[ "$(sqlite3 "$D/x-ui.db" 'PRAGMA integrity_check;' 2>/dev/null)" == "ok" ]] \
     || { echo "ОШИБКА: БД в архиве не проходит integrity_check."; exit 1; }
 
+  # значения из манифеста — данные, не команды: оставляем только безопасные формы
+  local sites_ok="" ports_ok="" s p
+  for s in $(set -f; bk_man_get "$M" enabled_sites); do
+    [[ "$s" =~ ^[A-Za-z0-9._-]+\.conf$ ]] && sites_ok+="$s "
+  done
+  for p in $(set -f; bk_man_get "$M" awg_ports); do
+    [[ "$p" =~ ^[0-9]{1,5}$ ]] && (( 10#$p >= 1 && 10#$p <= 65535 )) && ports_ok+="$((10#$p)) "
+  done
+
   # --- проверки совместимости ---
-  local b_ver n_ver b_dom b_xh n_xh
+  local b_ver n_ver b_dom b_rd b_xh n_xh
   b_ver=$(bk_man_get "$M" lucx_version); n_ver=$(bk_xui_version)
-  b_dom=$(bk_man_get "$M" domain); b_xh=$(bk_man_get "$M" xhttp_domain)
+  b_dom=$(bk_man_get "$M" domain); b_rd=$(bk_man_get "$M" reality_domain); b_xh=$(bk_man_get "$M" xhttp_domain)
   n_xh=$(xhttp_domain_cfg 2>/dev/null || true)
   echo "Архив: создан $(bk_man_get "$M" created) на $(bk_man_get "$M" host), скрипт $(bk_man_get "$M" script_version), панель '${b_ver}', xray $(bk_man_get "$M" xray_version)"
   echo "Здесь: скрипт ${VERSION}, панель '${n_ver}'"
-  local problems=0
-  if [[ -n "$b_ver" && -n "$n_ver" ]] && ! bk_ver_ge "$n_ver" "$b_ver"; then
-    echo "СТОП: панель здесь ('${n_ver}') СТАРШЕ, чем в архиве ('${b_ver}'): схема БД может не открыться. Обнови панель (x-ui update) и повтори."
-    problems=1
-  fi
-  local b_rd; b_rd=$(bk_man_get "$M" reality_domain)
+  # домены: всегда стоп (--force их не обходит: конфиги из архива привязаны к старым именам и сертификатам)
+  local dom_bad=0
   if [[ "${DOMAIN:-}" != "$b_dom" ]] || { [[ -n "$b_rd" ]] && [[ "${REALITY_DOMAIN:-$DOMAIN}" != "$b_rd" ]]; }; then
-    echo "СТОП: домены установки (${DOMAIN:-?} / ${REALITY_DOMAIN:-?}) не совпадают с архивом (${b_dom} / $(bk_man_get "$M" reality_domain))."
+    echo "СТОП: домены установки (${DOMAIN:-?} / ${REALITY_DOMAIN:-?}) не совпадают с архивом (${b_dom} / ${b_rd})."
     echo "      Ставь скрипт с теми же именами, что были на старом сервере (клиенты привязаны к ним)."
-    problems=1
+    dom_bad=1
   fi
   if [[ -n "$b_xh" && "$b_xh" != "$n_xh" ]]; then
     echo "СТОП: в архиве есть XHTTP-домен ${b_xh}, а здесь он не настроен (${n_xh:-нет}). Поставь: sudo bash $0 add-xhttp ${b_xh} — и повтори restore."
-    problems=1
+    dom_bad=1
   fi
-  if [[ $problems -eq 1 ]]; then
-    [[ $force -eq 1 ]] && echo "--force: продолжаю несмотря на предупреждения выше." || { echo "Сервер не тронут."; exit 1; }
+  [[ $dom_bad -eq 0 ]] || { echo "Сервер не тронут."; exit 1; }
+  [[ -z "$b_xh" && -n "$n_xh" ]] && echo "WARN: здесь настроен XHTTP (${n_xh}), в архиве его нет. После restore выполни: sudo bash $0 remove-xhttp (или add-xhttp заново)."
+  # версия панели: пустая или ниже архивной — стоп (обходится только --force)
+  local ver_bad=0
+  if [[ -z "$b_ver" || -z "$n_ver" ]]; then
+    echo "СТОП: версию панели определить не удалось (архив: '${b_ver}', здесь: '${n_ver}'), совместимость БД проверить нельзя."
+    ver_bad=1
+  elif ! bk_ver_ge "$n_ver" "$b_ver"; then
+    echo "СТОП: версия панели здесь (${n_ver}) НИЖЕ архивной (${b_ver}): схема БД может не открыться. Обнови панель (x-ui update) и повтори."
+    ver_bad=1
   fi
+  if [[ $ver_bad -eq 1 ]]; then
+    [[ $force -eq 1 ]] && echo "--force: проверку версии пропускаю на твою ответственность." || { echo "Сервер не тронут."; exit 1; }
+  fi
+  local b_xv n_xv xbin
+  b_xv=$(bk_man_get "$M" xray_version)
+  xbin="/usr/local/x-ui/bin/xray-linux-$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')"
+  n_xv=""; [[ -x "$xbin" ]] && n_xv=$("$xbin" -version 2>/dev/null | head -1 | awk '{print $2}' || true)
+  if [[ -n "$b_xv" && -n "$n_xv" ]] && ! bk_ver_ge "$n_xv" "$b_xv"; then
+    echo "WARN: xray здесь (${n_xv}) старее, чем в архиве (${b_xv}); часть настроек инбаундов может не примениться."
+  fi
+  local b_aw n_aw; b_aw=$(bk_man_get "$M" awg_module_version); n_aw=$(cat /etc/x-ui/.awg-module-version 2>/dev/null || true)
+  [[ -n "$b_aw" && -n "$n_aw" && "$b_aw" != "$n_aw" ]] && echo "WARN: версия модуля AWG отличается (архив ${b_aw:0:8}, здесь ${n_aw:0:8}): после restore проверь подключение AWG-клиента."
   local d
-  for d in "$b_dom" "$(bk_man_get "$M" reality_domain)" "$b_xh"; do
+  for d in "$b_dom" "$b_rd" "$b_xh"; do
     [[ -n "$d" ]] || continue
     [[ -d "/etc/letsencrypt/live/$d" || $use_certs -eq 1 ]] \
       || echo "WARN: сертификата для ${d} здесь нет (install выпускает их; без него nginx -t не пройдёт). Используй --certs, если архив делался с --with-certs."
   done
 
-  local SERVER_IP; SERVER_IP=$(get_server_ip)
-  [[ -n "$SERVER_IP" ]] || { echo "ОШИБКА: не определить публичный IP сервера."; exit 1; }
-  echo "Публичный IP здесь: ${SERVER_IP} (в архиве был $(bk_man_get "$M" server_ip))."
+  # IP для listen: адрес из РАБОЧЕЙ установки (stream-конфиг после install), а не от внешнего сервиса
+  local SERVER_IP="" ipre='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+  SERVER_IP=$(grep -oP '^\s*listen\s+\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(?=:443;)' /etc/nginx/stream-sni-router.conf 2>/dev/null | grep -v '^0\.0\.0\.0$' | head -n1 || true)
+  [[ "$SERVER_IP" =~ $ipre ]] || SERVER_IP=$(get_server_ip)
+  [[ "$SERVER_IP" =~ $ipre ]] || { echo "ОШИБКА: не определить IP сервера (нет listen в stream-конфиге и внешний сервис недоступен). Сервер не тронут."; exit 1; }
+  echo "IP для nginx здесь: ${SERVER_IP} (в архиве был $(bk_man_get "$M" server_ip))."
   if [[ $assume_yes -ne 1 ]]; then
     echo "Будет ЗАМЕНЕНО: БД панели (клиенты/инбаунды/настройки), ${CREDS_FILE}, конфиги nginx схемы, конфиги AWG."
-    echo "Текущие версии сохраняются в /root/.lucx-restore-backup-*/."
-    read -rp "Продолжить? [y/N]: " ans
+    echo "Текущие версии сохраняются в /root/.lucx-restore-backup-*/ (там секреты — удали после проверки)."
+    read -rp "Продолжить? [y/N]: " ans || ans=""
     [[ "$ans" =~ ^[YyДд] ]] || { echo "Отменено."; exit 0; }
   fi
 
-  # --- страховочная копия текущего ---
-  local SAFE; SAFE="/root/.lucx-restore-backup-$(date +%Y%m%d-%H%M%S)"
-  mkdir -p "$SAFE/nginx"
-  cp -p "$XUIDB" "$SAFE/x-ui.db"; cp -p "$CREDS_FILE" "$SAFE/lucx-credentials"
-  cp -a /etc/nginx/stream-sni-router.conf /etc/nginx/conf.d "$SAFE/nginx/" 2>/dev/null || true
-  cp -a /etc/nginx/sites-available "$SAFE/nginx/" 2>/dev/null || true
-  [[ -d /etc/amnezia/amneziawg ]] && cp -a /etc/amnezia/amneziawg "$SAFE/amneziawg"
-  echo "Страховочная копия: ${SAFE}"
+  # --- остановка панели и полная страховочная копия ---
+  lucx_xui_stop || { echo "ОШИБКА: x-ui не остановился. Ничего не изменено."; exit 1; }
+  BK_SAFE="/root/.lucx-restore-backup-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$BK_SAFE/nginx" || { echo "ОШИБКА: не создать ${BK_SAFE}."; exit 1; }
+  sqlite3 "$XUIDB" ".backup '$BK_SAFE/x-ui.db'" \
+    && [[ "$(sqlite3 "$BK_SAFE/x-ui.db" 'PRAGMA integrity_check;' 2>/dev/null)" == "ok" ]] \
+    || { echo "ОШИБКА: страховочная копия БД не создана. Ничего не изменено."; exit 1; }
+  cp -p "$CREDS_FILE" "$BK_SAFE/lucx-credentials" || { echo "ОШИБКА: страховочная копия creds. Ничего не изменено."; exit 1; }
+  for d in sites-available sites-enabled conf.d; do
+    cp -a "/etc/nginx/$d" "$BK_SAFE/nginx/" || { echo "ОШИБКА: страховочная копия nginx/${d}. Ничего не изменено."; exit 1; }
+  done
+  cp -p /etc/nginx/stream-sni-router.conf "$BK_SAFE/nginx/" 2>/dev/null || true
+  if [[ -d /etc/amnezia/amneziawg ]]; then
+    cp -a /etc/amnezia/amneziawg "$BK_SAFE/amneziawg" || { echo "ОШИБКА: страховочная копия AWG. Ничего не изменено."; exit 1; }
+  else
+    : > "$BK_SAFE/no-amneziawg"
+  fi
+  if [[ $use_certs -eq 1 && -f "$D/letsencrypt.tar" && -d /etc/letsencrypt ]]; then
+    tar -C /etc -cf "$BK_SAFE/letsencrypt.tar" letsencrypt || { echo "ОШИБКА: страховочная копия сертификатов. Ничего не изменено."; exit 1; }
+  fi
+  echo "Страховочная копия: ${BK_SAFE}"
 
-  rb_all() {
-    echo "Откат из ${SAFE}..."
-    lucx_xui_stop || true
-    cp -p "$SAFE/x-ui.db" "$XUIDB"; rm -f "${XUIDB}-wal" "${XUIDB}-shm"
-    cp -p "$SAFE/lucx-credentials" "$CREDS_FILE"
-    [[ -f "$SAFE/nginx/stream-sni-router.conf" ]] && cp -p "$SAFE/nginx/stream-sni-router.conf" /etc/nginx/
-    [[ -d "$SAFE/nginx/conf.d" ]] && cp -a "$SAFE/nginx/conf.d/." /etc/nginx/conf.d/
-    [[ -d "$SAFE/nginx/sites-available" ]] && cp -a "$SAFE/nginx/sites-available/." /etc/nginx/sites-available/
-    [[ -d "$SAFE/amneziawg" ]] && cp -a "$SAFE/amneziawg/." /etc/amnezia/amneziawg/
-    lucx_xui_start || true
-    nginx -t >/dev/null 2>&1 && systemctl restart nginx 2>/dev/null || true
-  }
-
-  # --- применение ---
+  # --- применение: с этого места любой сбой/обрыв откатывает всё (ловушка EXIT) ---
+  trap '' HUP          # обрыв SSH не должен прервать применение посередине
+  BK_ARMED=1
   if [[ $use_certs -eq 1 && -f "$D/letsencrypt.tar" ]]; then
     echo "Сертификаты из архива -> /etc/letsencrypt (поверх существующих)"
-    tar -C /etc -xf "$D/letsencrypt.tar" || { echo "ОШИБКА: сертификаты."; exit 1; }
+    tar -C /etc -xf "$D/letsencrypt.tar"
   fi
-  lucx_xui_stop || true
-  cp -p "$D/x-ui.db" "$XUIDB"; rm -f "${XUIDB}-wal" "${XUIDB}-shm"
-  cp -p "$D/lucx-credentials" "$CREDS_FILE"; chmod 600 "$CREDS_FILE"
+  cp -p "$D/x-ui.db" "${XUIDB}.new" && mv -f "${XUIDB}.new" "$XUIDB"
+  rm -f "${XUIDB}-wal" "${XUIDB}-shm"
+  cp -p "$D/lucx-credentials" "${CREDS_FILE}.new" && chmod 600 "${CREDS_FILE}.new" && mv -f "${CREDS_FILE}.new" "$CREDS_FILE"
   if [[ -d "$D/amneziawg" ]]; then
     mkdir -p /etc/amnezia/amneziawg
     cp -a "$D/amneziawg/." /etc/amnezia/amneziawg/
@@ -7885,44 +7974,46 @@ cmd_restore() {
   [[ -d "$D/nginx/conf.d" ]] && cp -a "$D/nginx/conf.d/." /etc/nginx/conf.d/
   if [[ -d "$D/nginx/sites-available" ]]; then
     cp -a "$D/nginx/sites-available/." /etc/nginx/sites-available/
-    local s
-    for s in $(bk_man_get "$M" enabled_sites); do
+    for s in $sites_ok; do
       [[ -f "/etc/nginx/sites-available/$s" ]] && ln -sf "/etc/nginx/sites-available/$s" "/etc/nginx/sites-enabled/$s"
     done
   fi
 
-  # новый IP в stream-роутере (listen на конкретный адрес, v0.3.5+)
+  # listen stream-роутера -> IP этого сервера (явный адрес, как в rebind-ip; wildcard тоже приводим к явному)
   local SC="/etc/nginx/stream-sni-router.conf"
-  if [[ -f "$SC" ]] && ! grep -qE "listen ${SERVER_IP//./\.}:443;" "$SC"; then
-    sed -i -E "s/^\s*listen\s+[^;]*443;/        listen ${SERVER_IP}:443;/" "$SC"
-    grep -qE "listen ${SERVER_IP//./\.}:443;" "$SC" || { echo "ОШИБКА: listen-строка не обновилась."; rb_all; exit 1; }
+  if [[ -f "$SC" ]] && ! grep -qE "^\s*listen\s+${SERVER_IP//./\\.}:443;" "$SC"; then
+    sed -i -E "s/^(\s*)listen\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:)?443;/\1listen ${SERVER_IP}:443;/" "$SC"
+    grep -qE "^\s*listen\s+${SERVER_IP//./\\.}:443;" "$SC" || { echo "ОШИБКА: listen-строка stream-роутера не обновилась."; exit 1; }
     echo "stream-роутер: listen -> ${SERVER_IP}:443"
   fi
   if ! nginx -t >/dev/null 2>&1; then
     echo "ОШИБКА: nginx -t не прошёл после подстановки конфигов:"; { nginx -t 2>&1 | tail -5; } || true
-    rb_all; exit 1
+    exit 1
   fi
 
   # порты: install уже открыл 22/80/443 и свой AWG-порт; добавляем порты AWG из архива (повтор безопасен)
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-    local p
-    for p in $(bk_man_get "$M" awg_ports); do
+    for p in $ports_ok; do
       ufw allow "${p}/udp" >/dev/null 2>&1 && echo "ufw: ${p}/udp открыт (порт AWG из архива)"
     done
-    local own
-    own=$(ufw status 2>/dev/null | grep -E '/udp' | awk '{print $1}' | tr '\n' ' ' || true)
-    echo "Открытые UDP-порты сейчас: ${own:-нет}. Лишний порт AWG от install можно закрыть: ufw delete allow <порт>/udp"
   fi
 
-  systemctl restart nginx
-  lucx_xui_start || true
+  systemctl restart nginx || { echo "ОШИБКА: nginx не перезапустился."; exit 1; }
+  sleep 1
+  ss -tlnp 2>/dev/null | grep -qE "${SERVER_IP//./\\.}:443\b.*nginx" || { echo "ОШИБКА: nginx не слушает ${SERVER_IP}:443 после restart."; exit 1; }
+  lucx_xui_start || { echo "ОШИБКА: x-ui не стартовал после восстановления."; exit 1; }
   sleep 3
-  if ! systemctl is-active --quiet x-ui; then
-    echo "ОШИБКА: x-ui не стартовал после восстановления."; rb_all; exit 1
-  fi
-  echo "OK: восстановлено. Клиенты и подписки перенесены."
-  echo "Дальше: sudo bash $0 healthcheck; зайди в панель по ссылке из ${CREDS_FILE} (пароль — со старого сервера)."
-  echo "Если у старого сервера был бот: sudo bash $0 add-bot. AWG: проверь клиентов в панели; при необходимости перезагрузи сервер."
+  systemctl is-active --quiet x-ui || { echo "ОШИБКА: x-ui не работает после восстановления."; exit 1; }
+  BK_ARMED=0
+  trap bk_cleanup EXIT   # сброс HUP: дальше обычное поведение
+
+  echo "OK: восстановлено (панель и nginx запущены). Работу клиентов проверь сам: sudo bash $0 healthcheck и подключение с телефона."
+  if pgrep -f 'xray-linux' >/dev/null 2>&1; then echo "  xray запущен."; else echo "  WARN: процесс xray не найден — подожди минуту, затем смотри: journalctl -u x-ui -n 50"; fi
+  local pl
+  pl=$(sqlite3 -readonly "$XUIDB" "SELECT port||'/'||protocol FROM inbounds WHERE enable=1 AND (listen IS NULL OR listen='' OR listen NOT LIKE '127.%') ORDER BY port;" 2>/dev/null | tr '\n' ' ' || true)
+  [[ -n "$pl" ]] && echo "  Порты инбаундов из БД, доступные снаружи: ${pl}— сверь с 'ufw status' (скрипт открывает только 22/80/443 и порты AWG)."
+  echo "  Старый сервер выключи или останови там бота: один токен Telegram у двух серверов мешает; удали ${BK_SAFE} после проверки (там секреты)."
+  echo "  Если у старого сервера был бот: sudo bash $0 add-bot. AWG: проверь подключение клиента; при необходимости перезагрузи сервер."
 }
 
 # ================== РАЗБОР АРГУМЕНТОВ ==================
@@ -8029,7 +8120,7 @@ case "${1:-install}" in
     echo "  sudo bash $0 backup        — зашифрованный архив сервера (клиенты, инбаунды, настройки, конфиги; --with-certs"
     echo "                               кладёт и сертификаты); перенос: A-записи -> install -> restore"
     echo "  sudo bash $0 restore <файл> — восстановить архив на сервер с уже выполненным install (те же домены;"
-    echo "                               панель не старше архивной; страховочная копия, самотест, автооткат)"
+    echo "                               версия панели не ниже архивной; страховочная копия, автооткат)"
     echo "  sudo bash $0 add-swap      — (опц.) swap-файл против OOM на нодах с 1 ГБ ОЗУ"
     echo "                               (--size 512M|1G|2G; не включай на ВМ с подвисающим диском)"
     echo "  sudo bash $0 remove-swap   — убрать swap-файл, созданный add-swap"

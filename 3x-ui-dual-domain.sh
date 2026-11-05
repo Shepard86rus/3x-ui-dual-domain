@@ -1469,7 +1469,9 @@ cmd_add_hy2() {
   fi   # hy2_exists
 
   # v0.6.5: add-hy2 не открывал 443/udp в ufw (рассчитывал на правило от прежней схемы); без правила hy2 молча недоступен
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+  local hy2_ufw=""
+  command -v ufw >/dev/null 2>&1 && hy2_ufw=$(ufw status 2>/dev/null || true)
+  if grep -q '^Status: active' <<<"$hy2_ufw"; then
     if ufw allow 443/udp >/dev/null 2>&1; then echo "ufw: 443/udp открыт"; else echo "WARN: не удалось открыть 443/udp в ufw — открой вручную: ufw allow 443/udp"; fi
   fi
 
@@ -1525,10 +1527,11 @@ ensure_decoy2_http_vhost() {
     return 0
   fi
   # старый файл (если был без нужного listen) сохраняем: при провале nginx -t вернём его, а не оставим сервер без заглушки №2
-  local d2_old=""
+  local d2_old="" d2_was_on=0
+  [[ -L /etc/nginx/sites-enabled/decoy2-http.conf || -f /etc/nginx/sites-enabled/decoy2-http.conf ]] && d2_was_on=1
   if [[ -f /etc/nginx/sites-available/decoy2-http.conf ]]; then
     d2_old=$(mktemp)
-    cp -p /etc/nginx/sites-available/decoy2-http.conf "$d2_old" 2>/dev/null || d2_old=""
+    cp -p /etc/nginx/sites-available/decoy2-http.conf "$d2_old" 2>/dev/null || { rm -f "$d2_old"; d2_old=""; }
   fi
   cat > /etc/nginx/sites-available/decoy2-http.conf <<EOF
 server {
@@ -1548,6 +1551,8 @@ EOF
     # v0.6.5: сломанный конфиг не должен пережить следующий reload или перезагрузку: возвращаем прежний файл, а если его не было, убираем наш
     if [[ -n "$d2_old" && -s "$d2_old" ]]; then
       cp -p "$d2_old" /etc/nginx/sites-available/decoy2-http.conf
+      # если раньше конфиг не был включён, возвращаем и это (иначе сломанная ссылка в sites-enabled переживёт отказ)
+      [[ "$d2_was_on" -eq 1 ]] || rm -f /etc/nginx/sites-enabled/decoy2-http.conf
     else
       rm -f /etc/nginx/sites-enabled/decoy2-http.conf /etc/nginx/sites-available/decoy2-http.conf
     fi
@@ -8383,7 +8388,9 @@ cmd_restore() {
   fi
 
   # порты: install уже открыл 22/80/443 и свой AWG-порт; добавляем порты AWG из архива (повтор безопасен)
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+  local rst_ufw=""
+  command -v ufw >/dev/null 2>&1 && rst_ufw=$(ufw status 2>/dev/null || true)
+  if grep -q '^Status: active' <<<"$rst_ufw"; then
     for p in $ports_ok; do
       ufw allow "${p}/udp" >/dev/null 2>&1 && bk_say "ufw: ${p}/udp открыт (порт AWG из архива)"
     done
@@ -8409,9 +8416,8 @@ cmd_restore() {
   [[ -n "$pl" ]] && bk_say "  Порты инбаундов из БД, доступные снаружи: ${pl}— сверь с 'ufw status'. install открыл SSH, 80/tcp, 443/tcp+udp и порты AWG; правила ufw для остальных портов не переносятся (открой сам: ufw allow <порт>/tcp или /udp)."
   # v0.6.5: порты из восстановленных /root/.lucx-public-*-ports.txt (открытые осознанно на старом сервере): файлы пришли из
   # архива, а правил ufw они не создают; healthcheck такие порты считает разрешёнными и о закрытом ufw молчит
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-    local pf pproto pnum pmiss="" pufw
-    pufw=$(ufw status 2>/dev/null || true)
+  if grep -q '^Status: active' <<<"$rst_ufw"; then
+    local pf pproto pnum pmiss="" pufw="$rst_ufw"
     for pproto in tcp udp; do
       pf="/root/.lucx-public-${pproto}-ports.txt"
       [[ -f "$pf" ]] || continue

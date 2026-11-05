@@ -8197,7 +8197,7 @@ cmd_restore() {
   bk_get_pass 0 || exit 1
   umask 077
   rm -rf /root/.lucx-bk.* 2>/dev/null || true
-  local stage
+  local stage bk_list le_list
   stage=$(mktemp -d /root/.lucx-bk.XXXXXX) || { echo "ОШИБКА: не создать временный каталог."; exit 1; }
   BK_STAGE="$stage"
   trap bk_cleanup EXIT

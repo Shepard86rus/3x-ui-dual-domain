@@ -1272,6 +1272,7 @@ ensure_geodata() {
 # оставался без работающих инбаундов до ручного возврата x-ui.db.backup.*.
 hy2_rollback_db() {
   local bak="$1"
+  HY2_AUTH=""   # инбаунда hy2 больше нет: ссылку и auth в креды не писать
   [[ -n "$bak" && -s "$bak" ]] || { echo "ОШИБКА: копии БД для отката нет (${bak:-путь пуст}). Верни вручную: ${XUIDB}.backup.*"; return 1; }
   echo "Откат: возвращаю БД из ${bak} (инбаунд hy2 убирается)."
   systemctl stop x-ui 2>/dev/null || true
@@ -2509,6 +2510,14 @@ cmd_install() {
   # сообщением; в rebind-ip та же проверка есть с 0.6.4)
   if ! [[ "$SERVER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo "ОШИБКА: '${SERVER_IP}' — не IPv4-адрес. Установка не начата."
+    exit 1
+  fi
+  # v0.6.5: stream-роутер слушает явный IP (listen ${SERVER_IP}:443): если адрес не назначен интерфейсу (NAT, внешний адрес
+  # облака), nginx не стартует. Раньше это вскрывалось в середине установки, теперь — до начала (как в rebind-ip)
+  if command -v ip >/dev/null 2>&1 && ! ip -4 -o addr show 2>/dev/null | grep -qwF "$SERVER_IP"; then
+    echo "СТОП: ${SERVER_IP} не назначен ни одному интерфейсу сервера (NAT или другой исходящий адрес): nginx не сможет его слушать."
+    echo "      Установка не начата: схема рассчитана на сервер, у которого публичный адрес назначен самому интерфейсу ('ip -4 addr')."
+    echo "      За NAT (внешний адрес облака) такая установка не поддерживается: возьмите сервер с публичным IPv4 на интерфейсе."
     exit 1
   fi
 
@@ -4969,7 +4978,9 @@ EOF
 
   # --- [10a] Hysteria 2 inbound на UDP/443 (SQLite) ---
   echo "=== [10a] Hysteria 2 inbound на UDP/443 (SQLite) ==="
-  create_hy2_inbound || exit 1
+  # v0.6.5: сбой hy2 больше не обрывает установку: БД возвращается из копии (hy2_rollback_db), а креды панели и строка
+  # certbot в cron записываются ниже в любом случае (раньше после `exit 1` пароль панели нигде не сохранялся)
+  create_hy2_inbound || echo "  WARN: Hysteria 2 не создан — установка продолжается без него (позже: sudo bash $0 add-hy2)."
 
   # --- Финал: подробности — в лог/креды, на экран — install_print_summary в самом конце ---
   INSTALL_PROBLEMS=()
@@ -5223,13 +5234,17 @@ cmd_healthcheck() {
     tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -qi "$2"
   }
 
-  if [[ -n "${SERVER_IP:-}" ]]; then
+  # v0.6.5: адрес для проверки nginx берётся из listen stream-роутера (то, что nginx реально слушает), а не только из
+  # внешнего определения публичного IP: за NAT или при недоступных сервисах определения IP проверка давала ложный результат
+  HC_STREAM_IP=$(grep -oP '^\s*listen \K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(?=:443;)' /etc/nginx/stream-sni-router.conf 2>/dev/null | head -n1 || true)
+  HC_NGX_IP="${HC_STREAM_IP:-${SERVER_IP:-}}"
+  if [[ -n "$HC_NGX_IP" ]]; then
     # v0.3.3: с этой версии install генерирует "listen 443;" (wildcard),
     # а не "listen ${SERVER_IP}:443;" (см. changelog v0.3.3) — сервера,
     # установленные ДО этой версии, по-прежнему слушают явный IP. Паттерн
     # ловит оба случая, тем же приёмом, что уже применялся для порта 80
     # (см. PUBLIC80_PID ниже).
-    NGINX443_PID=$(get_listener_pid "(${SERVER_IP}|0\.0\.0\.0):443\b")
+    NGINX443_PID=$(get_listener_pid "(${HC_NGX_IP}|0\.0\.0\.0):443\b")
     # v0.2.5 / v0.3.0: lucx-ui v3.8.5-lucx.245+ умеет «SNI gateway /
     # Masking» со СВОИМ bundled sidecar'ом. В .245 это nginx
     # (bin/nginx-linux-*), в .246+ — Caddy L4 (bin/caddy-layer4-linux-*).
@@ -5349,6 +5364,18 @@ cmd_healthcheck() {
     if [[ -n "$AWG_PORT_HC" ]]; then
       ufw status 2>/dev/null | grep -qE "^${AWG_PORT_HC}/udp.*ALLOW" && check "ufw: ${AWG_PORT_HC}/udp разрешён (AWG)" ok || check "ufw: ${AWG_PORT_HC}/udp (AWG) НЕ разрешён" fail
     fi
+    # v0.6.5: правило для SSH. Если ufw включён, а порта sshd в правилах нет, новое подключение по SSH после перезагрузки
+    # или перезапуска ufw будет отрезано. Только предупреждение: вход может быть разрешён и по-другому (по адресу, по профилю)
+    if ufw status 2>/dev/null | grep -q '^Status: active'; then
+      HC3_SSHP=$(lucx_detect_ssh_ports 2>/dev/null || true)
+      for HC3_P in $HC3_SSHP; do
+        if ufw status 2>/dev/null | grep -qE "^${HC3_P}(/tcp)?[[:space:]]+ALLOW" || ufw status 2>/dev/null | grep -qiE "^(OpenSSH|SSH)[[:space:]]+ALLOW"; then
+          check "ufw: SSH-порт ${HC3_P}/tcp разрешён" ok
+        else
+          check "ufw: для SSH-порта ${HC3_P}/tcp нет правила ALLOW — после перезапуска ufw доступ по SSH может пропасть (проверь: ufw status)" warn
+        fi
+      done
+    fi
   else
     check "ufw не установлен" warn
   fi
@@ -5389,6 +5416,8 @@ cmd_healthcheck() {
     # IP, сервер жив").
     if grep -qE "^\s*listen 443;" "$STREAM_CONF"; then
       check "stream: wildcard-форма 'listen 443;' (v0.3.3–v0.3.4, ОТОЗВАНА в v0.3.5 — регресс, см. changelog) — Reality может быть мёртв; исправь: bash $0 rebind-ip" warn
+    elif [[ -n "${HC_STREAM_IP:-}" ]] && ip -4 -o addr show 2>/dev/null | grep -qwF "$HC_STREAM_IP"; then
+      check "stream: слушает явный IP ${HC_STREAM_IP} (назначен интерфейсу сервера; штатная форма v0.3.5+, при смене IP: bash $0 rebind-ip)" ok
     elif [[ -z "${SERVER_IP:-}" ]]; then
       check "stream: публичный IP не определён — legacy-форму сверить нельзя, пропускаю" warn
     elif grep -qE "^\s*listen ${SERVER_IP}:443;" "$STREAM_CONF"; then
@@ -6033,7 +6062,10 @@ cmd_healthcheck() {
       check "Публичный UDP/${HC11_PORT} (${HC11_NAME}) — слушает и разрешён ufw, но НЕ из схемы; сканер видит. Если нужен осознанно: echo ${HC11_PORT} >> ${HC11_EXC_UDP}" fail
       HC11_LEAKS=$((HC11_LEAKS+1))
     else
-      check "UDP/${HC11_PORT} (${HC11_NAME}) слушает, но закрыт ufw — снаружи не виден" warn
+      # v0.6.5: UDP/68 — DHCP-клиент провайдера: слушает на публичном интерфейсе, входящих не принимает; WARN был ложным
+      if [[ "$HC11_PORT" != "68" ]]; then
+        check "UDP/${HC11_PORT} (${HC11_NAME}) слушает, но закрыт ufw — снаружи не виден" warn
+      fi
     fi
   done < <(ss -ulnp 2>/dev/null || true)
   if [[ "$HC11_LEAKS" -eq 0 ]]; then
@@ -6145,9 +6177,10 @@ cmd_healthcheck() {
   echo "=== [14] SSH-атаки и ресурсы (справочно, на итог не влияет) ==="
   if command -v journalctl >/dev/null 2>&1; then
     local ssh_1h ssh_24h ssh_ips f2b_banned f2b_total f2b_txt
-    ssh_1h=$(journalctl _COMM=sshd --since "1 hour ago" --no-pager 2>/dev/null | grep -cE 'Failed password|Invalid user|authentication failure' || true)
-    ssh_24h=$(journalctl _COMM=sshd --since "24 hours ago" --no-pager 2>/dev/null | grep -cE 'Failed password|Invalid user|authentication failure' || true)
-    ssh_ips=$(journalctl _COMM=sshd --since "24 hours ago" --no-pager 2>/dev/null | grep -E 'Failed password|Invalid user' | grep -oE 'from [0-9a-fA-F.:]+' | sort -u | wc -l || true)
+    # v0.6.5: с OpenSSH 9.8 сеансы обслуживает отдельный процесс sshd-session, по _COMM=sshd одному счётчик показывал ноль
+    ssh_1h=$(journalctl _COMM=sshd _COMM=sshd-session --since "1 hour ago" --no-pager 2>/dev/null | grep -cE 'Failed password|Invalid user|authentication failure' || true)
+    ssh_24h=$(journalctl _COMM=sshd _COMM=sshd-session --since "24 hours ago" --no-pager 2>/dev/null | grep -cE 'Failed password|Invalid user|authentication failure' || true)
+    ssh_ips=$(journalctl _COMM=sshd _COMM=sshd-session --since "24 hours ago" --no-pager 2>/dev/null | grep -E 'Failed password|Invalid user' | grep -oE 'from [0-9a-fA-F.:]+' | sort -u | wc -l || true)
     f2b_txt="fail2ban: не активен"
     if systemctl is-active --quiet fail2ban 2>/dev/null; then
       f2b_banned=$(fail2ban-client status sshd 2>/dev/null | grep -oE 'Currently banned:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)
@@ -6418,7 +6451,7 @@ cmd_panel_path() {
     exit 1
   fi
   if command -v flock >/dev/null 2>&1 && exec 9>/var/lock/lucx-panel-path.lock; then
-    flock -n 9 || { echo "ОШИБКА: panel-path уже выполняется (другой процесс)."; exit 1; }
+    flock -n 9 || { echo "ОШИБКА: сейчас выполняется panel-path, add-xhttp или remove-xhttp (другой процесс) — дождись и повтори."; exit 1; }
   fi
   if [[ ! -f "$CREDS_FILE" ]]; then
     echo "ОШИБКА: ${CREDS_FILE} не найден — не откуда взять домен панели (установка не выполнялась?)."
@@ -7546,6 +7579,11 @@ cmd_add_xhttp() {
     echo "Запусти от root: sudo bash $0 add-xhttp <домен>"
     exit 1
   fi
+  # v0.6.5: общая блокировка с panel-path, backup и restore: две команды, меняющие одну БД и конфиги nginx, одновременно
+  # не запускаются (раньше add/remove-xhttp не имели блокировки)
+  if command -v flock >/dev/null 2>&1 && exec 9>/var/lock/lucx-panel-path.lock; then
+    flock -n 9 || { echo "ОШИБКА: сейчас выполняется другая команда, меняющая схему (panel-path, add-xhttp или remove-xhttp) — дождись и повтори."; exit 1; }
+  fi
   trap lucx_xui_guard_fire EXIT   # в подоболочке install ловушки не наследуются
   REALITY_XRAY_PORT=443
   read_domains
@@ -7783,6 +7821,11 @@ cmd_remove_xhttp() {
     echo "Запусти от root: sudo bash $0 remove-xhttp [--yes] [--purge-cert]"
     exit 1
   fi
+  # v0.6.5: общая блокировка с panel-path, backup и restore: две команды, меняющие одну БД и конфиги nginx, одновременно
+  # не запускаются (раньше add/remove-xhttp не имели блокировки)
+  if command -v flock >/dev/null 2>&1 && exec 9>/var/lock/lucx-panel-path.lock; then
+    flock -n 9 || { echo "ОШИБКА: сейчас выполняется другая команда, меняющая схему (panel-path, add-xhttp или remove-xhttp) — дождись и повтори."; exit 1; }
+  fi
   local stream_conf="/etc/nginx/stream-sni-router.conf" xdom stamp sbak dbak yes=0 purge=0 a ids iid
   for a in "$@"; do
     case "$a" in
@@ -7964,7 +8007,7 @@ cmd_backup() {
   fi
   # panel-path меняет nginx, БД и creds по очереди: архив, снятый посередине, получится смешанным
   if command -v flock >/dev/null 2>&1 && exec 8>/var/lock/lucx-panel-path.lock; then
-    flock -n 8 || { echo "ОШИБКА: сейчас выполняется panel-path — дождись и повтори backup."; exit 1; }
+    flock -n 8 || { echo "ОШИБКА: сейчас выполняется panel-path, add-xhttp или remove-xhttp — дождись и повтори backup."; exit 1; }
   fi
   local t
   for t in sqlite3 openssl tar sha256sum; do
@@ -8057,9 +8100,9 @@ cmd_backup() {
   if [[ "$u" != "root" && -n "$uh" ]]; then
     echo "  Архив лежит в ${out} (доступен только root). Чтобы скачать под пользователем ${u}:"
     echo "    sudo cp '${out}' '${uh}/' && sudo chown ${u}: '${uh}/$(basename "$out")'"
-    echo "    scp ${u}@${DOMAIN}:$(basename "$out") .   (порт SSH — свой, если не 22: scp -P)"
+    echo "    scp ${u}@${DOMAIN}:$(basename "$out") .   (порт SSH — свой, если не 22: scp -P; так — пока A-записи ещё указывают на этот сервер, после смены DNS — по IP этого сервера)"
   else
-    echo "  Скачать на свой компьютер:  scp root@${DOMAIN}:${out} .   (или через Termius/SFTP)"
+    echo "  Скачать на свой компьютер:  scp root@${DOMAIN}:${out} .   (или через Termius/SFTP; так — пока A-записи ещё указывают на этот сервер, после смены DNS — по IP этого сервера)"
   fi
   echo "  Перенос: A-записи на новый IP -> install на новом сервере с теми же доменами -> sudo bash $0 restore <файл>"
 }
@@ -8081,7 +8124,7 @@ cmd_restore() {
     flock -n 9 || { echo "ОШИБКА: backup/restore уже выполняется."; exit 1; }
   fi
   if command -v flock >/dev/null 2>&1 && exec 8>/var/lock/lucx-panel-path.lock; then
-    flock -n 8 || { echo "ОШИБКА: сейчас выполняется panel-path — дождись и повтори."; exit 1; }
+    flock -n 8 || { echo "ОШИБКА: сейчас выполняется panel-path, add-xhttp или remove-xhttp — дождись и повтори."; exit 1; }
   fi
   local t
   for t in sqlite3 openssl tar sha256sum nginx; do
@@ -8310,7 +8353,22 @@ cmd_restore() {
   if pgrep -f 'xray-linux' >/dev/null 2>&1; then bk_say "  xray запущен."; else bk_say "  WARN: процесс xray не найден — подожди минуту, затем смотри: journalctl -u x-ui -n 50"; fi
   local pl
   pl=$(sqlite3 -readonly "$XUIDB" "SELECT port||'/'||protocol FROM inbounds WHERE enable=1 AND (listen IS NULL OR listen='' OR listen NOT LIKE '127.%') ORDER BY port;" 2>/dev/null | tr '\n' ' ' || true)
-  [[ -n "$pl" ]] && bk_say "  Порты инбаундов из БД, доступные снаружи: ${pl}— сверь с 'ufw status' (скрипт открывает только 22/80/443 и порты AWG)."
+  [[ -n "$pl" ]] && bk_say "  Порты инбаундов из БД, доступные снаружи: ${pl}— сверь с 'ufw status'. install открыл SSH, 80/tcp, 443/tcp+udp и порты AWG; правила ufw для остальных портов не переносятся (открой сам: ufw allow <порт>/tcp или /udp)."
+  # v0.6.5: порты из восстановленных /root/.lucx-public-*-ports.txt (открытые осознанно на старом сервере): файлы пришли из
+  # архива, а правил ufw они не создают; healthcheck такие порты считает разрешёнными и о закрытом ufw молчит
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    local pf pproto pnum pmiss=""
+    for pproto in tcp udp; do
+      pf="/root/.lucx-public-${pproto}-ports.txt"
+      [[ -f "$pf" ]] || continue
+      while IFS= read -r pnum || [[ -n "$pnum" ]]; do
+        pnum="${pnum%%#*}"; pnum="$(tr -d '[:space:]' <<<"$pnum")"
+        [[ "$pnum" =~ ^[0-9]+$ ]] || continue
+        ufw status 2>/dev/null | grep -qE "^${pnum}(/${pproto})?[[:space:]]+ALLOW" || pmiss+="${pnum}/${pproto} "
+      done < "$pf"
+    done
+    [[ -n "$pmiss" ]] && bk_say "  ВНИМАНИЕ: порты из ${pf%/*}/.lucx-public-*-ports.txt без правила ufw ALLOW: ${pmiss}— снаружи они закрыты; откройте: ufw allow <порт>/tcp (или /udp)."
+  fi
   bk_say "  Старый сервер выключи или останови там бота: один токен Telegram у двух серверов мешает; удали ${BK_SAFE} после проверки (там секреты)."
   bk_say "  Если у старого сервера был бот: sudo bash $0 add-bot. AWG: проверь подключение клиента; при необходимости перезагрузи сервер."
 }

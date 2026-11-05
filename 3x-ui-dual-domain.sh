@@ -1454,7 +1454,7 @@ cmd_add_hy2() {
   # Аудитория add-hy2 — как раз серверы до v0.3.1 с AWG на 443/udp: раньше
   # проверка проходила, hy2 вставлялся поверх занятого порта, xray уходил
   # в краш-луп. Второй preflight — через awg show, как в healthcheck [2].
-  if command -v awg >/dev/null 2>&1 && awg show 2>/dev/null | grep -qE '^  listening port: 443$'; then
+  if command -v awg >/dev/null 2>&1 && grep -qE '^  listening port: 443$' <<<"$(awg show 2>/dev/null || true)"; then
     echo "ОШИБКА: UDP/443 занят kernel-интерфейсом AmneziaWG (awg show подтверждает; в ss он не виден)."
     echo "Переедь AWG на другой порт в панели (AmneziaWG -> порт),"
     echo "обнови ufw (ufw allow <новый_порт>/udp) и перезапусти этот режим."
@@ -5331,7 +5331,7 @@ cmd_healthcheck() {
   # занял 443/udp).
   AWG_PORT_HC=$(sqlite3 "$XUIDB" "SELECT port FROM inbounds WHERE protocol='awg' AND enable=1 LIMIT 1;" 2>/dev/null || true)
   if [[ -n "$AWG_PORT_HC" ]] && command -v awg >/dev/null 2>&1 && \
-     awg show 2>/dev/null | grep -qE "^  listening port: ${AWG_PORT_HC}$"; then
+     grep -qE "^  listening port: ${AWG_PORT_HC}$" <<<"$(awg show 2>/dev/null || true)"; then
     check "AWG слушает UDP/${AWG_PORT_HC}" ok
   elif [[ -z "$AWG_PORT_HC" ]]; then
     check "AWG-инбаунд в БД не найден (включается вручную в панели — шаг 6 install)" warn
@@ -5388,7 +5388,7 @@ cmd_healthcheck() {
 
   # Порт панели читаем из БД (рандомный 20k-60k, не 8xxx)
   PANEL_PORT_HC=$(sqlite3 "$XUIDB" "SELECT value FROM settings WHERE key='webPort' LIMIT 1;" 2>/dev/null || true)
-  if [[ -n "$PANEL_PORT_HC" ]] && ss -tlnp 2>/dev/null | grep -qE "127\.0\.0\.1:${PANEL_PORT_HC}\b"; then
+  if [[ -n "$PANEL_PORT_HC" ]] && grep -qE "127\.0\.0\.1:${PANEL_PORT_HC}\b" <<<"$(ss -tlnp 2>/dev/null || true)"; then
     check "Панель слушает на loopback (порт ${PANEL_PORT_HC})" ok
   else
     check "Панель НЕ слушает на loopback" warn
@@ -8205,7 +8205,9 @@ cmd_restore() {
      || ! tar -tzf "$stage/payload.tgz" >/dev/null 2>&1; then
     echo "ОШИБКА: неверный пароль или повреждённый архив. Сервер не тронут."; exit 1
   fi
-  if tar -tzf "$stage/payload.tgz" | grep -qE '(^/|(^|/)\.\.(/|$))'; then
+  # v0.6.5: список читается один раз, без конвейера в grep -q (под pipefail SIGPIPE на длинном списке пропускал проверку)
+  bk_list=$(tar -tzf "$stage/payload.tgz" 2>/dev/null) || { echo "ОШИБКА: архив не читается. Сервер не тронут."; exit 1; }
+  if grep -qE '(^/|(^|/)\.\.(/|$))' <<<"$bk_list"; then
     echo "ОШИБКА: в архиве недопустимые пути (абсолютные или с ..). Сервер не тронут."; exit 1
   fi
   mkdir -p "$stage/x"
@@ -8224,11 +8226,12 @@ cmd_restore() {
   if [[ -n "$(find "$stage/x" -type l 2>/dev/null)" ]]; then
     echo "ОШИБКА: в архиве есть симлинки — так не делает скрипт backup. Сервер не тронут."; exit 1
   fi
-  if [[ -f "$D/letsencrypt.tar" ]] && tar -tf "$D/letsencrypt.tar" | grep -qvE '^letsencrypt(/[^/]+)*/?$|(^|/)\.\.(/|$)'; then
-    echo "ОШИБКА: недопустимые пути в сертификатах архива. Сервер не тронут."; exit 1
-  fi
-  if [[ -f "$D/letsencrypt.tar" ]] && tar -tf "$D/letsencrypt.tar" | grep -qE '(^|/)\.\.(/|$)'; then
-    echo "ОШИБКА: недопустимые пути в сертификатах архива. Сервер не тронут."; exit 1
+  if [[ -f "$D/letsencrypt.tar" ]]; then
+    # v0.6.5: список читается один раз (раньше `tar -tf | grep -qv` под pipefail пропускал посторонний путь в начале длинного списка)
+    le_list=$(tar -tf "$D/letsencrypt.tar" 2>/dev/null) || { echo "ОШИБКА: архив сертификатов не читается. Сервер не тронут."; exit 1; }
+    if grep -qvE '^letsencrypt(/[^/]+)*/?$|(^|/)\.\.(/|$)' <<<"$le_list" || grep -qE '(^|/)\.\.(/|$)' <<<"$le_list"; then
+      echo "ОШИБКА: недопустимые пути в сертификатах архива. Сервер не тронут."; exit 1
+    fi
   fi
 
   # значения из манифеста — данные, не команды: оставляем только безопасные формы
@@ -8418,6 +8421,7 @@ cmd_restore() {
   [[ -n "$pl" ]] && bk_say "  Порты инбаундов из БД, доступные снаружи: ${pl}— сверь с 'ufw status'. install открыл SSH, 80/tcp, 443/tcp+udp и порты AWG; правила ufw для остальных портов не переносятся (открой сам: ufw allow <порт>/tcp или /udp)."
   # v0.6.5: порты из восстановленных /root/.lucx-public-*-ports.txt (открытые осознанно на старом сервере): файлы пришли из
   # архива, а правил ufw они не создают; healthcheck такие порты считает разрешёнными и о закрытом ufw молчит
+  [[ -n "$rst_ufw" ]] && rst_ufw=$(ufw status 2>/dev/null || true)   # снимок после ufw allow для портов AWG: иначе они попадут в «без правила»
   if grep -q '^Status: active' <<<"$rst_ufw"; then
     local pf pproto pnum pmiss="" pufw="$rst_ufw"
     for pproto in tcp udp; do

@@ -1434,7 +1434,7 @@ cmd_add_hy2() {
   fi
   # v0.6.5: слушатель на любом адресе (в том числе [::]:443 и конкретный IP): инбаунд hy2 слушает все интерфейсы,
   # любой занятый UDP/443 роняет xray целиком
-  if ss -uln 2>/dev/null | awk '{print $5}' | grep -qE ':443$'; then
+  if ss -uln 2>/dev/null | awk '{print $4}' | grep -qE ':443$'; then
     echo "ОШИБКА: UDP/443 уже занят:"
     ss -ulnp | grep ':443 ' || true
     echo "Если там AWG — переедь его на другой порт в панели (AmneziaWG -> порт),"
@@ -2648,7 +2648,7 @@ cmd_install() {
 
   # v0.3.1: UDP-порты будущих протоколов (hy2 займёт 443/udp, AWG — AWG_PORT)
   # v0.6.5: слушатель на любом адресе (в том числе [::]:443 и конкретный IP), а не только *:443 и 0.0.0.0:443
-  if ss -uln 2>/dev/null | awk '{print $5}' | grep -qE ':443$'; then
+  if ss -uln 2>/dev/null | awk '{print $4}' | grep -qE ':443$'; then
     echo "ОШИБКА: UDP/443 уже занят:"
     ss -ulnp | grep ':443 ' || true
     exit 1

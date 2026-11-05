@@ -1228,7 +1228,7 @@ ensure_geodata() {
     "geoip_RU.dat|https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat"
     "geosite_RU.dat|https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat"
   )
-  local entry gfile gurl gok try
+  local entry gfile gurl gok
   for entry in "${glist[@]}"; do
     gfile="${entry%%|*}"
     gurl="${entry#*|}"
@@ -1237,7 +1237,7 @@ ensure_geodata() {
     fi
     echo "  Гео-страж: ${gfile} отсутствует — докачиваю (3 попытки)..."
     gok=0
-    for try in 1 2 3; do
+    for _ in 1 2 3; do
       if curl -fL --max-time 300 -o "${geo_bin}/${gfile}" "$gurl" 2>/dev/null; then
         gok=1
         break
@@ -1267,8 +1267,29 @@ ensure_geodata() {
 # masquerade -> decoy-сайт REALITY_DOMAIN (proxy + rewriteHost): чужая
 # QUIC-проба получает настоящий сайт. Salamander не включается — дефолт
 # чистый QUIC/HTTP/3 (см. changelog). Результаты — в глобальных HY2_*.
+# v0.6.5: возврат БД из копии, снятой перед вставкой hy2. Если после вставки x-ui или xray не поднялись, инбаунд hy2
+# на UDP/443 может держать весь xray в краш-лупе (падают все инбаунды). Раньше функция просто возвращала 1 и сервер
+# оставался без работающих инбаундов до ручного возврата x-ui.db.backup.*.
+hy2_rollback_db() {
+  local bak="$1"
+  [[ -n "$bak" && -s "$bak" ]] || { echo "ОШИБКА: копии БД для отката нет (${bak:-путь пуст}). Верни вручную: ${XUIDB}.backup.*"; return 1; }
+  echo "Откат: возвращаю БД из ${bak} (инбаунд hy2 убирается)."
+  systemctl stop x-ui 2>/dev/null || true
+  if ! cp -p "$bak" "$XUIDB"; then
+    echo "ОШИБКА: не удалось вернуть БД. Верни вручную: cp -p ${bak} ${XUIDB} && systemctl start x-ui"
+    return 1
+  fi
+  if ! systemctl start x-ui; then
+    echo "ОШИБКА: x-ui не запустился после отката. Смотри: journalctl -u x-ui -n 50"
+    return 1
+  fi
+  echo "БД возвращена из ${bak}, x-ui запущен."
+  return 0
+}
+
 create_hy2_inbound() {
   HY2_OK=0
+  local hy2_bak
   if [[ ! -f "$XUIDB" ]]; then
     echo "x-ui.db не найден — hy2 не создан."
     return 1
@@ -1287,7 +1308,8 @@ create_hy2_inbound() {
     return 1
   fi
   sleep 1
-  if ! cp "$XUIDB" "${XUIDB}.backup.$(date +%s)"; then
+  hy2_bak="${XUIDB}.backup.$(date +%s)"
+  if ! cp -p "$XUIDB" "$hy2_bak"; then
     echo "ОШИБКА: не удалось сделать бэкап БД."
     systemctl start x-ui
     return 1
@@ -1308,8 +1330,8 @@ INSERT INTO "inbounds" ("user_id","up","down","total","remark","enable","expiry_
   '{"enabled":false,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}'
 );
 SQL
-    echo "ОШИБКА: SQLite INSERT hy2 не удался. Бэкап: ${XUIDB}.backup.*"
-    systemctl start x-ui
+    echo "ОШИБКА: SQLite INSERT hy2 не удался. Бэкап: ${hy2_bak}"
+    hy2_rollback_db "$hy2_bak" || true
     return 1
   }
 
@@ -1327,11 +1349,13 @@ SQL
 
   if ! systemctl start x-ui; then
     echo "ОШИБКА: systemctl start x-ui не отработал. Смотри: journalctl -u x-ui -n 50"
+    hy2_rollback_db "$hy2_bak" || true
     return 1
   fi
   sleep 2
   if ! systemctl is-active --quiet x-ui; then
     echo "ОШИБКА: x-ui не запустился после создания hy2. Смотри: journalctl -u x-ui -n 50"
+    hy2_rollback_db "$hy2_bak" || true
     return 1
   fi
   # v0.3.7: is-active недостаточен — краш-луп xray-core (дочерний процесс
@@ -1349,6 +1373,7 @@ SQL
   done
   if [[ -z "$HY2_UDP_PID" ]]; then
     echo "ОШИБКА: xray не подтверждён на UDP/${REALITY_XRAY_PORT:-443} после старта (порт не слушается или владелец не xray — краш-луп?). Смотри: journalctl -u x-ui -n 50"
+    hy2_rollback_db "$hy2_bak" || true
     return 1
   fi
   HY2_OK=1
@@ -1388,7 +1413,16 @@ cmd_add_hy2() {
       exit 1
     fi
   done
-  if ss -ulnp 2>/dev/null | grep -qE '(\*|0\.0\.0\.0):443 '; then
+  # v0.6.5: повторный запуск на сервере, где hy2 уже работает, раньше упирался в проверку «UDP/443 занят» (его же xray)
+  # и давал ложную ошибку с советом переносить AWG; ветка «Hy2 уже был настроен» была недостижима
+  if sqlite3 "$XUIDB" "SELECT 1 FROM inbounds WHERE protocol='hysteria' AND port='443' LIMIT 1;" 2>/dev/null | grep -q 1; then
+    echo "Hy2 уже настроен — ничего не меняю."
+    echo "Ссылка и креды: ${CREDS_FILE} (строки Hy2 *). Проверка: bash $0 healthcheck"
+    exit 0
+  fi
+  # v0.6.5: слушатель на любом адресе (в том числе [::]:443 и конкретный IP): инбаунд hy2 слушает все интерфейсы,
+  # любой занятый UDP/443 роняет xray целиком
+  if ss -uln 2>/dev/null | awk '{print $5}' | grep -qE ':443$'; then
     echo "ОШИБКА: UDP/443 уже занят:"
     ss -ulnp | grep ':443 ' || true
     echo "Если там AWG — переедь его на другой порт в панели (AmneziaWG -> порт),"
@@ -1412,6 +1446,11 @@ cmd_add_hy2() {
   fi
 
   create_hy2_inbound || exit 1
+
+  # v0.6.5: add-hy2 не открывал 443/udp в ufw (рассчитывал на правило от прежней схемы); без правила hy2 молча недоступен
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    if ufw allow 443/udp >/dev/null 2>&1; then echo "ufw: 443/udp открыт"; else echo "WARN: не удалось открыть 443/udp в ufw — открой вручную: ufw allow 443/udp"; fi
+  fi
 
   # deploy-hook cron: xray читает серты при старте, нужен restart после renew
   if ! crontab -l 2>/dev/null | grep 'certbot renew' | grep -q 'restart x-ui'; then
@@ -1479,6 +1518,8 @@ EOF
   ln -sf /etc/nginx/sites-available/decoy2-http.conf /etc/nginx/sites-enabled/decoy2-http.conf
   if ! nginx -t 2>/dev/null; then
     echo "ОШИБКА: nginx -t не прошёл после создания decoy2-http.conf"
+    # v0.6.5: убираем наш vhost (как у decoy-h2c): сломанный конфиг не должен пережить следующий reload или перезагрузку
+    rm -f /etc/nginx/sites-enabled/decoy2-http.conf /etc/nginx/sites-available/decoy2-http.conf
     return 1
   fi
   systemctl reload nginx
@@ -1596,7 +1637,14 @@ create_reality_front_inbound() {
   lucx_xui_stop
   sleep 1
   bak="${XUIDB}.backup.$(date +%s)"
-  cp -a "$XUIDB" "$bak"
+  # v0.6.5: функция вызывается под `||`, set -e внутри не действует: сбой cp (нет места) раньше не ловился,
+  # вставка шла без бэкапа, а откат копировал несуществующий файл
+  if ! cp -a "$XUIDB" "$bak"; then
+    echo "  ОШИБКА: бэкап БД не создан — Reality-инбаунд не добавлен."
+    rm -f "$bak"
+    lucx_xui_start || true
+    return 1
+  fi
   if ! sqlite3 "$XUIDB" "INSERT INTO inbounds (\"user_id\",\"up\",\"down\",\"total\",\"remark\",\"enable\",\"expiry_time\",\"listen\",\"port\",\"protocol\",\"settings\",\"stream_settings\",\"tag\",\"sniffing\") VALUES ('1','0','0','0','reality-front','1','0','127.0.0.1','${REALITY_FRONT_PORT}','vless','${set_json}','${str_json}','${REALITY_FRONT_TAG}','{\"enabled\":false,\"destOverride\":[\"http\",\"tls\",\"quic\",\"fakedns\"],\"metadataOnly\":false,\"routeOnly\":false}');"; then
     echo "  ОШИБКА: SQLite INSERT Reality-инбаунда не удался. Бэкап: ${bak}"
     lucx_xui_start
@@ -1629,6 +1677,11 @@ xray_probe_client() {
   xray_bin=$(find /usr/local/x-ui -maxdepth 3 -name "xray-linux-*" -type f 2>/dev/null | head -n1 || true)
   [[ -n "$xray_bin" ]] || { echo "NOXRAY"; return 0; }   # v0.5.5: нет инструмента ≠ провал схемы
   w=$(mktemp -d /root/lucx-probe.XXXXXX)
+  # v0.6.5: тело в подоболочке со своей ловушкой: при Ctrl+C или сигнале временный каталог с UUID клиента удаляется,
+  # а фоновый xray на локальном SOCKS-порту не остаётся жить (раньше оба оставались)
+  (
+  trap 'kill "$p" 2>/dev/null || true; rm -rf "$w"' EXIT
+  trap 'exit 130' INT TERM HUP
   cat > "$w/c.json" <<EOF
 {"log":{"loglevel":"warning"},"inbounds":[{"listen":"127.0.0.1","port":${port},"protocol":"socks","settings":{"udp":false}}],"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"${addr}","port":443,"users":[{"id":"${uuid}","encryption":"none","flow":"${flow}"}]}]},"streamSettings":${stream}}]}
 EOF
@@ -1643,6 +1696,7 @@ EOF
   wait "$p" 2>/dev/null || true
   rm -rf "$w"
   echo "$r"
+  )
 }
 
 # Самотест после изменений: сайт по https (200), ALPN, клиенты TLS (и Reality, если передан).
@@ -1706,6 +1760,11 @@ cmd_add_reality_front() {
   fi
   local stream_conf="/etc/nginx/stream-sni-router.conf" stamp sec pp
   SERVER_IP=$(get_server_ip)
+  # v0.6.5: без публичного IP самотест обращался к --resolve домен:443: и падал с откатом, не называя причину
+  if [[ -z "$SERVER_IP" ]]; then
+    echo "ОШИБКА: публичный IP сервера не определён (нет доступа к внешним сервисам?). Ничего не изменено."
+    exit 1
+  fi
   if [[ ! -f "$XUIDB" || ! -f "$stream_conf" ]]; then
     echo "ОШИБКА: ${XUIDB} или ${stream_conf} не найдены — схема скрипта не развёрнута."
     exit 1
@@ -1794,6 +1853,11 @@ cmd_add_h2() {
   fi
   local sec alpn bak front_uuid="" front_pbk="" front_sid="" h2c_ok
   SERVER_IP=$(get_server_ip)
+  # v0.6.5: без публичного IP самотест обращался к --resolve домен:443: и падал с откатом, не называя причину
+  if [[ -z "$SERVER_IP" ]]; then
+    echo "ОШИБКА: публичный IP сервера не определён (нет доступа к внешним сервисам?). Ничего не изменено."
+    exit 1
+  fi
   if [[ ! -f "$XUIDB" ]]; then
     echo "ОШИБКА: ${XUIDB} не найден — схема не развёрнута."
     exit 1
@@ -1834,14 +1898,21 @@ cmd_add_h2() {
   lucx_xui_stop
   sleep 1
   bak="${XUIDB}.backup.$(date +%s)"
-  cp -a "$XUIDB" "$bak"
+  if ! cp -a "$XUIDB" "$bak"; then
+    echo "ОШИБКА: бэкап БД не создан — ничего не меняю."
+    rm -f "$bak"
+    lucx_xui_start || true
+    exit 1
+  fi
   echo "Бэкап БД: ${bak}"
   if ! sqlite3 "$XUIDB" "UPDATE inbounds SET stream_settings=json_set(stream_settings,'\$.tlsSettings.alpn',json('${TLS_ALPN_JSON_H2}')), settings=json_set(settings,'\$.fallbacks',json('${TLS_FB_JSON_H2}')) WHERE protocol='vless' AND port=443 AND listen='127.0.0.1';"; then
     echo "ОШИБКА: UPDATE не удался. Бэкап БД: ${bak}"
     lucx_xui_start
     exit 1
   fi
-  lucx_xui_start
+  # v0.6.5: без `|| true` сбой start под set -e обрывал скрипт до самотеста и отката (БД изменена, x-ui остановлен);
+  # теперь дальше сработает проверка is-active и откат
+  lucx_xui_start || true
   sleep 3
   if reality_front_active && lucx_load_front_params; then
     front_uuid="$FRONT_UUID"; front_pbk="$FRONT_PBK"; front_sid="$FRONT_SID"
@@ -2516,7 +2587,13 @@ cmd_install() {
     ss -tlnp | grep ':443 ' || true
     exit 1
   fi
-  for p in 8443 8444 2096; do
+  # v0.6.5: случайный порт панели мог попасть на занятый; берём другой (порт нигде не выводился до этого места)
+  for _ in 1 2 3 4 5 6 7 8; do
+    ss -tln 2>/dev/null | awk '{print $4}' | grep -qE ":${PANEL_PORT}$" || break
+    PANEL_PORT=$(( (RANDOM % 40000) + 20000 ))
+  done
+  # 8080, 8081 и 8446 схема занимает на loopback (заглушка №2, h2c, Reality перед TLS)
+  for p in 8443 8444 2096 8080 8081 8446; do
     if ss -tlnp 2>/dev/null | grep -q ":$p "; then
       echo "ОШИБКА: порт $p уже занят"
       ss -tlnp | grep ":$p " || true
@@ -2550,7 +2627,8 @@ cmd_install() {
   fi
 
   # v0.3.1: UDP-порты будущих протоколов (hy2 займёт 443/udp, AWG — AWG_PORT)
-  if ss -ulnp 2>/dev/null | grep -qE '(\*|0\.0\.0\.0):443 '; then
+  # v0.6.5: слушатель на любом адресе (в том числе [::]:443 и конкретный IP), а не только *:443 и 0.0.0.0:443
+  if ss -uln 2>/dev/null | awk '{print $5}' | grep -qE ':443$'; then
     echo "ОШИБКА: UDP/443 уже занят:"
     ss -ulnp | grep ':443 ' || true
     exit 1

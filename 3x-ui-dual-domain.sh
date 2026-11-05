@@ -5400,15 +5400,16 @@ cmd_healthcheck() {
     # v0.3.7: добавлены 80/tcp (webroot certbot) и порт AWG; паттерны
     # заякорены на начало строки — без якоря «443/tcp» матчил и «8443/tcp»
     # (детектор матчил не только то, что проверял).
-    ufw status 2>/dev/null | grep -qE "^443/tcp.*ALLOW" && check "ufw: 443/tcp разрешён" ok || check "ufw: 443/tcp НЕ разрешён" fail
-    ufw status 2>/dev/null | grep -qE "^443/udp.*ALLOW" && check "ufw: 443/udp разрешён" ok || check "ufw: 443/udp НЕ разрешён" fail
-    ufw status 2>/dev/null | grep -qE "^80/tcp.*ALLOW" && check "ufw: 80/tcp разрешён (webroot certbot)" ok || check "ufw: 80/tcp НЕ разрешён — продление сертов через webroot упадёт" fail
+    # v0.6.5: вывод ufw читается один раз (pipe в grep -q под pipefail давал случайный ложный FAIL из-за SIGPIPE)
+    HC3_UFW=$(ufw status 2>/dev/null || true)
+    grep -qE "^443/tcp.*ALLOW" <<<"$HC3_UFW" && check "ufw: 443/tcp разрешён" ok || check "ufw: 443/tcp НЕ разрешён" fail
+    grep -qE "^443/udp.*ALLOW" <<<"$HC3_UFW" && check "ufw: 443/udp разрешён" ok || check "ufw: 443/udp НЕ разрешён" fail
+    grep -qE "^80/tcp.*ALLOW" <<<"$HC3_UFW" && check "ufw: 80/tcp разрешён (webroot certbot)" ok || check "ufw: 80/tcp НЕ разрешён — продление сертов через webroot упадёт" fail
     if [[ -n "$AWG_PORT_HC" ]]; then
-      ufw status 2>/dev/null | grep -qE "^${AWG_PORT_HC}/udp.*ALLOW" && check "ufw: ${AWG_PORT_HC}/udp разрешён (AWG)" ok || check "ufw: ${AWG_PORT_HC}/udp (AWG) НЕ разрешён" fail
+      grep -qE "^${AWG_PORT_HC}/udp.*ALLOW" <<<"$HC3_UFW" && check "ufw: ${AWG_PORT_HC}/udp разрешён (AWG)" ok || check "ufw: ${AWG_PORT_HC}/udp (AWG) НЕ разрешён" fail
     fi
     # v0.6.5: правило для SSH. Если ufw включён, а порта sshd в правилах нет, новое подключение по SSH после перезагрузки
     # или перезапуска ufw будет отрезано. Только предупреждение: вход может быть разрешён и по-другому (по адресу, по профилю)
-    HC3_UFW=$(ufw status 2>/dev/null || true)
     if grep -q '^Status: active' <<<"$HC3_UFW"; then
       HC3_SSHP=$(lucx_detect_ssh_ports 2>/dev/null || true)
       [[ -n "${HC3_SSHP// /}" ]] || HC3_SSHP=$(SSH_PORT="" lucx_detect_ssh_ports 2>/dev/null || true)   # кривой SSH_PORT в окружении не должен прятать проверку
@@ -5977,7 +5978,7 @@ cmd_healthcheck() {
   echo
 
   echo "=== [9] AWG модуль ядра ==="
-  if lsmod 2>/dev/null | grep -q amneziawg; then
+  if grep -q amneziawg <<<"$(lsmod 2>/dev/null || true)"; then
     check "Модуль amneziawg загружен" ok
     rm -f "$AWG_REBOOT_FLAG" 2>/dev/null || true   # ребут после установки нового ядра уже был
   elif [[ -f "$AWG_REBOOT_FLAG" ]]; then
@@ -6059,9 +6060,10 @@ cmd_healthcheck() {
       if [[ -n "$HC11_LINE" ]]; then HC11_ALLOW_UDP+="${HC11_LINE} "; fi
     done < "$HC11_EXC_UDP"
   fi
+  HC11_UFW_TXT=$(ufw status 2>/dev/null || true)   # v0.6.5: один вызов, без pipe в grep -q (SIGPIPE под pipefail)
   HC11_UFW_ALLOWS() {
     # $1 = порт, $2 = протокол; строка ufw: "<port>/<proto>  ALLOW  Anywhere"
-    ufw status 2>/dev/null | grep -qE "^${1}/${2}[[:space:]]+ALLOW"
+    grep -qE "^${1}/${2}[[:space:]]+ALLOW" <<<"$HC11_UFW_TXT"
   }
   HC11_LEAKS=0
   declare -A HC11_SEEN=()

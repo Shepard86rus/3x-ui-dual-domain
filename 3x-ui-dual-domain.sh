@@ -702,7 +702,7 @@
 #   со сторонними осознанными портами достаточно один раз создать
 #   файл-исключение.
 # v0.4.6: HC11 — SSH-ПОРТ В БЕЛОМ СПИСКЕ БЕРЁТСЯ С ФАКТА, А НЕ ХАРДКОДОМ
-#   (по ревью Клоуда, внешний аудит v0.4.4, 2026-10-10). Регрессия v0.4.4:
+#   (по внешнему ревью, аудит v0.4.4, 2026-10-10). Регрессия v0.4.4:
 #   HC11_ALLOW_TCP захардкоживал " 22 80 443 ", тогда как install [3/10]
 #   с v0.3.8 детектит фактические порты sshd (ss -tlnp | grep sshd) и
 #   открывает в ufw именно их. cmd_healthcheck — ОТДЕЛЬНЫЙ прогон скрипта:
@@ -728,7 +728,7 @@
 #   «Сохранить», неинтерактивный x-ui update без 'y\n4\n').
 #   Файл публикуется в репо Shepard86rus/3x-ui-dual-domain (скраб-политика:
 #   в комментариях нет хостнеймов/IP/имён клиентов).
-#   Патч по ревью Клоуда (2026-10-11): sort -V (защита от даунгрейда при локальной
+#   Патч по внешнему ревью (2026-10-11): sort -V (защита от даунгрейда при локальной
 #   версии новее remote), единый источник версий (raw main для INFO и upgrade; с v0.5.5 upgrade берёт
 #   releases/latest, INFO в healthcheck с v0.6.5 тоже), tmp рядом со скриптом (rename-атомарность, не
 #   copy+unlink через /tmp).
@@ -747,7 +747,7 @@
 #   remove-bot. HEALTHCHECK [12]: юнит/токен/chat_id/версия тела (не установлен —
 #   строка-пропуск, не FAIL).
 # v0.4.9: ПРЕДОХРАНИТЕЛИ совместимости с панелью .291+ (по живому тесту на тестовой ноде
-#   от 2026-10-13 и двум аудитам Клоуда).
+#   от 2026-10-13 и двум внешним аудитам).
 #   (1) ГАРАНТИЯ SQLITE: install.sh уже запускается в NONINTERACTIVE с
 #       XUI_DB_TYPE=sqlite (env-блок был и в v0.4.8) — v0.4.9 добавляет
 #       ПРОВЕРКУ ФАКТА после install.sh: install-result.env обязан сказать
@@ -1286,11 +1286,18 @@ hy2_rollback_db() {
   HY2_AUTH=""   # инбаунда hy2 больше нет: ссылку и auth в креды не писать
   [[ -n "$bak" && -s "$bak" ]] || { echo "ОШИБКА: копии БД для отката нет (${bak:-путь пуст}). Верни вручную: ${XUIDB}.backup.*"; return 1; }
   echo "Откат: возвращаю БД из ${bak} (инбаунд hy2 убирается)."
-  systemctl stop x-ui 2>/dev/null || true
-  if ! cp -p "$bak" "$XUIDB"; then
-    echo "ОШИБКА: не удалось вернуть БД. Верни вручную: cp -p ${bak} ${XUIDB} && systemctl start x-ui"
+  # БД не трогаем, пока x-ui не остановлен: перезапись файла, который держит работающий процесс, портит данные
+  if ! systemctl stop x-ui; then
+    echo "ОШИБКА: x-ui не остановился — БД не трогаю. Верни вручную: systemctl stop x-ui && cp -p ${bak} ${XUIDB} && rm -f ${XUIDB}-wal ${XUIDB}-shm && systemctl start x-ui"
     return 1
   fi
+  if ! { cp -p "$bak" "${XUIDB}.rb" && mv -f "${XUIDB}.rb" "$XUIDB"; }; then
+    rm -f "${XUIDB}.rb"
+    echo "ОШИБКА: не удалось вернуть БД. Верни вручную: cp -p ${bak} ${XUIDB} && rm -f ${XUIDB}-wal ${XUIDB}-shm && systemctl start x-ui"
+    return 1
+  fi
+  # после аварийного завершения x-ui рядом остаются WAL-файлы: SQLite применил бы их к возвращённой БД (hy2 вернулся бы или БД испортилась)
+  rm -f "${XUIDB}-wal" "${XUIDB}-shm"
   if ! systemctl start x-ui; then
     echo "ОШИБКА: x-ui не запустился после отката. Смотри: journalctl -u x-ui -n 50"
     return 1
@@ -1427,14 +1434,15 @@ cmd_add_hy2() {
   done
   # v0.6.5: повторный запуск на сервере, где hy2 уже работает, раньше упирался в проверку «UDP/443 занят» (его же xray)
   # и давал ложную ошибку с советом переносить AWG; ветка «Hy2 уже был настроен» была недостижима
+  local hy2_exists=0
   if sqlite3 "$XUIDB" "SELECT 1 FROM inbounds WHERE protocol='hysteria' AND port='443' LIMIT 1;" 2>/dev/null | grep -q 1; then
-    echo "Hy2 уже настроен — ничего не меняю."
-    echo "Ссылка и креды: ${CREDS_FILE} (строки Hy2 *). Проверка: bash $0 healthcheck"
-    exit 0
+    hy2_exists=1
+    echo "Hy2 уже настроен — инбаунд не трогаю; ниже проверю правило ufw и cron certbot."
   fi
+  if [[ "$hy2_exists" -eq 0 ]]; then
   # v0.6.5: слушатель на любом адресе (в том числе [::]:443 и конкретный IP): инбаунд hy2 слушает все интерфейсы,
   # любой занятый UDP/443 роняет xray целиком
-  if ss -uln 2>/dev/null | awk '{print $4}' | grep -qE ':443$'; then
+  if ss -uln 2>/dev/null | awk '$4 ~ /:443$/ {f=1} END {exit !f}'; then
     echo "ОШИБКА: UDP/443 уже занят:"
     ss -ulnp | grep ':443 ' || true
     echo "Если там AWG — переедь его на другой порт в панели (AmneziaWG -> порт),"
@@ -1458,6 +1466,7 @@ cmd_add_hy2() {
   fi
 
   create_hy2_inbound || exit 1
+  fi   # hy2_exists
 
   # v0.6.5: add-hy2 не открывал 443/udp в ufw (рассчитывал на правило от прежней схемы); без правила hy2 молча недоступен
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
@@ -1500,7 +1509,7 @@ EOF
   else
     # Идемпотентность: hy2 уже существовал, HY2_AUTH не генерировался заново.
     echo
-    echo "Hy2 уже был настроен ранее — ничего не менялось."
+    echo "Hy2 уже был настроен ранее — инбаунд не менялся (правило ufw и cron проверены)."
     echo "Ссылка и креды: ${CREDS_FILE} (строки Hy2 *)."
     echo "Проверка: bash $0 healthcheck"
   fi
@@ -1514,6 +1523,12 @@ ensure_decoy2_http_vhost() {
   if [[ -f /etc/nginx/sites-enabled/decoy2-http.conf ]] && \
      grep -qF "listen 127.0.0.1:8080" /etc/nginx/sites-enabled/decoy2-http.conf 2>/dev/null; then
     return 0
+  fi
+  # старый файл (если был без нужного listen) сохраняем: при провале nginx -t вернём его, а не оставим сервер без заглушки №2
+  local d2_old=""
+  if [[ -f /etc/nginx/sites-available/decoy2-http.conf ]]; then
+    d2_old=$(mktemp)
+    cp -p /etc/nginx/sites-available/decoy2-http.conf "$d2_old" 2>/dev/null || d2_old=""
   fi
   cat > /etc/nginx/sites-available/decoy2-http.conf <<EOF
 server {
@@ -1530,10 +1545,16 @@ EOF
   ln -sf /etc/nginx/sites-available/decoy2-http.conf /etc/nginx/sites-enabled/decoy2-http.conf
   if ! nginx -t 2>/dev/null; then
     echo "ОШИБКА: nginx -t не прошёл после создания decoy2-http.conf"
-    # v0.6.5: убираем наш vhost (как у decoy-h2c): сломанный конфиг не должен пережить следующий reload или перезагрузку
-    rm -f /etc/nginx/sites-enabled/decoy2-http.conf /etc/nginx/sites-available/decoy2-http.conf
+    # v0.6.5: сломанный конфиг не должен пережить следующий reload или перезагрузку: возвращаем прежний файл, а если его не было, убираем наш
+    if [[ -n "$d2_old" && -s "$d2_old" ]]; then
+      cp -p "$d2_old" /etc/nginx/sites-available/decoy2-http.conf
+    else
+      rm -f /etc/nginx/sites-enabled/decoy2-http.conf /etc/nginx/sites-available/decoy2-http.conf
+    fi
+    [[ -n "$d2_old" ]] && rm -f "$d2_old"
     return 1
   fi
+  [[ -n "$d2_old" ]] && rm -f "$d2_old"
   systemctl reload nginx
 }
 
@@ -2525,8 +2546,9 @@ cmd_install() {
   fi
   # v0.6.5: stream-роутер слушает явный IP (listen ${SERVER_IP}:443): если адрес не назначен интерфейсу (NAT, внешний адрес
   # облака), nginx не стартует. Раньше это вскрывалось в середине установки, теперь — до начала (как в rebind-ip)
-  if command -v ip >/dev/null 2>&1 && ! ip -4 -o addr show 2>/dev/null | grep -qwF "$SERVER_IP"; then
-    echo "СТОП: ${SERVER_IP} не назначен ни одному интерфейсу сервера (NAT или другой исходящий адрес): nginx не сможет его слушать."
+  if command -v ip >/dev/null 2>&1 && ! grep -qwF "$SERVER_IP" <<<"$(ip -4 -o addr show 2>/dev/null || true)"; then
+    echo "СТОП: ${SERVER_IP} не назначен ни одному интерфейсу сервера (NAT, прокси/WARP на исходящем трафике или другой исходящий адрес): nginx не сможет его слушать."
+    echo "      Адреса интерфейсов: $(ip -4 -o addr show 2>/dev/null | awk '{print $4}' | tr '\n' ' ')"
     echo "      Установка не начата: схема рассчитана на сервер, у которого публичный адрес назначен самому интерфейсу ('ip -4 addr')."
     echo "      За NAT (внешний адрес облака) такая установка не поддерживается: возьмите сервер с публичным IPv4 на интерфейсе."
     exit 1
@@ -2609,9 +2631,13 @@ cmd_install() {
   fi
   # v0.6.5: случайный порт панели мог попасть на занятый; берём другой (порт нигде не выводился до этого места)
   for _ in 1 2 3 4 5 6 7 8; do
-    ss -tln 2>/dev/null | awk '{print $4}' | grep -qE ":${PANEL_PORT}$" || break
+    ss -tln 2>/dev/null | awk -v p=":${PANEL_PORT}" '$4 ~ (p "$") {f=1} END {exit !f}' || break
     PANEL_PORT=$(( (RANDOM % 40000) + 20000 ))
   done
+  if ss -tln 2>/dev/null | awk -v p=":${PANEL_PORT}" '$4 ~ (p "$") {f=1} END {exit !f}'; then
+    echo "ОШИБКА: не удалось подобрать свободный порт для панели (8 попыток). Повтори запуск."
+    exit 1
+  fi
   # 8080, 8081 и 8446 схема занимает на loopback (заглушка №2, h2c, Reality перед TLS)
   for p in 8443 8444 2096 8080 8081 8446; do
     if ss -tlnp 2>/dev/null | grep -q ":$p "; then
@@ -2648,7 +2674,7 @@ cmd_install() {
 
   # v0.3.1: UDP-порты будущих протоколов (hy2 займёт 443/udp, AWG — AWG_PORT)
   # v0.6.5: слушатель на любом адресе (в том числе [::]:443 и конкретный IP), а не только *:443 и 0.0.0.0:443
-  if ss -uln 2>/dev/null | awk '{print $4}' | grep -qE ':443$'; then
+  if ss -uln 2>/dev/null | awk '$4 ~ /:443$/ {f=1} END {exit !f}'; then
     echo "ОШИБКА: UDP/443 уже занят:"
     ss -ulnp | grep ':443 ' || true
     exit 1
@@ -5247,7 +5273,7 @@ cmd_healthcheck() {
 
   # v0.6.5: адрес для проверки nginx берётся из listen stream-роутера (то, что nginx реально слушает), а не только из
   # внешнего определения публичного IP: за NAT или при недоступных сервисах определения IP проверка давала ложный результат
-  HC_STREAM_IP=$(grep -oP '^\s*listen \K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(?=:443;)' /etc/nginx/stream-sni-router.conf 2>/dev/null | head -n1 || true)
+  HC_STREAM_IP=$(grep -oP '^\s*listen\s+\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(?=:443;)' /etc/nginx/stream-sni-router.conf 2>/dev/null | head -n1 || true)
   HC_NGX_IP="${HC_STREAM_IP:-${SERVER_IP:-}}"
   if [[ -n "$HC_NGX_IP" ]]; then
     # v0.3.3: с этой версии install генерирует "listen 443;" (wildcard),
@@ -5377,10 +5403,14 @@ cmd_healthcheck() {
     fi
     # v0.6.5: правило для SSH. Если ufw включён, а порта sshd в правилах нет, новое подключение по SSH после перезагрузки
     # или перезапуска ufw будет отрезано. Только предупреждение: вход может быть разрешён и по-другому (по адресу, по профилю)
-    if ufw status 2>/dev/null | grep -q '^Status: active'; then
+    HC3_UFW=$(ufw status 2>/dev/null || true)
+    if grep -q '^Status: active' <<<"$HC3_UFW"; then
       HC3_SSHP=$(lucx_detect_ssh_ports 2>/dev/null || true)
+      [[ -n "${HC3_SSHP// /}" ]] || HC3_SSHP=$(SSH_PORT="" lucx_detect_ssh_ports 2>/dev/null || true)   # кривой SSH_PORT в окружении не должен прятать проверку
       for HC3_P in $HC3_SSHP; do
-        if ufw status 2>/dev/null | grep -qE "^${HC3_P}(/tcp)?[[:space:]]+ALLOW" || ufw status 2>/dev/null | grep -qiE "^(OpenSSH|SSH)[[:space:]]+ALLOW"; then
+        # профиль OpenSSH открывает только 22/tcp; правила вида «22/tcp on eth0 ALLOW» и «ufw limit» тоже считаются разрешением
+        if grep -qE "^${HC3_P}(/tcp)?([[:space:]]+on[[:space:]]+[^[:space:]]+)?[[:space:]]+(ALLOW|LIMIT)" <<<"$HC3_UFW" \
+           || { [[ "$HC3_P" == "22" ]] && grep -qiE "^(OpenSSH|SSH)[[:space:]]+(ALLOW|LIMIT)" <<<"$HC3_UFW"; }; then
           check "ufw: SSH-порт ${HC3_P}/tcp разрешён" ok
         else
           check "ufw: для SSH-порта ${HC3_P}/tcp нет правила ALLOW — после перезапуска ufw доступ по SSH может пропасть (проверь: ufw status)" warn
@@ -5427,8 +5457,12 @@ cmd_healthcheck() {
     # IP, сервер жив").
     if grep -qE "^\s*listen 443;" "$STREAM_CONF"; then
       check "stream: wildcard-форма 'listen 443;' (v0.3.3–v0.3.4, ОТОЗВАНА в v0.3.5 — регресс, см. changelog) — Reality может быть мёртв; исправь: bash $0 rebind-ip" warn
-    elif [[ -n "${HC_STREAM_IP:-}" ]] && ip -4 -o addr show 2>/dev/null | grep -qwF "$HC_STREAM_IP"; then
-      check "stream: слушает явный IP ${HC_STREAM_IP} (назначен интерфейсу сервера; штатная форма v0.3.5+, при смене IP: bash $0 rebind-ip)" ok
+    elif [[ -n "${HC_STREAM_IP:-}" ]] && grep -qwF "$HC_STREAM_IP" <<<"$(ip -4 -o addr show 2>/dev/null || true)"; then
+      if [[ -n "${SERVER_IP:-}" && "$SERVER_IP" != "$HC_STREAM_IP" ]]; then
+        check "stream: слушает ${HC_STREAM_IP} (назначен интерфейсу), а исходящий публичный IP ${SERVER_IP} — сверь A-записи доменов с ${HC_STREAM_IP}" warn
+      else
+        check "stream: слушает явный IP ${HC_STREAM_IP} (назначен интерфейсу сервера; штатная форма v0.3.5+, при смене IP: bash $0 rebind-ip)" ok
+      fi
     elif [[ -z "${SERVER_IP:-}" ]]; then
       check "stream: публичный IP не определён — legacy-форму сверить нельзя, пропускаю" warn
     elif grep -qE "^\s*listen ${SERVER_IP}:443;" "$STREAM_CONF"; then
@@ -6260,7 +6294,7 @@ cmd_rebind_ip() {
     echo "ОШИБКА: '${SERVER_IP}' — не IPv4-адрес. Ничего не изменено."
     exit 1
   fi
-  if command -v ip >/dev/null 2>&1 && ! ip -4 -o addr show 2>/dev/null | grep -qwF "$SERVER_IP"; then
+  if command -v ip >/dev/null 2>&1 && ! grep -qwF "$SERVER_IP" <<<"$(ip -4 -o addr show 2>/dev/null || true)"; then
     echo "СТОП: ${SERVER_IP} не назначен ни одному интерфейсу сервера (NAT или другой исходящий адрес): nginx не сможет его слушать."
     echo "      Ничего не изменено. Если нужен другой адрес — укажи тот, что виден в 'ip -4 addr'."
     exit 1
@@ -6676,7 +6710,7 @@ cmd_upgrade() {
   local raw_url="https://github.com/Shepard86rus/3x-ui-dual-domain/releases/latest/download/3x-ui-dual-domain.sh"
   local sha_url="${raw_url}.sha256"
   local tmp self_dir want got
-  # v0.4.7-fix (ревью Клоуда): tmp в каталоге скрипта (та же ФС) — mv = rename(2),
+  # v0.4.7-fix (внешнее ревью): tmp в каталоге скрипта (та же ФС) — mv = rename(2),
   # а не copy+unlink с обрезкой inode под работающим bash
   self_dir=$(dirname -- "$0")
   [[ -d "$self_dir" && -w "$self_dir" ]] || self_dir="/tmp"
@@ -6709,7 +6743,7 @@ cmd_upgrade() {
   if [[ "$new_ver" == "$VERSION" ]]; then
     rm -f "$tmp"; echo "Скрипт уже актуален: v$VERSION. Обновлять нечего."; return 0
   fi
-  # v0.4.7-fix (ревью Клоуда): направление сравнения — локальная новее удалённой
+  # v0.4.7-fix (внешнее ревью): направление сравнения — локальная новее удалённой
   # означает даунгрейд, его не делаем (паттерн маркера v0.4.1: sort -V)
   if [[ "$(printf '%s\n%s\n' "$VERSION" "$new_ver" | sort -V | head -n1)" != "$VERSION" ]]; then
     rm -f "$tmp"; echo "ОТКАЗ: локальная версия v$VERSION НОВЕЕ удалённой v$new_ver — даунгрейд не выполняю"; return 1
@@ -7404,7 +7438,14 @@ cmd_remove_swap() {
     cp -a /etc/fstab "/etc/fstab.backup.$(date +%s)"
     # v0.6.5: grep -v возвращает 1, если в fstab была только строка swap; прежний `&&` тогда не обновлял fstab,
     # а swap-файл удалялся (при загрузке systemd жаловался на отсутствующий swap)
-    grep -vF "$SWAP_MARK" /etc/fstab > /etc/fstab.tmp.3xui || true
+    local frc=0
+    grep -vF "$SWAP_MARK" /etc/fstab > /etc/fstab.tmp.3xui || frc=$?
+    # код 1 = в fstab не осталось других строк (нормально); код 2 или нет файла = ошибка: fstab не трогаем (иначе он мог остаться пустым)
+    if [[ $frc -gt 1 || ! -f /etc/fstab.tmp.3xui ]]; then
+      echo "ОШИБКА: не удалось подготовить новый fstab — fstab не трогаю (копия: /etc/fstab.backup.*)"
+      rm -f /etc/fstab.tmp.3xui
+      return 1
+    fi
     cat /etc/fstab.tmp.3xui > /etc/fstab
     rm -f /etc/fstab.tmp.3xui
   fi
@@ -7678,6 +7719,7 @@ cmd_add_xhttp() {
   sbak="/root/stream-sni-router.conf.pre-xhttp-${stamp}"
   cp -a "$stream_conf" "$sbak"
   echo "Бэкап nginx-конфига: ${sbak}"
+  # при обрыве SSH самотест тоже прерывается и запускает откат (trap 'exit 130' в подоболочке пробы)
   XH_SBAK="$sbak"; XH_ARMED=1
   trap '' HUP PIPE            # обрыв SSH → откат (ловушка ниже вернёт прежнее состояние)
   trap xhttp_exit_trap EXIT
@@ -8368,14 +8410,15 @@ cmd_restore() {
   # v0.6.5: порты из восстановленных /root/.lucx-public-*-ports.txt (открытые осознанно на старом сервере): файлы пришли из
   # архива, а правил ufw они не создают; healthcheck такие порты считает разрешёнными и о закрытом ufw молчит
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-    local pf pproto pnum pmiss=""
+    local pf pproto pnum pmiss="" pufw
+    pufw=$(ufw status 2>/dev/null || true)
     for pproto in tcp udp; do
       pf="/root/.lucx-public-${pproto}-ports.txt"
       [[ -f "$pf" ]] || continue
       while IFS= read -r pnum || [[ -n "$pnum" ]]; do
         pnum="${pnum%%#*}"; pnum="$(tr -d '[:space:]' <<<"$pnum")"
         [[ "$pnum" =~ ^[0-9]+$ ]] || continue
-        ufw status 2>/dev/null | grep -qE "^${pnum}(/${pproto})?[[:space:]]+ALLOW" || pmiss+="${pnum}/${pproto} "
+        grep -qE "^${pnum}(/${pproto})?([[:space:]]+on[[:space:]]+[^[:space:]]+)?[[:space:]]+(ALLOW|LIMIT)" <<<"$pufw" || pmiss+="${pnum}/${pproto} "
       done < "$pf"
     done
     [[ -n "$pmiss" ]] && bk_say "  ВНИМАНИЕ: порты из ${pf%/*}/.lucx-public-*-ports.txt без правила ufw ALLOW: ${pmiss}— снаружи они закрыты; откройте: ufw allow <порт>/tcp (или /udp)."

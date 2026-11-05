@@ -730,7 +730,7 @@
 #   в комментариях нет хостнеймов/IP/имён клиентов).
 #   Патч по ревью Клоуда (2026-10-11): sort -V (защита от даунгрейда при локальной
 #   версии новее remote), единый источник версий (raw main для INFO и upgrade; с v0.5.5 upgrade берёт
-#   releases/latest, INFO в healthcheck пока остаётся на raw main), tmp рядом со скриптом (rename-атомарность, не
+#   releases/latest, INFO в healthcheck с v0.6.5 тоже), tmp рядом со скриптом (rename-атомарность, не
 #   copy+unlink через /tmp).
 # v0.4.8: ОПЦИОНАЛЬНЫЙ TELEGRAM-БОТ УПРАВЛЕНИЯ (решение владельца 2026-10-13).
 #   В конце install вопрос «Поставить Telegram-бота управления? [y/N]» — дефолт НЕТ,
@@ -1954,8 +1954,6 @@ cmd_switch_mode() {
     exit 0
   fi
 
-  local now_ms
-  now_ms=$(( $(date +%s) * 1000 ))
   uuid=$(sqlite3 "$XUIDB" "SELECT json_extract(settings,'\$.clients[0].id') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
   if [[ -z "$uuid" ]]; then
     echo "ОШИБКА: не прочитал UUID клиента из инбаунда."
@@ -2141,10 +2139,10 @@ install_preflight_pypi() {
   command -v curl >/dev/null 2>&1 || return 0
   local url="${LUCX_PYPI_URL:-https://pypi.org/simple/pip/}" gai="${LUCX_GAI_CONF:-/etc/gai.conf}"
   local mark="# lucx: IPv4 первым (IPv6 до PyPI не отвечает, pip иначе виснет)"
-  local rc4=0 rc6=0 created=0 host="${LUCX_GAI_TEST_HOST:-pypi.org}" first="" try
+  local rc4=0 rc6=0 created=0 host="${LUCX_GAI_TEST_HOST:-pypi.org}" first=""
 
   # IPv4: до двух попыток (разовый сбой сети не должен считаться недоступностью)
-  for try in 1 2; do
+  for _ in 1 2; do
     rc4=0
     curl -4 -sS -I --connect-timeout 5 -m 15 -o /dev/null "$url" >/dev/null 2>&1 || rc4=$?
     [[ $rc4 -eq 0 ]] && break
@@ -2434,6 +2432,12 @@ cmd_install() {
   fi
   if [[ -z "$SERVER_IP" ]]; then
     echo "ОШИБКА: не удалось определить публичный IP."
+    exit 1
+  fi
+  # v0.6.5: введённый вручную адрес проверяем до начала установки (раньше install падал позже на nginx -t с непонятным
+  # сообщением; в rebind-ip та же проверка есть с 0.6.4)
+  if ! [[ "$SERVER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "ОШИБКА: '${SERVER_IP}' — не IPv4-адрес. Установка не начата."
     exit 1
   fi
 
@@ -3246,10 +3250,7 @@ DECOYTPL03
 
   template_04() {
     # Signal Hill — radio club
-    local LOG1 LOG2 LOG3 TUE_TIME
-    LOG1="3306-$(date -d '-3 days' +'%m-%d')"
-    LOG2="3306-$(date -d '-18 days' +'%m-%d')"
-    LOG3="3306-$(date -d '-45 days' +'%m-%d')"
+    local TUE_TIME
     TUE_TIME="$(date -d 'next tuesday' +'%a %H:%M') local"
     cat <<DECOYTPL04
 <!DOCTYPE html>
@@ -5073,8 +5074,9 @@ cmd_healthcheck() {
   # v0.4.7: INFO о новой версии скрипта (тихо без сети; не влияет на итог hc).
   # ВАЖНО: `|| true` обязателен — под set -e -o pipefail отсутствие сети/404
   # приватного репо убивало весь healthcheck (поймано в тесте на полигоне)
-  # v0.4.7-fix (ревью Клоуда): единый источник с upgrade — raw main, а не releases/latest
-  hc_latest_ver=$(timeout 8 curl -fsSL "https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/3x-ui-dual-domain.sh" 2>/dev/null | grep -m1 '^VERSION=' | cut -d'"' -f2 || true)
+  # v0.6.5: тот же источник, что у upgrade (последний релиз), а не ветка main: иначе при версии в main новее релиза
+  # healthcheck советовал upgrade, а upgrade отвечал «уже актуален»
+  hc_latest_ver=$(timeout 8 curl -fsSL "https://github.com/Shepard86rus/3x-ui-dual-domain/releases/latest/download/3x-ui-dual-domain.sh" 2>/dev/null | grep -m1 '^VERSION=' | cut -d'"' -f2 || true)
   if [[ -n "$hc_latest_ver" && "$hc_latest_ver" != "$VERSION" ]] && [[ "$(printf '%s\n%s\n' "$VERSION" "$hc_latest_ver" | sort -V | head -n1)" == "$VERSION" ]]; then
     echo "INFO: доступна новая версия скрипта v${hc_latest_ver} (установлена v${VERSION}) — обновление: bash $0 upgrade"
   fi
@@ -7278,7 +7280,10 @@ cmd_remove_swap() {
   fi
   if grep -qF "$SWAP_MARK" /etc/fstab 2>/dev/null; then
     cp -a /etc/fstab "/etc/fstab.backup.$(date +%s)"
-    grep -vF "$SWAP_MARK" /etc/fstab > /etc/fstab.tmp.3xui && cat /etc/fstab.tmp.3xui > /etc/fstab
+    # v0.6.5: grep -v возвращает 1, если в fstab была только строка swap; прежний `&&` тогда не обновлял fstab,
+    # а swap-файл удалялся (при загрузке systemd жаловался на отсутствующий swap)
+    grep -vF "$SWAP_MARK" /etc/fstab > /etc/fstab.tmp.3xui || true
+    cat /etc/fstab.tmp.3xui > /etc/fstab
     rm -f /etc/fstab.tmp.3xui
   fi
   rm -f "$SWAP_FILE"

@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 472" width="760" height="472" role="img" aria-label="Запрос проверяется правилами сверху вниз, срабатывает первое подошедшее" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13">
+<rect width="760" height="472" rx="8" fill="#ffffff"/>
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8c959f"/></marker></defs>
+<text x="24" y="28" font-size="15" font-weight="600" fill="#1f2328">Срабатывает первое подошедшее правило</text>
+<text x="24" y="50" font-size="11.5" fill="#57606a">Не подошло — запрос идёт к следующему правилу вниз. Подошло — уходит туда, куда указывает стрелка.</text>
+<rect x="24" y="72" width="340" height="40" rx="8" fill="none" stroke="#8c959f" stroke-width="1.25"/>
+<rect x="460" y="72" width="276" height="40" rx="8" fill="none" stroke="#8c959f" stroke-width="1.25"/>
+<path d="M364 92H460" fill="none" stroke="#8c959f" stroke-width="1.25" marker-end="url(#a)"/>
+<path d="M194 112V128" fill="none" stroke="#8c959f" stroke-width="1.25" marker-end="url(#a)"/>
+<text x="40" y="97" fill="#1f2328">1. Служебный трафик панели</text>
+<text x="476" y="97" font-weight="600" fill="#1f2328">api</text>
+<rect x="24" y="128" width="340" height="40" rx="8" fill="none" stroke="#8c959f" stroke-width="1.25"/>
+<rect x="460" y="128" width="276" height="40" rx="8" fill="#cf222e" fill-opacity="0.12" stroke="#cf222e" stroke-width="1.25"/>
+<path d="M364 148H460" fill="none" stroke="#8c959f" stroke-width="1.25" marker-end="url(#a)"/>
+<path d="M194 168V184" fill="none" stroke="#8c959f" stroke-width="1.25" marker-end="url(#a)"/>
+<text x="40" y="153" fill="#1f2328">2. Частные адреса</text>
+<text x="476" y="153" font-weight="600" fill="#1f2328">blocked — отбросить</text>
+<rect x="24" y="184" width="340" height="40" rx="8" fill="none" stroke="#8c959f" stroke-width="1.25"/>
+<rect x="460" y="184" width="276" height="40" rx="8" fill="#cf222e" fill-opacity="0.12" stroke="#cf222e" stroke-width="1.25"/>
+<path d="M364 204H460" fill="none" stroke="#8c959f" stroke-width="1.25" marker-end="url(#a)"/>
+<path d="M194 224V240" fill="none" stroke="#8c959f" stroke-width="1.25" marker-end="url(#a)"/>
+<text x="40" y="209" fill="#1f2328">3. Торренты (если запрещены)</text>
+<text x="476" y="209" font-weight="600" fill="#1f2328">blocked — отбросить</text>
+<rect x="24" y="240" width="340" height="40" rx="8" fill="none" stroke="#8c959f" stroke-width="1.25"/>
+<rect x="460" y="240" width="276" height="40" rx="8" fill="#1a7f37" fill-opacity="0.12" stroke="#1a7f37" stroke-width="1.25"/>
+<path d="M364 260H460" fill="none" stroke="#8c959f" stroke-width="1.25" marker-end="url(#a)"/>
+<path d="M194 280V296" fill="none" stroke="#8c959f" stroke-width="1.25" marker-end="url(#a)"/>
+<text x="40" y="265" fill="#1f2328">4. Российские домены</text>
+<text x="476" y="265" font-weight="600" fill="#1f2328">direct — напрямую</text>
+<rect x="24" y="296" width="340" height="40" rx="8" fill="none" stroke="#8c959f" stroke-width="1.25"/>
+<rect x="460" y="296" width="276" height="40" rx="8" fill="#1a7f37" fill-opacity="0.12" stroke="#1a7f37" stroke-width="1.25"/>
+<path d="M364 316H460" fill="none" stroke="#8c959f" stroke-width="1.25" marker-end="url(#a)"/>
+<path d="M194 336V352" fill="none" stroke="#8c959f" stroke-width="1.25" marker-end="url(#a)"/>
+<text x="40" y="321" fill="#1f2328">5. Российские IP</text>
+<text x="476" y="321" font-weight="600" fill="#1f2328">direct — напрямую</text>
+<rect x="24" y="352" width="340" height="40" rx="8" fill="none" stroke="#8c959f" stroke-width="1.25"/>
+<rect x="460" y="352" width="276" height="40" rx="8" fill="#2f81f7" fill-opacity="0.12" stroke="#2f81f7" stroke-width="2"/>
+<path d="M364 372H460" fill="none" stroke="#8c959f" stroke-width="1.25" marker-end="url(#a)"/>
+<path d="M194 392V408" fill="none" stroke="#8c959f" stroke-width="1.25" marker-end="url(#a)"/>
+<text x="40" y="377" fill="#1f2328">6. Клиенты из списка (по желанию)</text>
+<text x="476" y="377" font-weight="600" fill="#1f2328">Европа: выбранная нода</text>
+<rect x="24" y="408" width="340" height="40" rx="8" fill="none" stroke="#8c959f" stroke-width="1.25"/>
+<rect x="460" y="408" width="276" height="40" rx="8" fill="#2f81f7" fill-opacity="0.12" stroke="#2f81f7" stroke-width="2"/>
+<path d="M364 428H460" fill="none" stroke="#8c959f" stroke-width="1.25" marker-end="url(#a)"/>
+<text x="40" y="433" fill="#1f2328">7. Всё остальное</text>
+<text x="476" y="433" font-weight="600" fill="#1f2328">Европа: to-europe-1</text>
+</svg>

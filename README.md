@@ -219,6 +219,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-doma
 | [docs/troubleshooting.md](docs/troubleshooting.md) | если что-то не так |
 | [docs/ip-change.md](docs/ip-change.md) | сервер сменил IP: DNS и `rebind-ip` по шагам |
 | [docs/migration.md](docs/migration.md) | перенос на другой сервер и откат к снимку: `backup` и `restore` по шагам, проверка, ошибки, вопросы |
+| [docs/cascade.md](docs/cascade.md) | необязательный каскад: вход в России, выход в Европе (исходящее подключение и правила маршрутизации в панели) |
 | [tools/hub/README.md](tools/hub/README.md) | один бот на весь флот (для продвинутых) |
 | [RELEASING.md](RELEASING.md) | как выпустить релиз (для мейнтейнера) |
 

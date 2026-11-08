@@ -2420,6 +2420,69 @@ install_print_summary() {
   echo "====================================================="
 }
 
+# v0.6.7: предпроверка доступа к GitHub в начале install (до вопросов и до любых изменений). Установка качает оттуда панель lucx-ui
+# (api.github.com — список релизов, github.com — архив релиза и списки geo, raw.githubusercontent.com — install.sh панели и шаблоны), а установщик
+# AmneziaWG клонирует утилиты. GitHub бывает недоступен выборочно (часть адресов отвечает, часть нет; сбой может пройти за минуты), и тогда
+# установка падает на середине или молча остаётся без AWG-утилит. Три хоста проверяются параллельно (HEAD, до 3 попыток с паузой 2 с).
+# Любой HTTP-ответ 2xx-4xx считается «доступен» (403 лимита API — это ответ GitHub). api.github.com или github.com не ответили -> СТОП
+# (код 1) с понятным текстом; raw.githubusercontent.com не ответил -> только предупреждение. Пропуск: SKIP_GITHUB_PREFLIGHT=1.
+gh_probe() {  # $1 = файл результата, $2 = URL
+  local try c="000"
+  for try in 1 2 3; do
+    c=$(curl -sS -I -L --max-redirs 3 --connect-timeout 6 -m 12 -o /dev/null -w '%{http_code}' "$2" 2>/dev/null || true)
+    c="${c: -3}"
+    [[ "$c" =~ ^[234][0-9][0-9]$ ]] && break
+    [[ "$try" -lt 3 ]] && sleep 2
+  done
+  [[ "$c" =~ ^[0-9]{3}$ ]] || c="000"
+  printf '%s\n' "$c" > "$1"
+  return 0
+}
+install_preflight_github() {
+  [[ "${SKIP_GITHUB_PREFLIGHT:-0}" == "1" ]] && return 0
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "  curl не найден — проверку доступа к GitHub пропускаю"
+    return 0
+  fi
+  local tmp h c fail_crit="" fail_raw=""
+  local -a hosts=(api.github.com github.com raw.githubusercontent.com)
+  local -a urls=(
+    "https://api.github.com/repos/${LUCX_REPO}/releases?per_page=1"
+    "https://github.com/${LUCX_REPO}/releases"
+    "https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/README.md"
+  )
+  tmp=$(mktemp -d 2>/dev/null) || return 0
+  echo "  Проверка доступа к GitHub (панель, утилиты AmneziaWG, списки маршрутов)..."
+  for h in 0 1 2; do
+    gh_probe "${tmp}/${h}" "${urls[$h]}" &
+  done
+  wait
+  for h in 0 1 2; do
+    c=$(cat "${tmp}/${h}" 2>/dev/null || echo "000")
+    if [[ "$c" =~ ^[234][0-9][0-9]$ ]]; then
+      echo "    ✓ ${hosts[$h]}"
+    else
+      echo "    ✗ ${hosts[$h]} (нет ответа, код ${c})"
+      if [[ "$h" == "2" ]]; then fail_raw="${hosts[$h]}"; else fail_crit+=" ${hosts[$h]}"; fi
+    fi
+  done
+  rm -rf "$tmp"
+  if [[ -n "$fail_crit" ]]; then
+    echo
+    echo "СТОП: сервер не достучался до GitHub:${fail_crit}. Без него установка не дойдёт до конца: не скачается панель и утилиты AmneziaWG."
+    echo "      Это часто временный сбой на пути до GitHub (бывает, что часть адресов отвечает, а часть нет). Что сделать:"
+    echo "        1. Подождать 5-10 минут и запустить install ещё раз (ничего не изменено, повтор безопасен)."
+    echo "        2. Проверить с сервера: curl -sSI https://github.com | head -1   и   getent hosts github.com"
+    echo "        3. Если не проходит долго — попросить хостера проверить маршрут до GitHub или взять сервер в другом месте."
+    echo "      Принудительно продолжить без проверки (на свой риск): SKIP_GITHUB_PREFLIGHT=1 sudo bash $0 install"
+    exit 1
+  fi
+  if [[ -n "$fail_raw" ]]; then
+    echo "  WARN: ${fail_raw} не ответил — оттуда берутся шаблоны и install.sh панели; если установка упадёт на скачивании, повтори её чуть позже."
+  fi
+  return 0
+}
+
 # v0.6.0: предпроверка доступа к PyPI. Установщик панели (lucx-ui, x-ui.sh setup-fail2ban) на Ubuntu >= 24.04 ставит fail2ban и
 # докачивает через pip пакет pyasynchat. Если у сервера есть IPv6-адрес, но маршрут до PyPI по IPv6 не работает, pip ждёт таймаут
 # по каждому адресу и установка выглядит зависшей («Collecting pyasynchat» и тишина). Здесь: (1) IPv4 до PyPI жив, а IPv6 уходит
@@ -2625,6 +2688,7 @@ cmd_install() {
   echo " Версия скрипта: ${VERSION}"
   echo "======================================================"
   install_preflight_kernel
+  install_preflight_github
   read -rp "Домен панели (напр. panel.example.com): " DOMAIN
   echo
   read -rp "Домен-обложка для Reality (напр. reality.example.com): " REALITY_DOMAIN

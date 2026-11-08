@@ -23,9 +23,11 @@
 
    В ответе должен быть новый IP.
 
-3. **На сервере выполните:**
+3. **На сервере выполните.** Скрипт должен лежать в текущей папке. Если его там нет (ошибка
+   `No such file or directory`), скачайте свежий: в старых версиях команды `rebind-ip` может не быть.
 
    ```bash
+   curl -fsSL https://github.com/Shepard86rus/3x-ui-dual-domain/releases/latest/download/3x-ui-dual-domain.sh -o 3x-ui-dual-domain.sh
    sudo bash 3x-ui-dual-domain.sh rebind-ip
    ```
 

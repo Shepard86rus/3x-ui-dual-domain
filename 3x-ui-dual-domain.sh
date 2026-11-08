@@ -2447,8 +2447,11 @@ install_preflight_github() {
     return 0
   fi
   local ans=""
-  read -rp "Проверить доступ к GitHub перед установкой? (рекомендуется) [Y/n]: " ans || ans=""
-  if [[ "${ans,,}" == "n" || "${ans,,}" == "no" || "${ans,,}" == "н" ]]; then
+  # Спрашиваем только в интерактиве (как проверка ядра): иначе вопрос съел бы первую строку ответов из pipe.
+  if [[ -t 0 ]]; then
+    read -rp "Проверить доступ к GitHub перед установкой? (рекомендуется) [Y/n]: " ans || ans=""
+  fi
+  if [[ "${ans,,}" == "n" || "${ans,,}" == "no" ]]; then
     echo "  Проверка GitHub пропущена. Если он недоступен, установка оборвётся позже: не скачается панель или утилиты AmneziaWG."
     return 0
   fi
@@ -2496,7 +2499,7 @@ install_preflight_github() {
     echo "        1. Подождать 5-10 минут и запустить install ещё раз (панель и настройки сервера не тронуты, повтор безопасен)."
     echo "        2. Проверить с сервера: curl -sSI https://github.com | head -1   и   getent hosts github.com"
     echo "        3. Если не проходит долго — попросить хостера проверить маршрут до GitHub или взять сервер в другом месте."
-    echo "      Принудительно продолжить без проверки (на свой риск): sudo SKIP_GITHUB_PREFLIGHT=1 bash ${self} install"
+    echo "      Принудительно продолжить без проверки (на свой риск): ответить n на вопрос о проверке или sudo SKIP_GITHUB_PREFLIGHT=1 bash ${self} install"
     INSTALL_SUCCESS=1   # cleanup не должен трогать x-ui: установка ещё ничего не меняла
     exit 1
   fi

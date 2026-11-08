@@ -2196,8 +2196,9 @@ iv_line() {  # $1 = ok|warn|fail, $2 = текст, $3 = подсказка (не
 install_verify_summary() {
   [[ "${SKIP_INSTALL_VERIFY:-0}" == "1" ]] && return 0
   IV_OK=0; IV_WARN=0; IV_FAIL=0
-  local ip="${SERVER_IP:-}" d res days end n_in n_cl sub_id sub_url code body svc ok_all=1
-  echo "  Проверка установки:"
+  local crt_seen=0 ip="${SERVER_IP:-}" self="${INSTALL_SELF:-3x-ui-dual-domain.sh}"
+  local d res r days end crt n_in n_cl sub_id sub_url code body svc ok_all=1 ss_out ufw_txt miss lsmod_txt dns_bad dns_none
+  echo "  Проверка установки (может занять до минуты):"
 
   # 1. Службы
   for svc in x-ui nginx; do
@@ -2209,8 +2210,9 @@ install_verify_summary() {
   [[ "$ok_all" == "1" ]] && iv_line ok "Службы: x-ui, nginx, Xray запущены"
 
   # 2. Порты: публичный 443 держит nginx, внутренний 127.0.0.1:443 — Xray
-  if ss -tlnp 2>/dev/null | awk -v a="${ip}:443" '$4==a || $4=="0.0.0.0:443" || $4=="*:443" {if ($0 ~ /nginx/) f=1} END{exit !f}'; then
-    if ss -tlnp 2>/dev/null | awk '$4=="127.0.0.1:443" {f=1} END{exit !f}'; then
+  ss_out=$(ss -tlnp 2>/dev/null || true)
+  if awk -v a="${ip}:443" '$4==a || $4=="0.0.0.0:443" || $4=="*:443" {if ($0 ~ /nginx/) f=1} END{exit !f}' <<<"$ss_out"; then
+    if awk '$4=="127.0.0.1:443" {f=1} END{exit !f}' <<<"$ss_out"; then
       iv_line ok "Порт 443: nginx принимает на ${ip:-<IP>}, Xray слушает на 127.0.0.1:443"
     else
       iv_line fail "Порт 443: nginx есть, а Xray на 127.0.0.1:443 не слушает" "перезапусти: systemctl restart x-ui; проверь: ss -tlnp | grep 443"
@@ -2219,84 +2221,124 @@ install_verify_summary() {
     iv_line fail "Порт 443: nginx не слушает публичный адрес ${ip:-<IP не определён>}" "проверь конфиг: nginx -t; ss -tlnp | grep :443"
   fi
 
-  # 3. Домены и сертификаты (DNS сравниваем с публичным IP сервера; серт — срок действия)
-  if [[ -n "$ip" ]] && command -v dig >/dev/null 2>&1; then
-    local dns_bad=""
-    for d in "${DOMAIN:-}" "${REALITY_DOMAIN:-}"; do
-      [[ -n "$d" ]] || continue
-      res=$(dig +short A "$d" @1.1.1.1 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
-      [[ "$res" == "$ip" ]] || dns_bad+=" ${d}(${res:-нет записи})"
-    done
-    if [[ -z "$dns_bad" ]]; then iv_line ok "DNS: A-записи доменов указывают на ${ip}"
-    else iv_line warn "DNS: домен указывает не на этот сервер:${dns_bad}" "исправь A-запись; клиенты подключатся только когда DNS обновится"; fi
-  fi
-  if [[ -n "${REALITY_DOMAIN:-}" ]]; then
-    local crt="/etc/letsencrypt/live/${REALITY_DOMAIN}/fullchain.pem"
-    if [[ -f "$crt" ]] && end=$(openssl x509 -enddate -noout -in "$crt" 2>/dev/null | sed 's/notAfter=//'); then
-      days=$(( ( $(date -d "$end" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
-      if [[ "$days" -gt 14 ]]; then iv_line ok "Сертификат ${REALITY_DOMAIN}: действует ещё ${days} дн."
-      else iv_line warn "Сертификат ${REALITY_DOMAIN}: осталось ${days} дн." "проверь продление: certbot renew --dry-run"; fi
+  # 3. DNS: два резолвера с короткими таймаутами; если никто не ответил — «не проверен», а не «указывает не туда»
+  if [[ -n "$ip" ]]; then
+    if command -v dig >/dev/null 2>&1; then
+      dns_bad=""; dns_none=""
+      for d in "${DOMAIN:-}" "${REALITY_DOMAIN:-}"; do
+        [[ -n "$d" ]] || continue
+        res=""
+        for r in 1.1.1.1 8.8.8.8; do
+          res=$(dig +short +time=3 +tries=1 A "$d" "@$r" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
+          [[ -n "$res" ]] && break
+        done
+        if [[ -z "$res" ]]; then dns_none+=" ${d}"
+        elif [[ "$res" != "$ip" ]]; then dns_bad+=" ${d}(${res})"; fi
+      done
+      if [[ -n "$dns_bad" ]]; then
+        iv_line warn "DNS: домен указывает не на этот сервер:${dns_bad}" "исправь A-запись; клиенты подключатся только когда DNS обновится"
+      elif [[ -n "$dns_none" ]]; then
+        iv_line warn "DNS не проверен (нет ответа от резолверов или записи):${dns_none}" "проверь вручную: dig +short A <домен>"
+      else
+        iv_line ok "DNS: A-записи доменов указывают на ${ip}"
+      fi
     else
-      iv_line fail "Сертификат ${REALITY_DOMAIN} не найден" "ls /etc/letsencrypt/live/; certbot certificates"
+      iv_line warn "DNS не проверен: нет утилиты dig"
     fi
   fi
 
-  # 4. Инбаунды и клиенты в базе панели
-  if [[ -f "$XUIDB" ]]; then
-    n_in=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbounds WHERE enable=1;" 2>/dev/null || echo 0)
-    n_cl=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbounds i, json_each(i.settings,'\$.clients') WHERE i.enable=1;" 2>/dev/null || echo 0)
-    if [[ "${n_in:-0}" -ge 1 && "${n_cl:-0}" -ge 1 ]]; then iv_line ok "Инбаунды: ${n_in} включено, клиентов в них: ${n_cl}"
-    else iv_line fail "Инбаунды: включено ${n_in:-0}, клиентов ${n_cl:-0}" "открой панель и создай инбаунд с клиентом (причина — в логе установки)"; fi
+  # 4. Сертификаты: панельный домен (панель и подписки) и домен Reality
+  for d in "${DOMAIN:-}" "${REALITY_DOMAIN:-}"; do
+    [[ -n "$d" ]] || continue
+    [[ "$d" == "${REALITY_DOMAIN:-}" && "$d" == "${DOMAIN:-}" && "$crt_seen" == "1" ]] && continue
+    crt_seen=1
+    crt="/etc/letsencrypt/live/${d}/fullchain.pem"
+    if [[ ! -f "$crt" ]]; then
+      iv_line fail "Сертификат ${d} не найден" "ls /etc/letsencrypt/live/; certbot certificates"; continue
+    fi
+    end=$(openssl x509 -enddate -noout -in "$crt" 2>/dev/null | sed 's/notAfter=//' || true)
+    days=$(( ( $(date -d "$end" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
+    if [[ -z "$end" || "$days" -gt 36500 || "$days" -lt -36500 ]]; then
+      iv_line warn "Сертификат ${d}: не удалось прочитать срок действия" "openssl x509 -enddate -noout -in ${crt}"
+    elif [[ "$days" -gt 14 ]]; then
+      iv_line ok "Сертификат ${d}: действует ещё ${days} дн."
+    else
+      iv_line warn "Сертификат ${d}: осталось ${days} дн." "проверь продление: certbot renew --dry-run"
+    fi
+  done
+
+  # 5. Инбаунды и клиенты (клиентов считаем по таблице client_inbounds, откуда их берёт Xray; иначе по settings)
+  if [[ -f "${XUIDB:-}" ]] && command -v sqlite3 >/dev/null 2>&1; then
+    n_in=$(sqlite3 -init /dev/null "$XUIDB" "SELECT COUNT(*) FROM inbounds WHERE enable=1;" 2>/dev/null || true)
+    if sqlite3 -init /dev/null "$XUIDB" "SELECT 1 FROM client_inbounds LIMIT 1;" >/dev/null 2>&1; then
+      n_cl=$(sqlite3 -init /dev/null "$XUIDB" "SELECT COUNT(*) FROM client_inbounds ci JOIN inbounds i ON i.id=ci.inbound_id WHERE i.enable=1;" 2>/dev/null || true)
+    else
+      n_cl=$(sqlite3 -init /dev/null "$XUIDB" "SELECT COUNT(*) FROM inbounds i, json_each(i.settings,'\$.clients') WHERE i.enable=1;" 2>/dev/null || true)
+    fi
+    [[ "$n_in" =~ ^[0-9]+$ ]] || n_in=0
+    [[ "$n_cl" =~ ^[0-9]+$ ]] || n_cl=0
+    if [[ "$n_in" -ge 1 && "$n_cl" -ge 1 ]]; then iv_line ok "Инбаунды: ${n_in} включено, клиентов в них: ${n_cl}"
+    else iv_line fail "Инбаунды: включено ${n_in}, клиентов ${n_cl}" "systemctl stop x-ui && /usr/local/x-ui/x-ui migrate && systemctl start x-ui; затем healthcheck"; fi
+  else
+    iv_line warn "Инбаунды не проверены: нет базы панели или sqlite3"
   fi
 
-  # 5. Подписка отдаётся по секретному пути (через публичный IP -> тот же путь, что у клиента)
-  if [[ -n "$ip" && -n "${DOMAIN:-}" && -n "${SUB_SECRET_PATH:-}" && -f "$XUIDB" ]]; then
-    sub_id=$(sqlite3 "$XUIDB" "SELECT json_extract(c.value,'\$.subId') FROM inbounds i, json_each(i.settings,'\$.clients') c WHERE i.enable=1 AND json_extract(c.value,'\$.subId') != '' LIMIT 1;" 2>/dev/null || true)
+  # 6. Подписка по секретному пути, с проверкой сертификата (без -k): так её увидит клиент
+  if [[ -n "$ip" && -n "${DOMAIN:-}" && -n "${SUB_SECRET_PATH:-}" && -f "${XUIDB:-}" ]] && command -v sqlite3 >/dev/null 2>&1; then
+    sub_id=$(sqlite3 -init /dev/null "$XUIDB" "SELECT sub_id FROM clients WHERE sub_id != '' LIMIT 1;" 2>/dev/null || true)
+    [[ -n "$sub_id" ]] || sub_id=$(sqlite3 -init /dev/null "$XUIDB" "SELECT json_extract(c.value,'\$.subId') FROM inbounds i, json_each(i.settings,'\$.clients') c WHERE i.enable=1 AND json_extract(c.value,'\$.subId') != '' LIMIT 1;" 2>/dev/null || true)
     if [[ -n "$sub_id" ]]; then
       sub_url="https://${DOMAIN}${SUB_SECRET_PATH}${sub_id}"
-      body=$(curl -sk -m 12 --resolve "${DOMAIN}:443:${ip}" -w $'\n%{http_code}' "$sub_url" 2>/dev/null || true)
+      body=$(curl -s -m 12 --resolve "${DOMAIN}:443:${ip}" -w $'\n%{http_code}' "$sub_url" 2>/dev/null || true)
       code="${body##*$'\n'}"
       if [[ "$code" == "200" && -n "${body%$'\n'*}" ]]; then iv_line ok "Подписка: отдаётся (HTTP 200)"
-      else iv_line warn "Подписка не отдалась (HTTP ${code:-нет ответа})" "проверь позже: sudo bash $0 healthcheck [8]; возможно, DNS ещё обновляется"; fi
+      else iv_line warn "Подписка не отдалась (HTTP ${code:-нет ответа})" "systemctl stop x-ui && /usr/local/x-ui/x-ui migrate && systemctl start x-ui; затем: sudo bash ${self} healthcheck (блок «подписки»)"; fi
+    else
+      iv_line warn "Подписка не проверена: в базе не нашлось клиента с ID подписки"
     fi
   fi
 
-  # 6. AmneziaWG: модуль ядра + утилиты. Пока ждём перезагрузку после нового ядра — это не ошибка
-  if [[ -f "$AWG_REBOOT_FLAG" ]]; then
-    iv_line warn "AmneziaWG: модуль заработает после перезагрузки сервера (установлено новое ядро)" "sudo reboot, затем: sudo bash $0 healthcheck"
+  # 7. AmneziaWG: утилиты и модуль ядра. Пока ждём перезагрузку после нового ядра — это не ошибка
+  if [[ -f "${AWG_REBOOT_FLAG:-}" ]]; then
+    iv_line warn "AmneziaWG: модуль заработает после перезагрузки сервера (см. ниже)"
   else
-    local awg_miss=""
-    command -v awg >/dev/null 2>&1 || awg_miss+=" awg"
-    command -v awg-quick >/dev/null 2>&1 || awg_miss+=" awg-quick"
-    if [[ -n "$awg_miss" ]]; then
-      iv_line fail "AmneziaWG: не установлены утилиты:${awg_miss} (часто — нет доступа к GitHub во время установки)" "sudo bash /usr/local/x-ui/bin/install-awg-module.sh"
-    elif ! lsmod 2>/dev/null | grep -q amneziawg; then
+    miss=""
+    command -v awg >/dev/null 2>&1 || miss+=" awg"
+    command -v awg-quick >/dev/null 2>&1 || miss+=" awg-quick"
+    lsmod_txt=$(lsmod 2>/dev/null || true)
+    if [[ -n "$miss" ]]; then
+      iv_line fail "AmneziaWG: не установлены утилиты:${miss} (часто — нет доступа к GitHub во время установки)" "sudo bash /usr/local/x-ui/bin/install-awg-module.sh"
+    elif ! grep -q amneziawg <<<"$lsmod_txt"; then
       iv_line fail "AmneziaWG: модуль ядра не загружен" "modprobe amneziawg; dkms status; sudo bash /usr/local/x-ui/bin/install-awg-module.sh"
-    elif [[ ! -d /etc/amnezia/amneziawg ]]; then
-      iv_line warn "AmneziaWG: каталог /etc/amnezia/amneziawg ещё не создан" "создастся при включении AmneziaWG в панели (шаг ниже)"
     else
       iv_line ok "AmneziaWG: модуль загружен, awg и awg-quick установлены"
     fi
   fi
 
-  # 7. Файрвол
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-    local ufw_txt miss=""; ufw_txt=$(ufw status 2>/dev/null || true)
-    grep -qE '^443/tcp[[:space:]]+ALLOW' <<<"$ufw_txt" || miss+=" 443/tcp"
-    grep -qE '^443/udp[[:space:]]+ALLOW' <<<"$ufw_txt" || miss+=" 443/udp"
-    [[ -n "${AWG_PORT:-}" ]] && { grep -qE "^${AWG_PORT}/udp[[:space:]]+ALLOW" <<<"$ufw_txt" || miss+=" ${AWG_PORT}/udp"; }
-    if [[ -z "$miss" ]]; then iv_line ok "Файрвол: ufw активен, нужные порты открыты"
-    else iv_line fail "Файрвол: не открыты${miss}" "ufw allow <порт>"; fi
+  # 8. Файрвол
+  if ! command -v ufw >/dev/null 2>&1; then
+    iv_line warn "Файрвол не проверен: ufw не установлен"
   else
-    iv_line warn "Файрвол: ufw не активен" "sudo ufw status; включать осторожно (сначала разрешить SSH)"
+    ufw_txt=$(ufw status 2>/dev/null || true)
+    if grep -q '^Status: active' <<<"$ufw_txt"; then
+      miss=""
+      grep -qE '^443/tcp[[:space:]]+ALLOW' <<<"$ufw_txt" || miss+=" 443/tcp"
+      grep -qE '^443/udp[[:space:]]+ALLOW' <<<"$ufw_txt" || miss+=" 443/udp"
+      grep -qE '^80/tcp[[:space:]]+ALLOW' <<<"$ufw_txt" || miss+=" 80/tcp"
+      [[ -n "${AWG_PORT:-}" ]] && { grep -qE "^${AWG_PORT}/udp[[:space:]]+ALLOW" <<<"$ufw_txt" || miss+=" ${AWG_PORT}/udp"; }
+      if [[ -z "$miss" ]]; then iv_line ok "Файрвол: ufw активен, нужные порты открыты"
+      else iv_line fail "Файрвол: не открыты${miss}" "для каждого: sudo ufw allow <порт/протокол>, например sudo ufw allow ${miss# }"; fi
+    else
+      iv_line warn "Файрвол: ufw не активен" "sudo ufw status; включать осторожно (сначала разрешить SSH)"
+    fi
   fi
 
-  # 8. Сайт-заглушка отвечает на домене обложки
+  # 9. Сайт-заглушка отвечает на домене обложки
   if [[ -n "$ip" && -n "${REALITY_DOMAIN:-}" ]]; then
     code=$(curl -sk -m 10 -o /dev/null -w "%{http_code}" --resolve "${REALITY_DOMAIN}:443:${ip}" "https://${REALITY_DOMAIN}/" 2>/dev/null || true)
     code="${code:-000}"; code="${code: -3}"
     if [[ "$code" == "200" ]]; then iv_line ok "Сайт-заглушка ${REALITY_DOMAIN}: отвечает (HTTP 200)"
-    else iv_line warn "Сайт-заглушка ${REALITY_DOMAIN}: HTTP ${code}" "sudo bash $0 healthcheck [6]"; fi
+    else iv_line warn "Сайт-заглушка ${REALITY_DOMAIN}: HTTP ${code}" "sudo bash ${self} healthcheck (блок про заглушки)"; fi
   fi
 
   echo "    Итого: ${IV_OK} ✓, ${IV_WARN} ⚠, ${IV_FAIL} ✗"
@@ -2349,9 +2391,9 @@ install_print_summary() {
   echo "       Hysteria Auth) — установка создаёт их неполными."
   echo "    4. Только после этого выдавай клиентам подписки. Они берутся в панели:"
   echo "       Клиенты -> кнопка ⓘ у клиента -> «Информация о подписке»;"
-  echo "         SUB   — для INCY и Happ;"
+  echo "         SUB   — для INCY (Happ и другие клиенты на Xray — на свой риск, мы их не проверяли);"
   echo "         CLASH — для Clash Verge Rev."
-  echo "       Подписки работают только в этих приложениях (INCY, Happ, Clash)."
+  echo "       AmneziaWG — отдельная подписка для приложения Amnezia: адрес ищи в ${CREDS_FILE} (строка «AWG Path»)."
   echo
   echo "  В панели НЕ делай:"
   echo "    - не создавай инбаунд «Cover site» и не жми «Apply» на странице Masking / SNI gateway:"

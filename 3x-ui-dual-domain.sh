@@ -2420,12 +2420,14 @@ install_print_summary() {
   echo "====================================================="
 }
 
-# v0.6.7: предпроверка доступа к GitHub в начале install (до вопросов и до любых изменений). Установка качает оттуда панель lucx-ui
-# (api.github.com — список релизов, github.com — архив релиза и списки geo, raw.githubusercontent.com — install.sh панели и шаблоны), а установщик
-# AmneziaWG клонирует утилиты. GitHub бывает недоступен выборочно (часть адресов отвечает, часть нет; сбой может пройти за минуты), и тогда
-# установка падает на середине или молча остаётся без AWG-утилит. Три хоста проверяются параллельно (HEAD, до 3 попыток с паузой 2 с).
-# Любой HTTP-ответ 2xx-4xx считается «доступен» (403 лимита API — это ответ GitHub). api.github.com или github.com не ответили -> СТОП
-# (код 1) с понятным текстом; raw.githubusercontent.com не ответил -> только предупреждение. Пропуск: SKIP_GITHUB_PREFLIGHT=1.
+# v0.6.7: предпроверка доступа к GitHub в начале install (до проверки ядра, вопросов и любых изменений). Установка качает оттуда панель
+# lucx-ui (api.github.com — список релизов, github.com -> хост загрузок — архив релиза и списки geo, raw.githubusercontent.com — install.sh
+# панели и шаблоны, codeload.github.com — исходники AWG), и GitHub бывает недоступен выборочно (часть адресов отвечает, часть нет, сбой может
+# пройти за минуты). Тогда установка падает на середине или молча остаётся без AWG-утилит. Четыре хоста проверяются параллельно (HEAD, до
+# 3 попыток с паузой 2 с, худший случай ~40 с). Любой HTTP-ответ 2xx-4xx = «доступен», кроме 403/429 от API (исчерпан лимит запросов для
+# этого IP: install всё равно упадёт на списке релизов; если версия задана LUCX_PIN_VERSION, API не нужен). Хоть один хост не ответил ->
+# СТОП (код 1) с понятным текстом. Пропуск: SKIP_GITHUB_PREFLIGHT=1 (через sudo: sudo SKIP_GITHUB_PREFLIGHT=1 bash ...). Нет curl -> пропуск.
+# wait только по PID: голый wait после exec > >(tee) ждёт и сам tee и вешает установку навсегда.
 gh_probe() {  # $1 = файл результата, $2 = URL
   local try c="000"
   for try in 1 2 3; do
@@ -2444,41 +2446,53 @@ install_preflight_github() {
     echo "  curl не найден — проверку доступа к GitHub пропускаю"
     return 0
   fi
-  local tmp h c fail_crit="" fail_raw=""
-  local -a hosts=(api.github.com github.com raw.githubusercontent.com)
+  local tmp h c fail="" ratelimit=0 self="${INSTALL_SELF:-3x-ui-dual-domain.sh}"
+  local -a hosts=(api.github.com github.com raw.githubusercontent.com codeload.github.com)
   local -a urls=(
     "https://api.github.com/repos/${LUCX_REPO}/releases?per_page=1"
-    "https://github.com/${LUCX_REPO}/releases"
+    "https://github.com/${LUCX_REPO}/releases/latest/download/x-ui-linux-amd64.tar.gz"
     "https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/README.md"
+    "https://codeload.github.com/"
   )
-  tmp=$(mktemp -d 2>/dev/null) || return 0
-  echo "  Проверка доступа к GitHub (панель, утилиты AmneziaWG, списки маршрутов)..."
-  for h in 0 1 2; do
+  local -a pids=()
+  tmp=$(mktemp -d 2>/dev/null) || { echo "  не удалось создать временный каталог — проверку доступа к GitHub пропускаю"; return 0; }
+  echo "  Проверка доступа к GitHub (панель, утилиты AmneziaWG, списки маршрутов), до ~40 с..."
+  for h in 0 1 2 3; do
     gh_probe "${tmp}/${h}" "${urls[$h]}" &
+    pids+=("$!")
   done
-  wait
-  for h in 0 1 2; do
+  wait "${pids[@]}" || true
+  for h in 0 1 2 3; do
     c=$(cat "${tmp}/${h}" 2>/dev/null || echo "000")
-    if [[ "$c" =~ ^[234][0-9][0-9]$ ]]; then
+    if [[ "$h" == "0" && ( "$c" == "403" || "$c" == "429" ) ]]; then
+      if [[ -n "${LUCX_PIN_VERSION:-}" ]]; then
+        echo "    ✓ ${hosts[$h]} (лимит запросов исчерпан, но версия задана LUCX_PIN_VERSION — список релизов не нужен)"
+      else
+        echo "    ✗ ${hosts[$h]} (код ${c}: исчерпан лимит запросов GitHub для этого IP)"
+        ratelimit=1; fail+=" ${hosts[$h]}"
+      fi
+    elif [[ "$c" =~ ^[234][0-9][0-9]$ ]]; then
       echo "    ✓ ${hosts[$h]}"
     else
       echo "    ✗ ${hosts[$h]} (нет ответа, код ${c})"
-      if [[ "$h" == "2" ]]; then fail_raw="${hosts[$h]}"; else fail_crit+=" ${hosts[$h]}"; fi
+      fail+=" ${hosts[$h]}"
     fi
   done
   rm -rf "$tmp"
-  if [[ -n "$fail_crit" ]]; then
+  if [[ -n "$fail" ]]; then
     echo
-    echo "СТОП: сервер не достучался до GitHub:${fail_crit}. Без него установка не дойдёт до конца: не скачается панель и утилиты AmneziaWG."
-    echo "      Это часто временный сбой на пути до GitHub (бывает, что часть адресов отвечает, а часть нет). Что сделать:"
-    echo "        1. Подождать 5-10 минут и запустить install ещё раз (ничего не изменено, повтор безопасен)."
+    echo "СТОП: сервер не достучался до GitHub:${fail}. Без него установка не дойдёт до конца: не скачается панель или утилиты AmneziaWG."
+    if [[ "$ratelimit" == "1" ]]; then
+      echo "      Для api.github.com исчерпан лимит запросов без токена на этот IP (60 в час): подожди час или задай версию панели"
+      echo "      явно (LUCX_PIN_VERSION=<тег>, тогда список релизов не нужен)."
+    fi
+    echo "      Чаще всего это временный сбой на пути до GitHub (бывает, что часть адресов отвечает, а часть нет). Что сделать:"
+    echo "        1. Подождать 5-10 минут и запустить install ещё раз (панель и настройки сервера не тронуты, повтор безопасен)."
     echo "        2. Проверить с сервера: curl -sSI https://github.com | head -1   и   getent hosts github.com"
     echo "        3. Если не проходит долго — попросить хостера проверить маршрут до GitHub или взять сервер в другом месте."
-    echo "      Принудительно продолжить без проверки (на свой риск): SKIP_GITHUB_PREFLIGHT=1 sudo bash $0 install"
+    echo "      Принудительно продолжить без проверки (на свой риск): sudo SKIP_GITHUB_PREFLIGHT=1 bash ${self} install"
+    INSTALL_SUCCESS=1   # cleanup не должен трогать x-ui: установка ещё ничего не меняла
     exit 1
-  fi
-  if [[ -n "$fail_raw" ]]; then
-    echo "  WARN: ${fail_raw} не ответил — оттуда берутся шаблоны и install.sh панели; если установка упадёт на скачивании, повтори её чуть позже."
   fi
   return 0
 }
@@ -2687,8 +2701,8 @@ cmd_install() {
   echo " lucx-ui + два домена + Reality на 443 (install mode)"
   echo " Версия скрипта: ${VERSION}"
   echo "======================================================"
-  install_preflight_kernel
   install_preflight_github
+  install_preflight_kernel
   read -rp "Домен панели (напр. panel.example.com): " DOMAIN
   echo
   read -rp "Домен-обложка для Reality (напр. reality.example.com): " REALITY_DOMAIN

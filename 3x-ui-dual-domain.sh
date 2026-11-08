@@ -2391,8 +2391,9 @@ install_print_summary() {
   echo "       Hysteria Auth) — установка создаёт их неполными."
   echo "    4. Только после этого выдавай клиентам подписки. Они берутся в панели:"
   echo "       Клиенты -> кнопка ⓘ у клиента -> «Информация о подписке»;"
-  echo "         SUB   — для INCY (Happ и другие клиенты на Xray — на свой риск, мы их не проверяли);"
+  echo "         SUB   — для INCY и Happ;"
   echo "         CLASH — для Clash Verge Rev."
+  echo "       Подписки работают только в этих приложениях (INCY, Happ, Clash)."
   echo "       AmneziaWG — отдельная подписка для приложения Amnezia: адрес ищи в ${CREDS_FILE} (строка «AWG Path»)."
   echo
   echo "  В панели НЕ делай:"

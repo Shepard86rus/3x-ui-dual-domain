@@ -952,7 +952,13 @@
 #   - add-xhttp и remove-xhttp: общая блокировка с panel-path, backup и restore;
 #   - restore: текст про порты уточнён, печатаются порты из .lucx-public-*-ports.txt без правила ufw; remove-swap: fstab не остаётся
 #     старым, если в нём была только строка swap.
-VERSION="0.6.5"
+# v0.6.6: итоговый экран install стал информативнее. Добавлен блок «Проверка установки» (только чтение, на код возврата не влияет;
+#   отключается SKIP_INSTALL_VERIFY=1): службы, порт 443, DNS, сертификаты панельного домена и домена Reality, инбаунды и клиенты, подписка,
+#   AmneziaWG (с подсказкой, если не поставлены утилиты), ufw, сайт-заглушка; у каждой проверки ✓/⚠/✗, подсказка при сбое и итоговая строка.
+#   Из итога убраны общие ссылки подписок (их выдают из панели после обновления ключей клиентов). «Что сделать сейчас» переписан по шагам:
+#   создание инбаунда «AmneziaWG (LucX)» с пользовательским адресом, обновление ключей клиентов, выдача подписок SUB и CLASH,
+#   AWG-конфиг берётся у клиента; добавлено примечание, что автор не рекомендует AmneziaWG из-за массовых банов. Доки: install.md, clients.md.
+VERSION="0.6.6"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -2180,6 +2186,176 @@ cmd_switch_mode() {
 # v0.5.6: единый итоговый экран install. Раньше конец установки был «кашей»: блок ГОТОВО с сырыми ссылками, вывод
 # certbot, списки «уже сделано»/«что осталось»/«при смене IP» — адрес и пароль панели уезжали за экран, новичок пугался.
 # Теперь подробности идут в лог и файл кредов, а на экране последним остаётся этот короткий блок.
+# v0.6.6: блок «Проверка установки» в итоговом выводе install. Только читает состояние (ничего не чинит, код возврата
+# установки не меняет): службы, порты, домены/сертификаты, инбаунды, подписка, AWG, ufw, сайт-заглушка. Каждая проверка в
+# защите || true: сбой самой проверки не должен ронять итог. Пропуск: SKIP_INSTALL_VERIFY=1. Счётчики: IV_OK/IV_WARN/IV_FAIL.
+IV_OK=0; IV_WARN=0; IV_FAIL=0
+iv_line() {  # $1 = ok|warn|fail, $2 = текст, $3 = подсказка (необязательно)
+  case "$1" in
+    ok)   echo "    ✓ $2"; IV_OK=$((IV_OK+1)) ;;
+    warn) echo "    ⚠ $2"; IV_WARN=$((IV_WARN+1)) ;;
+    *)    echo "    ✗ $2"; IV_FAIL=$((IV_FAIL+1)) ;;
+  esac
+  [[ -n "${3:-}" ]] && echo "        → $3"
+  return 0
+}
+install_verify_summary() {
+  [[ "${SKIP_INSTALL_VERIFY:-0}" == "1" ]] && return 0
+  IV_OK=0; IV_WARN=0; IV_FAIL=0
+  local crt_seen=0 ip="${SERVER_IP:-}" self="${INSTALL_SELF:-3x-ui-dual-domain.sh}"
+  local d res r days end crt n_in n_cl sub_id sub_url code body svc ok_all=1 ss_out ufw_txt miss lsmod_txt dns_bad dns_none
+  echo "  Проверка установки (может занять до минуты):"
+
+  # 1. Службы
+  for svc in x-ui nginx; do
+    systemctl is-active --quiet "$svc" 2>/dev/null || { ok_all=0; iv_line fail "служба ${svc} не запущена" "journalctl -u ${svc} -n 50"; }
+  done
+  if ! pgrep -f 'bin/xray-linux' >/dev/null 2>&1; then
+    ok_all=0; iv_line fail "Xray не запущен" "перезапусти панель: systemctl restart x-ui"
+  fi
+  [[ "$ok_all" == "1" ]] && iv_line ok "Службы: x-ui, nginx, Xray запущены"
+
+  # 2. Порты: публичный 443 держит nginx, внутренний 127.0.0.1:443 — Xray
+  ss_out=$(ss -tlnp 2>/dev/null || true)
+  if [[ -z "$ip" ]]; then
+    iv_line warn "Порт 443 не проверен: публичный IP сервера не определён"
+  elif awk -v a="${ip}:443" '$4==a || $4=="0.0.0.0:443" || $4=="*:443" {if ($0 ~ /nginx/) f=1} END{exit !f}' <<<"$ss_out"; then
+    if awk '$4=="127.0.0.1:443" {f=1} END{exit !f}' <<<"$ss_out"; then
+      iv_line ok "Порт 443: nginx принимает на ${ip:-<IP>}, Xray слушает на 127.0.0.1:443"
+    else
+      iv_line fail "Порт 443: nginx есть, а Xray на 127.0.0.1:443 не слушает" "перезапусти: systemctl restart x-ui; проверь: ss -tlnp | grep 443"
+    fi
+  else
+    iv_line fail "Порт 443: nginx не слушает публичный адрес ${ip:-<IP не определён>}" "проверь конфиг: nginx -t; ss -tlnp | grep :443"
+  fi
+
+  # 3. DNS: два резолвера с короткими таймаутами; если никто не ответил — «не проверен», а не «указывает не туда»
+  if [[ -n "$ip" ]]; then
+    if command -v dig >/dev/null 2>&1; then
+      dns_bad=""; dns_none=""
+      for d in "${DOMAIN:-}" "${REALITY_DOMAIN:-}"; do
+        [[ -n "$d" ]] || continue
+        res=""
+        for r in 1.1.1.1 8.8.8.8; do
+          res=$(dig +short +time=3 +tries=1 A "$d" "@$r" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
+          [[ -n "$res" ]] && break
+        done
+        if [[ -z "$res" ]]; then dns_none+=" ${d}"
+        elif ! grep -qxF "$ip" <<<"$res"; then dns_bad+=" ${d}($(head -n1 <<<"$res"))"; fi
+      done
+      if [[ -n "$dns_bad" ]]; then
+        iv_line warn "DNS: домен указывает не на этот сервер:${dns_bad}" "исправь A-запись; клиенты подключатся только когда DNS обновится"
+      elif [[ -n "$dns_none" ]]; then
+        iv_line warn "DNS не проверен (нет ответа от резолверов или записи):${dns_none}" "проверь вручную: dig +short A <домен>"
+      else
+        iv_line ok "DNS: A-записи доменов указывают на ${ip}"
+      fi
+    else
+      iv_line warn "DNS не проверен: нет утилиты dig"
+    fi
+  fi
+
+  # 4. Сертификаты: панельный домен (панель и подписки) и домен Reality
+  for d in "${DOMAIN:-}" "${REALITY_DOMAIN:-}"; do
+    [[ -n "$d" ]] || continue
+    [[ "$d" == "${REALITY_DOMAIN:-}" && "$d" == "${DOMAIN:-}" && "$crt_seen" == "1" ]] && continue
+    crt_seen=1
+    crt="/etc/letsencrypt/live/${d}/fullchain.pem"
+    if [[ ! -f "$crt" ]]; then
+      iv_line fail "Сертификат ${d} не найден" "ls /etc/letsencrypt/live/; certbot certificates"; continue
+    fi
+    end=$(openssl x509 -enddate -noout -in "$crt" 2>/dev/null | sed 's/notAfter=//' || true)
+    days=$(( ( $(date -d "$end" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
+    if [[ -z "$end" || "$days" -gt 36500 || "$days" -lt -36500 ]]; then
+      iv_line warn "Сертификат ${d}: не удалось прочитать срок действия" "openssl x509 -enddate -noout -in ${crt}"
+    elif [[ "$days" -gt 14 ]]; then
+      iv_line ok "Сертификат ${d}: действует ещё ${days} дн."
+    else
+      iv_line warn "Сертификат ${d}: осталось ${days} дн." "проверь продление: certbot renew --dry-run"
+    fi
+  done
+
+  # 5. Инбаунды и клиенты (клиентов считаем по таблице client_inbounds, откуда их берёт Xray; иначе по settings)
+  if [[ -f "${XUIDB:-}" ]] && command -v sqlite3 >/dev/null 2>&1; then
+    n_in=$(sqlite3 -init /dev/null "$XUIDB" "SELECT COUNT(*) FROM inbounds WHERE enable=1;" 2>/dev/null || true)
+    if sqlite3 -init /dev/null "$XUIDB" "SELECT 1 FROM client_inbounds LIMIT 1;" >/dev/null 2>&1; then
+      n_cl=$(sqlite3 -init /dev/null "$XUIDB" "SELECT COUNT(*) FROM client_inbounds ci JOIN inbounds i ON i.id=ci.inbound_id WHERE i.enable=1;" 2>/dev/null || true)
+    else
+      n_cl=$(sqlite3 -init /dev/null "$XUIDB" "SELECT COUNT(*) FROM inbounds i, json_each(i.settings,'\$.clients') WHERE i.enable=1;" 2>/dev/null || true)
+    fi
+    [[ "$n_in" =~ ^[0-9]+$ ]] || n_in=0
+    [[ "$n_cl" =~ ^[0-9]+$ ]] || n_cl=0
+    if [[ "$n_in" -ge 1 && "$n_cl" -ge 1 ]]; then iv_line ok "Инбаунды: ${n_in} включено, клиентов в них: ${n_cl}"
+    else iv_line fail "Инбаунды: включено ${n_in}, клиентов ${n_cl}" "systemctl stop x-ui && /usr/local/x-ui/x-ui migrate && systemctl start x-ui; затем healthcheck"; fi
+  else
+    iv_line warn "Инбаунды не проверены: нет базы панели или sqlite3"
+  fi
+
+  # 6. Подписка по секретному пути, с проверкой сертификата (без -k): так её увидит клиент
+  if [[ -n "$ip" && -n "${DOMAIN:-}" && -n "${SUB_SECRET_PATH:-}" && -f "${XUIDB:-}" ]] && command -v sqlite3 >/dev/null 2>&1; then
+    sub_id=$(sqlite3 -init /dev/null "$XUIDB" "SELECT sub_id FROM clients WHERE sub_id != '' LIMIT 1;" 2>/dev/null || true)
+    [[ -n "$sub_id" ]] || sub_id=$(sqlite3 -init /dev/null "$XUIDB" "SELECT json_extract(c.value,'\$.subId') FROM inbounds i, json_each(i.settings,'\$.clients') c WHERE i.enable=1 AND json_extract(c.value,'\$.subId') != '' LIMIT 1;" 2>/dev/null || true)
+    if [[ -n "$sub_id" ]]; then
+      sub_url="https://${DOMAIN}${SUB_SECRET_PATH}${sub_id}"
+      body=$(curl -s -m 12 --resolve "${DOMAIN}:443:${ip}" -w $'\n%{http_code}' "$sub_url" 2>/dev/null || true)
+      code="${body##*$'\n'}"
+      if [[ "$code" == "200" && -n "${body%$'\n'*}" ]]; then iv_line ok "Подписка: отдаётся (HTTP 200)"
+      else iv_line warn "Подписка не отдалась (HTTP ${code:-нет ответа})" "systemctl stop x-ui && /usr/local/x-ui/x-ui migrate && systemctl start x-ui; затем: sudo bash ${self} healthcheck (блок «подписки»)"; fi
+    else
+      iv_line warn "Подписка не проверена: в базе не нашлось клиента с ID подписки"
+    fi
+  fi
+
+  # 7. AmneziaWG: утилиты и модуль ядра. Пока ждём перезагрузку после нового ядра — это не ошибка
+  if [[ -f "${AWG_REBOOT_FLAG:-}" ]]; then
+    iv_line warn "AmneziaWG: модуль заработает после перезагрузки сервера (см. ниже)"
+  else
+    lsmod_txt=$(lsmod 2>/dev/null || true)
+    if ! command -v awg >/dev/null 2>&1; then
+      iv_line fail "AmneziaWG: не установлена утилита awg (часто — нет доступа к GitHub во время установки)" "sudo bash /usr/local/x-ui/bin/install-awg-module.sh"
+    elif ! command -v awg-quick >/dev/null 2>&1; then
+      iv_line warn "AmneziaWG: нет awg-quick (нужен для запуска AWG-инбаундов)" "sudo bash /usr/local/x-ui/bin/install-awg-module.sh"
+    elif ! grep -q amneziawg <<<"$lsmod_txt"; then
+      iv_line warn "AmneziaWG: модуль ядра пока не загружен" "modprobe amneziawg; dkms status; если не помогло — sudo bash /usr/local/x-ui/bin/install-awg-module.sh"
+    else
+      iv_line ok "AmneziaWG: модуль загружен, awg и awg-quick установлены"
+    fi
+  fi
+
+  # 8. Файрвол
+  if ! command -v ufw >/dev/null 2>&1; then
+    iv_line warn "Файрвол не проверен: ufw не установлен"
+  else
+    ufw_txt=$(LC_ALL=C ufw status 2>/dev/null || true)
+    if grep -q '^Status: active' <<<"$ufw_txt"; then
+      miss=""
+      grep -qE '^443/tcp[[:space:]]+ALLOW' <<<"$ufw_txt" || miss+=" 443/tcp"
+      grep -qE '^443/udp[[:space:]]+ALLOW' <<<"$ufw_txt" || miss+=" 443/udp"
+      grep -qE '^80/tcp[[:space:]]+ALLOW' <<<"$ufw_txt" || miss+=" 80/tcp"
+      [[ -n "${AWG_PORT:-}" ]] && { grep -qE "^${AWG_PORT}/udp[[:space:]]+ALLOW" <<<"$ufw_txt" || miss+=" ${AWG_PORT}/udp"; }
+      if [[ -z "$miss" ]]; then iv_line ok "Файрвол: ufw активен, нужные порты открыты"
+      else iv_line fail "Файрвол: не открыты${miss}" "для каждого: sudo ufw allow <порт/протокол>, например sudo ufw allow $(set -- $miss; echo "$1")"; fi
+    else
+      iv_line warn "Файрвол: ufw не активен" "sudo ufw status; включать осторожно (сначала разрешить SSH)"
+    fi
+  fi
+
+  # 9. Сайт-заглушка отвечает на домене обложки
+  if [[ -n "$ip" && -n "${REALITY_DOMAIN:-}" ]]; then
+    code=$(curl -sk -m 10 -o /dev/null -w "%{http_code}" --resolve "${REALITY_DOMAIN}:443:${ip}" "https://${REALITY_DOMAIN}/" 2>/dev/null || true)
+    code="${code:-000}"; code="${code: -3}"
+    if [[ "$code" == "200" ]]; then iv_line ok "Сайт-заглушка ${REALITY_DOMAIN}: отвечает (HTTP 200)"
+    else iv_line warn "Сайт-заглушка ${REALITY_DOMAIN}: HTTP ${code}" "sudo bash ${self} healthcheck (блок про заглушки)"; fi
+  fi
+
+  echo "    Итого: ${IV_OK} ✓, ${IV_WARN} ⚠, ${IV_FAIL} ✗"
+  if [[ "$IV_FAIL" -gt 0 ]]; then
+    echo "    Есть ✗ — исправь их по подсказкам выше до выдачи ссылок клиентам."
+  fi
+  echo
+  return 0
+}
+
 install_print_summary() {
   local p
   echo
@@ -2189,9 +2365,6 @@ install_print_summary() {
   echo "    адрес:   https://${DOMAIN}${PANEL_PATH}"
   echo "    логин:   ${XUI_USERNAME}"
   echo "    пароль:  ${XUI_PASSWORD}"
-  echo
-  echo "  Подписка для клиентов:  https://${DOMAIN}${SUB_SECRET_PATH}"
-  echo "  Подписка AmneziaWG:     https://${DOMAIN}${AWG_SECRET_PATH}"
   echo
   echo "  Что работает:"
   if [[ "${REALITY_OK:-0}" == "1" ]]; then
@@ -2210,6 +2383,7 @@ install_print_summary() {
     done
   fi
   echo
+  install_verify_summary || true
   if [[ -f "$AWG_REBOOT_FLAG" ]]; then
     echo "  ⚠ СНАЧАЛА ПЕРЕЗАГРУЗИ СЕРВЕР: установлено новое ядро, AmneziaWG заработает только после перезагрузки."
     echo "    Команда: sudo reboot   (потом: sudo bash $0 healthcheck)"
@@ -2217,9 +2391,20 @@ install_print_summary() {
   fi
   echo "  Что сделать сейчас (пара минут):"
   echo "    1. Открой панель по адресу выше и войди."
-  echo "    2. Страница AmneziaWG -> Enable -> порт ${AWG_PORT} (udp) -> Save."
-  echo "       В созданном AWG-инбаунде выбери «Стратегия адреса для ссылок» = «Пользовательская»"
-  echo "       и впиши адрес: ${REALITY_DOMAIN}"
+  echo "    2. Инбаунды -> Добавить инбаунд -> протокол «AmneziaWG (LucX)» -> порт ${AWG_PORT} (udp) -> сохранить."
+  echo "       Затем «Изменить» у него -> вкладка «Основное»: «Адрес» оставь пустым, «Стратегия адреса для ссылок» ="
+  echo "       «Пользовательская», «Пользовательский адрес для ссылок» = ${REALITY_DOMAIN}"
+  echo "       ⚠ Автор скрипта не рекомендует пользоваться протоколом AmneziaWG: из-за массовых банов он ненадёжен."
+  echo "    3. Страница «Клиенты»: у каждого созданного клиента обнови ключи (UUID, пароль, ID подписки,"
+  echo "       Hysteria Auth) — установка создаёт их общими и неполными. После этого ключи в ${CREDS_FILE}"
+  echo "       устареют: ссылки клиентам бери только из панели."
+  echo "    4. Только после этого выдавай клиентам подписки. Они берутся в панели:"
+  echo "       Клиенты -> кнопка ⓘ у клиента -> «Информация о подписке»;"
+  echo "         SUB   — для INCY и Happ;"
+  echo "         CLASH — для Clash Verge Rev."
+  echo "       SUB и CLASH работают только в этих приложениях (INCY, Happ, Clash)."
+  echo "       AmneziaWG подпиской не выдаётся: у клиента в окне ⓘ блок «AWG-конфиг» -> «Конфигурация»"
+  echo "       (копировать или скачать) или ссылка AmneziaWG в блоке «Копировать ссылку»; для приложения Amnezia."
   echo
   echo "  В панели НЕ делай:"
   echo "    - не создавай инбаунд «Cover site» и не жми «Apply» на странице Masking / SNI gateway:"
@@ -2228,7 +2413,7 @@ install_print_summary() {
   echo "      клиентов и подписки менять можно свободно."
   echo
   echo "  Где остальное:"
-  echo "    все ссылки и ключи:    cat ${CREDS_FILE}"
+  echo "    данные установки:      cat ${CREDS_FILE}   (пароль панели, пути; ссылки клиентам — из панели)"
   echo "    полный лог установки:  ${LOG_FILE}"
   echo "    проверка схемы:        sudo bash $0 healthcheck"
   echo "    если сменится IP:      обнови A-записи ВСЕХ доменов, затем sudo bash $0 rebind-ip"

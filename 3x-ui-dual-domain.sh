@@ -2317,7 +2317,7 @@ install_print_summary() {
   echo "    логин:   ${XUI_USERNAME}"
   echo "    пароль:  ${XUI_PASSWORD}"
   echo
-  echo "  Подписки клиентам (после обновления ключей):"
+  echo "  Подписки клиентам (только после обновления ключей, шаг 3 ниже):"
   echo "    берутся в панели: Клиенты → кнопка ⓘ у клиента → «Информация о подписке»;"
   echo "    SUB   — для INCY и Happ;"
   echo "    CLASH — для Clash Verge Rev."
@@ -2351,6 +2351,8 @@ install_print_summary() {
   echo "    2. Страница AmneziaWG -> Enable -> порт ${AWG_PORT} (udp) -> Save."
   echo "       В созданном AWG-инбаунде выбери «Стратегия адреса для ссылок» = «Пользовательская»"
   echo "       и впиши адрес: ${REALITY_DOMAIN}"
+  echo "    3. Страница «Клиенты»: у каждого созданного клиента обнови ключи (UUID, пароль, ID подписки,"
+  echo "       Hysteria Auth) — установка создаёт их неполными. Подписки выдавай только после этого."
   echo
   echo "  В панели НЕ делай:"
   echo "    - не создавай инбаунд «Cover site» и не жми «Apply» на странице Masking / SNI gateway:"

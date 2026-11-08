@@ -2431,7 +2431,7 @@ install_print_summary() {
 gh_probe() {  # $1 = файл результата, $2 = URL
   local try c="000"
   for try in 1 2 3; do
-    c=$(curl -sS -I -L --max-redirs 3 --connect-timeout 6 -m 12 -o /dev/null -w '%{http_code}' "$2" 2>/dev/null || true)
+    c=$(curl -sS -I -L --max-redirs 3 --connect-timeout 6 -m 12 -o /dev/null -w '%{http_code}' "$2" 2>/dev/null) || c="000"
     c="${c: -3}"
     [[ "$c" =~ ^[234][0-9][0-9]$ ]] && break
     [[ "$try" -lt 3 ]] && sleep 2
@@ -2474,7 +2474,7 @@ install_preflight_github() {
     elif [[ "$c" =~ ^[234][0-9][0-9]$ ]]; then
       echo "    ✓ ${hosts[$h]}"
     else
-      echo "    ✗ ${hosts[$h]} (нет ответа, код ${c})"
+      if [[ "$c" == "000" ]]; then echo "    ✗ ${hosts[$h]} (нет ответа)"; else echo "    ✗ ${hosts[$h]} (ошибка сервера, код ${c})"; fi
       fail+=" ${hosts[$h]}"
     fi
   done

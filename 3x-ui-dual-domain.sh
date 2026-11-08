@@ -2211,7 +2211,9 @@ install_verify_summary() {
 
   # 2. Порты: публичный 443 держит nginx, внутренний 127.0.0.1:443 — Xray
   ss_out=$(ss -tlnp 2>/dev/null || true)
-  if awk -v a="${ip}:443" '$4==a || $4=="0.0.0.0:443" || $4=="*:443" {if ($0 ~ /nginx/) f=1} END{exit !f}' <<<"$ss_out"; then
+  if [[ -z "$ip" ]]; then
+    iv_line warn "Порт 443 не проверен: публичный IP сервера не определён"
+  elif awk -v a="${ip}:443" '$4==a || $4=="0.0.0.0:443" || $4=="*:443" {if ($0 ~ /nginx/) f=1} END{exit !f}' <<<"$ss_out"; then
     if awk '$4=="127.0.0.1:443" {f=1} END{exit !f}' <<<"$ss_out"; then
       iv_line ok "Порт 443: nginx принимает на ${ip:-<IP>}, Xray слушает на 127.0.0.1:443"
     else
@@ -2229,11 +2231,11 @@ install_verify_summary() {
         [[ -n "$d" ]] || continue
         res=""
         for r in 1.1.1.1 8.8.8.8; do
-          res=$(dig +short +time=3 +tries=1 A "$d" "@$r" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
+          res=$(dig +short +time=3 +tries=1 A "$d" "@$r" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
           [[ -n "$res" ]] && break
         done
         if [[ -z "$res" ]]; then dns_none+=" ${d}"
-        elif [[ "$res" != "$ip" ]]; then dns_bad+=" ${d}(${res})"; fi
+        elif ! grep -qxF "$ip" <<<"$res"; then dns_bad+=" ${d}($(head -n1 <<<"$res"))"; fi
       done
       if [[ -n "$dns_bad" ]]; then
         iv_line warn "DNS: домен указывает не на этот сервер:${dns_bad}" "исправь A-запись; клиенты подключатся только когда DNS обновится"
@@ -2302,14 +2304,13 @@ install_verify_summary() {
   if [[ -f "${AWG_REBOOT_FLAG:-}" ]]; then
     iv_line warn "AmneziaWG: модуль заработает после перезагрузки сервера (см. ниже)"
   else
-    miss=""
-    command -v awg >/dev/null 2>&1 || miss+=" awg"
-    command -v awg-quick >/dev/null 2>&1 || miss+=" awg-quick"
     lsmod_txt=$(lsmod 2>/dev/null || true)
-    if [[ -n "$miss" ]]; then
-      iv_line fail "AmneziaWG: не установлены утилиты:${miss} (часто — нет доступа к GitHub во время установки)" "sudo bash /usr/local/x-ui/bin/install-awg-module.sh"
+    if ! command -v awg >/dev/null 2>&1; then
+      iv_line fail "AmneziaWG: не установлена утилита awg (часто — нет доступа к GitHub во время установки)" "sudo bash /usr/local/x-ui/bin/install-awg-module.sh"
+    elif ! command -v awg-quick >/dev/null 2>&1; then
+      iv_line warn "AmneziaWG: нет awg-quick (нужен для запуска AWG-инбаундов)" "sudo bash /usr/local/x-ui/bin/install-awg-module.sh"
     elif ! grep -q amneziawg <<<"$lsmod_txt"; then
-      iv_line fail "AmneziaWG: модуль ядра не загружен" "modprobe amneziawg; dkms status; sudo bash /usr/local/x-ui/bin/install-awg-module.sh"
+      iv_line warn "AmneziaWG: модуль ядра пока не загружен" "modprobe amneziawg; dkms status; если не помогло — sudo bash /usr/local/x-ui/bin/install-awg-module.sh"
     else
       iv_line ok "AmneziaWG: модуль загружен, awg и awg-quick установлены"
     fi
@@ -2319,7 +2320,7 @@ install_verify_summary() {
   if ! command -v ufw >/dev/null 2>&1; then
     iv_line warn "Файрвол не проверен: ufw не установлен"
   else
-    ufw_txt=$(ufw status 2>/dev/null || true)
+    ufw_txt=$(LC_ALL=C ufw status 2>/dev/null || true)
     if grep -q '^Status: active' <<<"$ufw_txt"; then
       miss=""
       grep -qE '^443/tcp[[:space:]]+ALLOW' <<<"$ufw_txt" || miss+=" 443/tcp"
@@ -2327,7 +2328,7 @@ install_verify_summary() {
       grep -qE '^80/tcp[[:space:]]+ALLOW' <<<"$ufw_txt" || miss+=" 80/tcp"
       [[ -n "${AWG_PORT:-}" ]] && { grep -qE "^${AWG_PORT}/udp[[:space:]]+ALLOW" <<<"$ufw_txt" || miss+=" ${AWG_PORT}/udp"; }
       if [[ -z "$miss" ]]; then iv_line ok "Файрвол: ufw активен, нужные порты открыты"
-      else iv_line fail "Файрвол: не открыты${miss}" "для каждого: sudo ufw allow <порт/протокол>, например sudo ufw allow ${miss# }"; fi
+      else iv_line fail "Файрвол: не открыты${miss}" "для каждого: sudo ufw allow <порт/протокол>, например sudo ufw allow $(set -- $miss; echo "$1")"; fi
     else
       iv_line warn "Файрвол: ufw не активен" "sudo ufw status; включать осторожно (сначала разрешить SSH)"
     fi
@@ -2388,13 +2389,14 @@ install_print_summary() {
   echo "       Затем «Изменить» у него -> вкладка «Основное»: «Стратегия адреса для ссылок» = «Пользовательская»"
   echo "       и впиши адрес: ${REALITY_DOMAIN}"
   echo "    3. Страница «Клиенты»: у каждого созданного клиента обнови ключи (UUID, пароль, ID подписки,"
-  echo "       Hysteria Auth) — установка создаёт их неполными."
+  echo "       Hysteria Auth) — установка создаёт их общими и неполными. После этого ключи в ${CREDS_FILE}"
+  echo "       устареют: ссылки клиентам бери только из панели."
   echo "    4. Только после этого выдавай клиентам подписки. Они берутся в панели:"
   echo "       Клиенты -> кнопка ⓘ у клиента -> «Информация о подписке»;"
   echo "         SUB   — для INCY и Happ;"
   echo "         CLASH — для Clash Verge Rev."
-  echo "       Подписки работают только в этих приложениях (INCY, Happ, Clash)."
-  echo "       AmneziaWG — отдельная подписка для приложения Amnezia: адрес ищи в ${CREDS_FILE} (строка «AWG Path»)."
+  echo "       SUB и CLASH работают только в этих приложениях (INCY, Happ, Clash)."
+  echo "       AmneziaWG — отдельная подписка, только для приложения Amnezia (в INCY, Happ и Clash не работает)."
   echo
   echo "  В панели НЕ делай:"
   echo "    - не создавай инбаунд «Cover site» и не жми «Apply» на странице Masking / SNI gateway:"
@@ -2403,7 +2405,7 @@ install_print_summary() {
   echo "      клиентов и подписки менять можно свободно."
   echo
   echo "  Где остальное:"
-  echo "    все ссылки и ключи:    cat ${CREDS_FILE}"
+  echo "    данные установки:      cat ${CREDS_FILE}   (пароль панели, пути; ссылки клиентам — из панели)"
   echo "    полный лог установки:  ${LOG_FILE}"
   echo "    проверка схемы:        sudo bash $0 healthcheck"
   echo "    если сменится IP:      обнови A-записи ВСЕХ доменов, затем sudo bash $0 rebind-ip"

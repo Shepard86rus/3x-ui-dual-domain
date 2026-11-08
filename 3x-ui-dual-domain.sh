@@ -2180,6 +2180,133 @@ cmd_switch_mode() {
 # v0.5.6: единый итоговый экран install. Раньше конец установки был «кашей»: блок ГОТОВО с сырыми ссылками, вывод
 # certbot, списки «уже сделано»/«что осталось»/«при смене IP» — адрес и пароль панели уезжали за экран, новичок пугался.
 # Теперь подробности идут в лог и файл кредов, а на экране последним остаётся этот короткий блок.
+# v0.6.6: блок «Проверка установки» в итоговом выводе install. Только читает состояние (ничего не чинит, код возврата
+# установки не меняет): службы, порты, домены/сертификаты, инбаунды, подписка, AWG, ufw, сайт-заглушка. Каждая проверка в
+# защите || true: сбой самой проверки не должен ронять итог. Пропуск: SKIP_INSTALL_VERIFY=1. Счётчики: IV_OK/IV_WARN/IV_FAIL.
+IV_OK=0; IV_WARN=0; IV_FAIL=0
+iv_line() {  # $1 = ok|warn|fail, $2 = текст, $3 = подсказка (необязательно)
+  case "$1" in
+    ok)   echo "    ✓ $2"; IV_OK=$((IV_OK+1)) ;;
+    warn) echo "    ⚠ $2"; IV_WARN=$((IV_WARN+1)) ;;
+    *)    echo "    ✗ $2"; IV_FAIL=$((IV_FAIL+1)) ;;
+  esac
+  [[ -n "${3:-}" ]] && echo "        → $3"
+  return 0
+}
+install_verify_summary() {
+  [[ "${SKIP_INSTALL_VERIFY:-0}" == "1" ]] && return 0
+  IV_OK=0; IV_WARN=0; IV_FAIL=0
+  local ip="${SERVER_IP:-}" d res days end n_in n_cl sub_id sub_url code body svc ok_all=1
+  echo "  Проверка установки:"
+
+  # 1. Службы
+  for svc in x-ui nginx; do
+    systemctl is-active --quiet "$svc" 2>/dev/null || { ok_all=0; iv_line fail "служба ${svc} не запущена" "journalctl -u ${svc} -n 50"; }
+  done
+  if ! pgrep -f 'bin/xray-linux' >/dev/null 2>&1; then
+    ok_all=0; iv_line fail "Xray не запущен" "перезапусти панель: systemctl restart x-ui"
+  fi
+  [[ "$ok_all" == "1" ]] && iv_line ok "Службы: x-ui, nginx, Xray запущены"
+
+  # 2. Порты: публичный 443 держит nginx, внутренний 127.0.0.1:443 — Xray
+  if ss -tlnp 2>/dev/null | awk -v a="${ip}:443" '$4==a || $4=="0.0.0.0:443" || $4=="*:443" {if ($0 ~ /nginx/) f=1} END{exit !f}'; then
+    if ss -tlnp 2>/dev/null | awk '$4=="127.0.0.1:443" {f=1} END{exit !f}'; then
+      iv_line ok "Порт 443: nginx принимает на ${ip:-<IP>}, Xray слушает на 127.0.0.1:443"
+    else
+      iv_line fail "Порт 443: nginx есть, а Xray на 127.0.0.1:443 не слушает" "перезапусти: systemctl restart x-ui; проверь: ss -tlnp | grep 443"
+    fi
+  else
+    iv_line fail "Порт 443: nginx не слушает публичный адрес ${ip:-<IP не определён>}" "проверь конфиг: nginx -t; ss -tlnp | grep :443"
+  fi
+
+  # 3. Домены и сертификаты (DNS сравниваем с публичным IP сервера; серт — срок действия)
+  if [[ -n "$ip" ]] && command -v dig >/dev/null 2>&1; then
+    local dns_bad=""
+    for d in "${DOMAIN:-}" "${REALITY_DOMAIN:-}"; do
+      [[ -n "$d" ]] || continue
+      res=$(dig +short A "$d" @1.1.1.1 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
+      [[ "$res" == "$ip" ]] || dns_bad+=" ${d}(${res:-нет записи})"
+    done
+    if [[ -z "$dns_bad" ]]; then iv_line ok "DNS: A-записи доменов указывают на ${ip}"
+    else iv_line warn "DNS: домен указывает не на этот сервер:${dns_bad}" "исправь A-запись; клиенты подключатся только когда DNS обновится"; fi
+  fi
+  if [[ -n "${REALITY_DOMAIN:-}" ]]; then
+    local crt="/etc/letsencrypt/live/${REALITY_DOMAIN}/fullchain.pem"
+    if [[ -f "$crt" ]] && end=$(openssl x509 -enddate -noout -in "$crt" 2>/dev/null | sed 's/notAfter=//'); then
+      days=$(( ( $(date -d "$end" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
+      if [[ "$days" -gt 14 ]]; then iv_line ok "Сертификат ${REALITY_DOMAIN}: действует ещё ${days} дн."
+      else iv_line warn "Сертификат ${REALITY_DOMAIN}: осталось ${days} дн." "проверь продление: certbot renew --dry-run"; fi
+    else
+      iv_line fail "Сертификат ${REALITY_DOMAIN} не найден" "ls /etc/letsencrypt/live/; certbot certificates"
+    fi
+  fi
+
+  # 4. Инбаунды и клиенты в базе панели
+  if [[ -f "$XUIDB" ]]; then
+    n_in=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbounds WHERE enable=1;" 2>/dev/null || echo 0)
+    n_cl=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbounds i, json_each(i.settings,'\$.clients') WHERE i.enable=1;" 2>/dev/null || echo 0)
+    if [[ "${n_in:-0}" -ge 1 && "${n_cl:-0}" -ge 1 ]]; then iv_line ok "Инбаунды: ${n_in} включено, клиентов в них: ${n_cl}"
+    else iv_line fail "Инбаунды: включено ${n_in:-0}, клиентов ${n_cl:-0}" "открой панель и создай инбаунд с клиентом (причина — в логе установки)"; fi
+  fi
+
+  # 5. Подписка отдаётся по секретному пути (через публичный IP -> тот же путь, что у клиента)
+  if [[ -n "$ip" && -n "${DOMAIN:-}" && -n "${SUB_SECRET_PATH:-}" && -f "$XUIDB" ]]; then
+    sub_id=$(sqlite3 "$XUIDB" "SELECT json_extract(c.value,'\$.subId') FROM inbounds i, json_each(i.settings,'\$.clients') c WHERE i.enable=1 AND json_extract(c.value,'\$.subId') != '' LIMIT 1;" 2>/dev/null || true)
+    if [[ -n "$sub_id" ]]; then
+      sub_url="https://${DOMAIN}${SUB_SECRET_PATH}${sub_id}"
+      body=$(curl -sk -m 12 --resolve "${DOMAIN}:443:${ip}" -w $'\n%{http_code}' "$sub_url" 2>/dev/null || true)
+      code="${body##*$'\n'}"
+      if [[ "$code" == "200" && -n "${body%$'\n'*}" ]]; then iv_line ok "Подписка: отдаётся (HTTP 200)"
+      else iv_line warn "Подписка не отдалась (HTTP ${code:-нет ответа})" "проверь позже: sudo bash $0 healthcheck [8]; возможно, DNS ещё обновляется"; fi
+    fi
+  fi
+
+  # 6. AmneziaWG: модуль ядра + утилиты. Пока ждём перезагрузку после нового ядра — это не ошибка
+  if [[ -f "$AWG_REBOOT_FLAG" ]]; then
+    iv_line warn "AmneziaWG: модуль заработает после перезагрузки сервера (установлено новое ядро)" "sudo reboot, затем: sudo bash $0 healthcheck"
+  else
+    local awg_miss=""
+    command -v awg >/dev/null 2>&1 || awg_miss+=" awg"
+    command -v awg-quick >/dev/null 2>&1 || awg_miss+=" awg-quick"
+    if [[ -n "$awg_miss" ]]; then
+      iv_line fail "AmneziaWG: не установлены утилиты:${awg_miss} (часто — нет доступа к GitHub во время установки)" "sudo bash /usr/local/x-ui/bin/install-awg-module.sh"
+    elif ! lsmod 2>/dev/null | grep -q amneziawg; then
+      iv_line fail "AmneziaWG: модуль ядра не загружен" "modprobe amneziawg; dkms status; sudo bash /usr/local/x-ui/bin/install-awg-module.sh"
+    elif [[ ! -d /etc/amnezia/amneziawg ]]; then
+      iv_line warn "AmneziaWG: каталог /etc/amnezia/amneziawg ещё не создан" "создастся при включении AmneziaWG в панели (шаг ниже)"
+    else
+      iv_line ok "AmneziaWG: модуль загружен, awg и awg-quick установлены"
+    fi
+  fi
+
+  # 7. Файрвол
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    local ufw_txt miss=""; ufw_txt=$(ufw status 2>/dev/null || true)
+    grep -qE '^443/tcp[[:space:]]+ALLOW' <<<"$ufw_txt" || miss+=" 443/tcp"
+    grep -qE '^443/udp[[:space:]]+ALLOW' <<<"$ufw_txt" || miss+=" 443/udp"
+    [[ -n "${AWG_PORT:-}" ]] && { grep -qE "^${AWG_PORT}/udp[[:space:]]+ALLOW" <<<"$ufw_txt" || miss+=" ${AWG_PORT}/udp"; }
+    if [[ -z "$miss" ]]; then iv_line ok "Файрвол: ufw активен, нужные порты открыты"
+    else iv_line fail "Файрвол: не открыты${miss}" "ufw allow <порт>"; fi
+  else
+    iv_line warn "Файрвол: ufw не активен" "sudo ufw status; включать осторожно (сначала разрешить SSH)"
+  fi
+
+  # 8. Сайт-заглушка отвечает на домене обложки
+  if [[ -n "$ip" && -n "${REALITY_DOMAIN:-}" ]]; then
+    code=$(curl -sk -m 10 -o /dev/null -w "%{http_code}" --resolve "${REALITY_DOMAIN}:443:${ip}" "https://${REALITY_DOMAIN}/" 2>/dev/null || true)
+    code="${code:-000}"; code="${code: -3}"
+    if [[ "$code" == "200" ]]; then iv_line ok "Сайт-заглушка ${REALITY_DOMAIN}: отвечает (HTTP 200)"
+    else iv_line warn "Сайт-заглушка ${REALITY_DOMAIN}: HTTP ${code}" "sudo bash $0 healthcheck [6]"; fi
+  fi
+
+  echo "    Итого: ${IV_OK} ✓, ${IV_WARN} ⚠, ${IV_FAIL} ✗"
+  if [[ "$IV_FAIL" -gt 0 ]]; then
+    echo "    Есть ✗ — исправь их по подсказкам выше до выдачи ссылок клиентам."
+  fi
+  echo
+  return 0
+}
+
 install_print_summary() {
   local p
   echo
@@ -2210,6 +2337,7 @@ install_print_summary() {
     done
   fi
   echo
+  install_verify_summary || true
   if [[ -f "$AWG_REBOOT_FLAG" ]]; then
     echo "  ⚠ СНАЧАЛА ПЕРЕЗАГРУЗИ СЕРВЕР: установлено новое ядро, AmneziaWG заработает только после перезагрузки."
     echo "    Команда: sudo reboot   (потом: sudo bash $0 healthcheck)"

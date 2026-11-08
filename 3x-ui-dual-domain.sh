@@ -2317,7 +2317,11 @@ install_print_summary() {
   echo "    логин:   ${XUI_USERNAME}"
   echo "    пароль:  ${XUI_PASSWORD}"
   echo
-  echo "  Ссылки-подписки клиентам выдавай из панели (у клиента), после обновления ключей."
+  echo "  Подписки клиентам (после обновления ключей):"
+  echo "    берутся в панели: Клиенты → кнопка ⓘ у клиента → «Информация о подписке»;"
+  echo "    SUB   — для INCY и Happ;"
+  echo "    CLASH — для Clash Verge Rev."
+  echo "    Подписки работают только в этих приложениях (INCY, Happ, Clash)."
   echo
   echo "  Что работает:"
   if [[ "${REALITY_OK:-0}" == "1" ]]; then

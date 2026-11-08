@@ -2446,6 +2446,12 @@ install_preflight_github() {
     echo "  curl не найден — проверку доступа к GitHub пропускаю"
     return 0
   fi
+  local ans=""
+  read -rp "Проверить доступ к GitHub перед установкой? (рекомендуется) [Y/n]: " ans || ans=""
+  if [[ "${ans,,}" == "n" || "${ans,,}" == "no" || "${ans,,}" == "н" ]]; then
+    echo "  Проверка GitHub пропущена. Если он недоступен, установка оборвётся позже: не скачается панель или утилиты AmneziaWG."
+    return 0
+  fi
   local tmp h c fail="" ratelimit=0 self="${INSTALL_SELF:-3x-ui-dual-domain.sh}"
   local -a hosts=(api.github.com github.com raw.githubusercontent.com codeload.github.com)
   local -a urls=(

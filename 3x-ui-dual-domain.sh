@@ -958,7 +958,10 @@
 #   Из итога убраны общие ссылки подписок (их выдают из панели после обновления ключей клиентов). «Что сделать сейчас» переписан по шагам:
 #   создание инбаунда «AmneziaWG (LucX)» с пользовательским адресом, обновление ключей клиентов, выдача подписок SUB и CLASH,
 #   AWG-конфиг берётся у клиента; добавлено примечание, что автор не рекомендует AmneziaWG из-за массовых банов. Доки: install.md, clients.md.
-VERSION="0.6.6"
+# v0.6.7: в самом начале install (до проверки ядра, вопросов и любых изменений) спрашивает «Проверить доступ к GitHub? [Y/n]» и проверяет
+#   api.github.com, github.com (архив релиза), raw.githubusercontent.com и codeload.github.com (3 попытки, до ~40 с). Если что-то недоступно
+#   или исчерпан лимит API — СТОП с подсказкой, сервер не тронут, повтор безопасен. Пропуск: ответ n или SKIP_GITHUB_PREFLIGHT=1.
+VERSION="0.6.7"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -2420,6 +2423,92 @@ install_print_summary() {
   echo "====================================================="
 }
 
+# v0.6.7: предпроверка доступа к GitHub в начале install (до проверки ядра, вопросов и любых изменений). Установка качает оттуда панель
+# lucx-ui (api.github.com — список релизов, github.com -> хост загрузок — архив релиза и списки geo, raw.githubusercontent.com — install.sh
+# панели и шаблоны, codeload.github.com — исходники AWG), и GitHub бывает недоступен выборочно (часть адресов отвечает, часть нет, сбой может
+# пройти за минуты). Тогда установка падает на середине или молча остаётся без AWG-утилит. Четыре хоста проверяются параллельно (HEAD, до
+# 3 попыток с паузой 2 с, худший случай ~40 с). Любой HTTP-ответ 2xx-4xx = «доступен», кроме 403/429 от API (исчерпан лимит запросов для
+# этого IP: install всё равно упадёт на списке релизов; если версия задана LUCX_PIN_VERSION, API не нужен). Хоть один хост не ответил ->
+# СТОП (код 1) с понятным текстом. Пропуск: SKIP_GITHUB_PREFLIGHT=1 (через sudo: sudo SKIP_GITHUB_PREFLIGHT=1 bash ...). Нет curl -> пропуск.
+# wait только по PID: голый wait после exec > >(tee) ждёт и сам tee и вешает установку навсегда.
+gh_probe() {  # $1 = файл результата, $2 = URL
+  local try c="000"
+  for try in 1 2 3; do
+    c=$(curl -sS -I -L --max-redirs 3 --connect-timeout 6 -m 12 -o /dev/null -w '%{http_code}' "$2" 2>/dev/null) || c="000"
+    c="${c: -3}"
+    [[ "$c" =~ ^[234][0-9][0-9]$ ]] && break
+    [[ "$try" -lt 3 ]] && sleep 2
+  done
+  [[ "$c" =~ ^[0-9]{3}$ ]] || c="000"
+  printf '%s\n' "$c" > "$1"
+  return 0
+}
+install_preflight_github() {
+  [[ "${SKIP_GITHUB_PREFLIGHT:-0}" == "1" ]] && return 0
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "  curl не найден — проверку доступа к GitHub пропускаю"
+    return 0
+  fi
+  local ans=""
+  # Спрашиваем только в интерактиве (как проверка ядра): иначе вопрос съел бы первую строку ответов из pipe.
+  if [[ -t 0 ]]; then
+    read -rp "Проверить доступ к GitHub перед установкой? (рекомендуется) [Y/n]: " ans || ans=""
+  fi
+  if [[ "${ans,,}" == "n" || "${ans,,}" == "no" ]]; then
+    echo "  Проверка GitHub пропущена. Если он недоступен, установка оборвётся позже: не скачается панель или утилиты AmneziaWG."
+    return 0
+  fi
+  local tmp h c fail="" ratelimit=0 self="${INSTALL_SELF:-3x-ui-dual-domain.sh}"
+  local -a hosts=(api.github.com github.com raw.githubusercontent.com codeload.github.com)
+  local -a urls=(
+    "https://api.github.com/repos/${LUCX_REPO}/releases?per_page=1"
+    "https://github.com/${LUCX_REPO}/releases/latest/download/x-ui-linux-amd64.tar.gz"
+    "https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-domain/main/README.md"
+    "https://codeload.github.com/"
+  )
+  local -a pids=()
+  tmp=$(mktemp -d 2>/dev/null) || { echo "  не удалось создать временный каталог — проверку доступа к GitHub пропускаю"; return 0; }
+  echo "  Проверка доступа к GitHub (панель, утилиты AmneziaWG, списки маршрутов), до ~40 с..."
+  for h in 0 1 2 3; do
+    gh_probe "${tmp}/${h}" "${urls[$h]}" &
+    pids+=("$!")
+  done
+  wait "${pids[@]}" || true
+  for h in 0 1 2 3; do
+    c=$(cat "${tmp}/${h}" 2>/dev/null || echo "000")
+    if [[ "$h" == "0" && ( "$c" == "403" || "$c" == "429" ) ]]; then
+      if [[ -n "${LUCX_PIN_VERSION:-}" ]]; then
+        echo "    ✓ ${hosts[$h]} (лимит запросов исчерпан, но версия задана LUCX_PIN_VERSION — список релизов не нужен)"
+      else
+        echo "    ✗ ${hosts[$h]} (код ${c}: исчерпан лимит запросов GitHub для этого IP)"
+        ratelimit=1; fail+=" ${hosts[$h]}"
+      fi
+    elif [[ "$c" =~ ^[234][0-9][0-9]$ ]]; then
+      echo "    ✓ ${hosts[$h]}"
+    else
+      if [[ "$c" == "000" ]]; then echo "    ✗ ${hosts[$h]} (нет ответа)"; else echo "    ✗ ${hosts[$h]} (ошибка сервера, код ${c})"; fi
+      fail+=" ${hosts[$h]}"
+    fi
+  done
+  rm -rf "$tmp"
+  if [[ -n "$fail" ]]; then
+    echo
+    echo "СТОП: сервер не достучался до GitHub:${fail}. Без него установка не дойдёт до конца: не скачается панель или утилиты AmneziaWG."
+    if [[ "$ratelimit" == "1" ]]; then
+      echo "      Для api.github.com исчерпан лимит запросов без токена на этот IP (60 в час): подожди час или задай версию панели"
+      echo "      явно (LUCX_PIN_VERSION=<тег>, тогда список релизов не нужен)."
+    fi
+    echo "      Чаще всего это временный сбой на пути до GitHub (бывает, что часть адресов отвечает, а часть нет). Что сделать:"
+    echo "        1. Подождать 5-10 минут и запустить install ещё раз (панель и настройки сервера не тронуты, повтор безопасен)."
+    echo "        2. Проверить с сервера: curl -sSI https://github.com | head -1   и   getent hosts github.com"
+    echo "        3. Если не проходит долго — попросить хостера проверить маршрут до GitHub или взять сервер в другом месте."
+    echo "      Принудительно продолжить без проверки (на свой риск): ответить n на вопрос о проверке или sudo SKIP_GITHUB_PREFLIGHT=1 bash ${self} install"
+    INSTALL_SUCCESS=1   # cleanup не должен трогать x-ui: установка ещё ничего не меняла
+    exit 1
+  fi
+  return 0
+}
+
 # v0.6.0: предпроверка доступа к PyPI. Установщик панели (lucx-ui, x-ui.sh setup-fail2ban) на Ubuntu >= 24.04 ставит fail2ban и
 # докачивает через pip пакет pyasynchat. Если у сервера есть IPv6-адрес, но маршрут до PyPI по IPv6 не работает, pip ждёт таймаут
 # по каждому адресу и установка выглядит зависшей («Collecting pyasynchat» и тишина). Здесь: (1) IPv4 до PyPI жив, а IPv6 уходит
@@ -2624,6 +2713,7 @@ cmd_install() {
   echo " lucx-ui + два домена + Reality на 443 (install mode)"
   echo " Версия скрипта: ${VERSION}"
   echo "======================================================"
+  install_preflight_github
   install_preflight_kernel
   read -rp "Домен панели (напр. panel.example.com): " DOMAIN
   echo

@@ -2317,8 +2317,7 @@ install_print_summary() {
   echo "    логин:   ${XUI_USERNAME}"
   echo "    пароль:  ${XUI_PASSWORD}"
   echo
-  echo "  Подписка для клиентов:  https://${DOMAIN}${SUB_SECRET_PATH}"
-  echo "  Подписка AmneziaWG:     https://${DOMAIN}${AWG_SECRET_PATH}"
+  echo "  Ссылки-подписки клиентам выдавай из панели (у клиента), после обновления ключей."
   echo
   echo "  Что работает:"
   if [[ "${REALITY_OK:-0}" == "1" ]]; then

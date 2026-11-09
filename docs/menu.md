@@ -42,4 +42,4 @@ sudo bash 3x-ui-dual-domain.sh
 
 ## Чего в меню нет
 
-`add-vls`, `add-reality`, `add-hy2`, `add-h2`, `add-reality-front` и `panel-path` в меню не вынесены: `install` ставит всё это сам. Команды остаются в скрипте и работают из командной строки, как раньше. Они нужны для серверов, поставленных старыми версиями: например, после `upgrade` на установке версии 0.6.0 и старше один раз запустите `sudo bash 3x-ui-dual-domain.sh panel-path` (подсказывает healthcheck).
+`add-vls`, `add-reality`, `add-hy2`, `add-h2`, `add-reality-front` и `panel-path` в меню не вынесены: `install` ставит всё это сам. Команды остаются в скрипте и работают из командной строки, как раньше. Описание и порядок действий: [service-commands.md](service-commands.md). Они нужны для серверов, поставленных старыми версиями: например, после `upgrade` на установке версии 0.6.0 и старше один раз запустите `sudo bash 3x-ui-dual-domain.sh panel-path` (подсказывает healthcheck).

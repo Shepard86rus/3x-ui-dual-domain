@@ -148,7 +148,7 @@ bash 3x-ui-dual-domain.sh healthcheck
 | `bash 3x-ui-dual-domain.sh add-bot` / `remove-bot` | Поставить или удалить Telegram-бота управления. Нужен, если не поставили его при установке |
 | `bash 3x-ui-dual-domain.sh add-swap` / `remove-swap` | Swap-файл для сервера с малой памятью (около 1 ГБ). `healthcheck` сам подскажет, если он нужен |
 | `bash 3x-ui-dual-domain.sh rebind-ip` | Только если сервер сменил IP: перепрописать конфиги (порядок действий: [docs/ip-change.md](docs/ip-change.md)) |
-| `bash 3x-ui-dual-domain.sh conntrack-guard` | Поднять таблицу conntrack (0.6.9+) на уже работающем сервере: защита от флуда, из-за которого забивается таблица (по умолчанию 8192) и сервер «тупит». Меняет только параметры ядра, nginx и клиентов не трогает; install делает то же сам |
+| `bash 3x-ui-dual-domain.sh conntrack-guard` | Поднять таблицу conntrack (0.6.9+) на уже работающем сервере: защита от флуда, из-за которого забивается таблица (по умолчанию 8192) и сервер «тупит». Меняет только параметры ядра, nginx и клиентов не трогает; install делает то же сам; `worker_connections 16384` и `proxy_connect_timeout 5s` ставит только новый install (на работающем сервере не применяются) |
 
 ### Служебные команды (обычно не нужны)
 

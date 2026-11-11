@@ -5009,7 +5009,7 @@ SYSTEMDEOF
   systemctl daemon-reload
   echo "  systemd LimitNOFILE -> 65535 (override.conf)"
   # v0.6.9: таблица conntrack (по умолчанию 8192) забивается флудом — поднимаем (без снижения существующего)
-  conntrack_guard_apply
+  conntrack_guard_apply || echo "  WARN: conntrack не настроен — продолжаю установку (потом: bash $0 conntrack-guard)"
 
   # Валидируем конфиг сразу после правок — если sed что-то сломал,
   # ошибка всплывёт здесь с точной привязкой к шагу, а не позже
@@ -5834,7 +5834,8 @@ cmd_healthcheck() {
           check "conntrack: таблица заполнена на ${HC_CT_P}% (${HC_CT_N}/${HC_CT_M}) — близко к пределу; bash $0 conntrack-guard" warn
         elif (( HC_CT_M < 16384 )); then
           check "conntrack: ${HC_CT_N}/${HC_CT_M} (${HC_CT_P}%), но предел таблицы мал (< 16384) — флуд забьёт её за минуты; bash $0 conntrack-guard" warn
-        elif ! grep -rqsE '^\s*net\.netfilter\.nf_conntrack_max\s*=' /etc/sysctl.conf /etc/sysctl.d/ 2>/dev/null; then
+        elif (( $(cat /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || echo 0) * 8 < HC_CT_M )) \
+          && ! grep -rqsE --include='*.conf' '^\s*-?\s*net[./](netfilter[./])?nf_conntrack_max\s*=' /etc/sysctl.conf /etc/sysctl.d/ 2>/dev/null; then
           check "conntrack: ${HC_CT_N}/${HC_CT_M} (${HC_CT_P}%), но предел не записан в sysctl и пропадёт после перезагрузки; bash $0 conntrack-guard" warn
         else
           check "conntrack: ${HC_CT_N}/${HC_CT_M} (${HC_CT_P}%)" ok
@@ -6598,7 +6599,7 @@ stream_set_listen_ip() {  # $1=IPv4 $2=файл
 }
 
 # ---- v0.6.9: таблица conntrack ----
-# Таблица по умолчанию 8192 на малых ВМ забивается за минуты при флуде; established живёт 5 суток.
+# Таблица на малых ВМ часто 8192 забивается за минуты при флуде; established живёт 5 суток.
 # Поднимаем максимум и опускаем таймаут established до суток, но НИКОГДА не снижаем уже большее значение.
 # Постоянство после перезагрузки: nf_conntrack грузится рано (modules-load.d), иначе systemd-sysctl запускается раньше модуля
 # и молча пропускает ключи net.netfilter.*; hashsize в modprobe.d задан как max/8 (ядро 5.15+ при явном hashsize берёт
@@ -6616,7 +6617,7 @@ conntrack_guard_apply() {
   fi
   mem=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || true)
   want="${LUCX_CONNTRACK_MAX:-}"
-  if [[ "$want" =~ ^[0-9]+$ ]]; then want=$((10#$want)); else want=0; fi
+  if [[ "$want" =~ ^[0-9]{1,7}$ ]]; then want=$((10#$want)); else want=0; fi
   if (( want < 8192 )); then
     want=65536
     if [[ "$mem" =~ ^[0-9]+$ ]] && (( mem < 600000 )); then want=32768; fi
@@ -6632,27 +6633,29 @@ conntrack_guard_apply() {
   [[ "$est" =~ ^[0-9]+$ ]] || est=0
   newmax=$want; if (( cur > newmax )); then newmax=$cur; fi
   newest=86400; if (( est > 0 && est < newest )); then newest=$est; fi
+  mkdir -p /etc/sysctl.d 2>/dev/null || true
   tmp=$(mktemp /etc/sysctl.d/.lucx-ct.XXXXXX 2>/dev/null) || { echo "  conntrack: нет записи в /etc/sysctl.d — пропуск"; return 0; }
   printf '# v0.6.9 (3x-ui-dual-domain): таблица conntrack не должна забиваться флудом\nnet.netfilter.nf_conntrack_max = %s\nnet.netfilter.nf_conntrack_tcp_timeout_established = %s\n' \
     "$newmax" "$newest" > "$tmp" || { rm -f "$tmp"; echo "  conntrack: не удалось записать файл — пропуск"; return 0; }
-  chmod 644 "$tmp"
+  chmod 644 "$tmp" 2>/dev/null || true
   if [[ -f "$conf" && -f "$ml" ]] && cmp -s "$tmp" "$conf" && (( cur >= newmax && est <= newest )); then
     rm -f "$tmp"
     echo "  conntrack: max=${cur}, established=${est}с — уже достаточно и записано в ${conf}, не меняю"
     return 0
   fi
   rm -f /etc/sysctl.d/99-lucx-conntrack.conf   # имя из предрелизной сборки: префикс 99- перекрывал бы файлы администратора
-  mv -f "$tmp" "$conf"
-  mkdir -p /etc/modules-load.d /etc/modprobe.d
-  echo "nf_conntrack" > "$ml"
+  mv -f "$tmp" "$conf" || { rm -f "$tmp"; echo "  conntrack: не удалось записать ${conf} — пропуск"; return 0; }
+  mkdir -p /etc/modules-load.d /etc/modprobe.d 2>/dev/null || true
+  echo "nf_conntrack" > "$ml" 2>/dev/null || echo "  conntrack: не удалось записать ${ml} (значение может не пережить перезагрузку)"
   hs=$(( newmax / 8 )); if (( hs < 1024 )); then hs=1024; fi
   curhs=$(cat /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || echo 0)
   [[ "$curhs" =~ ^[0-9]+$ ]] || curhs=0
   if (( curhs < hs )); then   # hashsize никогда не снижаем
-    echo "options nf_conntrack hashsize=${hs}" > "$mp"
+    echo "options nf_conntrack hashsize=${hs}" > "$mp" 2>/dev/null || true
     { echo "$hs" > /sys/module/nf_conntrack/parameters/hashsize; } 2>/dev/null || true
   fi
-  if sysctl -q -p "$conf" >/dev/null 2>&1; then applied=0; fi
+  sysctl -q -p "$conf" >/dev/null 2>&1 || true
+  [[ "$(cat "$cnt_max" 2>/dev/null || echo 0)" =~ ^[0-9]+$ ]] && (( $(cat "$cnt_max") >= newmax )) && applied=0
   if (( applied == 0 )); then
     echo "  conntrack: max ${cur} -> $(cat "$cnt_max" 2>/dev/null), established ${est}с -> $(cat "$cnt_est" 2>/dev/null) (файл ${conf})"
   else
@@ -9229,8 +9232,8 @@ case "${1:-install}" in
     echo "  sudo bash $0 remove-bot    — удалить Telegram-бота"
     echo "  sudo bash $0 healthcheck   — проверить текущую связку"
     echo "  sudo bash $0 rebind-ip     — сменить IP в stream-роутере"
-    echo "  sudo bash $0 conntrack-guard — поднять таблицу conntrack (защита от флуда; только параметры ядра)"
     echo "                               (после смены IP у провайдера)"
+    echo "  sudo bash $0 conntrack-guard — поднять таблицу conntrack (защита от флуда; только параметры ядра)"
     echo "  sudo bash $0 backup        — зашифрованный архив сервера (клиенты, инбаунды, настройки, конфиги; --with-certs"
     echo "                               кладёт и сертификаты); перенос: A-записи -> install -> restore"
     echo "  sudo bash $0 restore <файл> — восстановить архив на сервер с уже выполненным install (те же домены;"

@@ -6606,6 +6606,22 @@ stream_set_listen_ip() {  # $1=IPv4 $2=файл
   grep -qE "^\s*listen\s+${1//./\\.}:443;" "$2"
 }
 
+# Чужие файлы sysctl, которые читаются ПОСЛЕ нашего (/etc/sysctl.conf и файлы с именем позже 20-lucx-conntrack.conf), перебьют
+# наше значение после перезагрузки: предупреждаем, ничего в чужих файлах не меняем. $1=нужное max, $2=наш файл
+conntrack_override_warn() {
+  local newmax="$1" conf="$2" LC_COLLATE=C of ov="" ov_v
+  for of in /etc/sysctl.conf /etc/sysctl.d/*.conf /run/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf; do
+    [[ -f "$of" && "$of" != "$conf" ]] || continue
+    if [[ "$of" != "/etc/sysctl.conf" && ! "$(basename "$of")" > "20-lucx-conntrack.conf" ]]; then continue; fi
+    ov_v=$(grep -E '^\s*-?\s*net[./](netfilter[./])?nf_conntrack_max\s*=' "$of" 2>/dev/null | tail -n1 | sed -E 's/.*=\s*//; s/\s+$//' || true)
+    if [[ "$ov_v" =~ ^[0-9]+$ ]] && (( ov_v < newmax )); then ov+=" ${of} (=${ov_v})"; fi
+  done
+  if [[ -n "$ov" ]]; then
+    echo "  ВНИМАНИЕ: после перезагрузки значение conntrack_max перебьют чужие файлы:${ov} — там меньше, чем нужно (${newmax}). Поправьте их вручную."
+  fi
+  return 0
+}
+
 # ---- v0.6.9: таблица conntrack ----
 # Таблица на малых ВМ часто 8192 забивается за минуты при флуде; established живёт 5 суток.
 # Поднимаем максимум и опускаем таймаут established до суток, но НИКОГДА не снижаем уже большее значение.
@@ -6649,6 +6665,7 @@ conntrack_guard_apply() {
   if [[ -f "$conf" && -f "$ml" ]] && cmp -s "$tmp" "$conf" && (( cur >= newmax && est <= newest )); then
     rm -f "$tmp"
     echo "  conntrack: max=${cur}, established=${est}с — уже достаточно и записано в ${conf}, не меняю"
+    conntrack_override_warn "$newmax" "$conf"
     return 0
   fi
   rm -f /etc/sysctl.d/99-lucx-conntrack.conf   # имя из предрелизной сборки: префикс 99- перекрывал бы файлы администратора
@@ -6673,6 +6690,7 @@ conntrack_guard_apply() {
   else
     echo "  conntrack: на лету не применено — значения записаны в ${conf} и вступят в силу после перезагрузки (в контейнере не вступят: conntrack настраивает хост)"
   fi
+  conntrack_override_warn "$newmax" "$conf"
   return 0
 }
 

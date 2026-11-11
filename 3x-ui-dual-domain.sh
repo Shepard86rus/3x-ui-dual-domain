@@ -967,7 +967,18 @@
 #   подводные камни, откат); пункты, которые трудно откатить или которые затрагивают клиентов (⚠), требуют ввести yes. Команды не менялись и работают из командной строки как раньше;
 #   add-vls, add-reality, add-hy2, add-h2, add-reality-front и panel-path в меню не вынесены (install ставит их сам).
 #   Автоматизация с pty (expect, ssh -tt): передавайте `install` явно, иначе откроется меню.
-VERSION="0.6.8"
+# v0.6.9: защита от переполнения таблицы conntrack (по живому случаю: сосед по подсети хостера держал ~1500 соединений с одним
+#   ClientHello, таблица conntrack 8192/8192 забилась, load на 1 ядре вырос до 9, SSH и клиенты отваливались). (1) conntrack:
+#   nf_conntrack_max не ниже 65536 (32768 при ОЗУ < 600 МБ, потолок — четверть ОЗУ; LUCX_CONNTRACK_MAX=<N>) и таймаут established
+#   не выше суток (было 5 суток); значения пишутся в sysctl.d (префикс 20-), modules-load.d и modprobe.d (hashsize = max/8), чтобы
+#   пережить перезагрузку, даже если администратор уже поднимал их вручную через sysctl -w; уже большие значения не снижаются.
+#   Ставит install; на работающей ноде — команда `conntrack-guard` (меняет только параметры ядра, nginx и клиентов не трогает).
+#   (2) nginx: worker_connections 16384 вместо 4096 (одно ядро держало ~2000 сессий) и proxy_connect_timeout 5s в stream-роутере
+#   (по умолчанию 60 с: каждая неудачная попытка к Xray держала два слота целую минуту). Только для новых install; на работающих
+#   нодах эти две правки не применяются сами. (3) healthcheck: заполнение conntrack (warn от 80%, fail от 95%), малый предел таблицы
+#   и значение, не записанное в файлы (не переживёт перезагрузку); в [11] из строки белого списка UDP убран дубль порта AWG.
+#   Лимит соединений с одного IP сознательно не вводится: клиенты разные (каскады, CGNAT, мобильные сети).
+VERSION="0.6.9"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -4967,18 +4978,18 @@ SITEMAP
   # --- [7.5/10] nginx connection limits ---
   echo "=== [7.5/10] nginx: лимиты соединений и файловых дескрипторов ==="
   # Дефолтные 768 worker_connections недостаточны при ~400+ активных
-  # проксируемых сессиях (каждая занимает 2 слота). Выставляем 4096
+  # проксируемых сессиях (каждая занимает 2 слота). Выставляем 16384 (v0.6.9; было 4096)
   # с запасом ~5× от текущей пиковой нагрузки.
   NGINX_CONF="/etc/nginx/nginx.conf"
 
-  # worker_connections 4096
+  # worker_connections 16384
   if grep -qE '^\s*worker_connections\s+' "$NGINX_CONF"; then
-    sed -i 's/^\s*worker_connections\s*.*/        worker_connections 4096;/' "$NGINX_CONF"
+    sed -i 's/^\s*worker_connections\s*.*/        worker_connections 16384;/' "$NGINX_CONF"
   else
     # Вставляем в блок events { ... }
-    sed -i '/events {/a\        worker_connections 4096;' "$NGINX_CONF"
+    sed -i '/events {/a\        worker_connections 16384;' "$NGINX_CONF"
   fi
-  echo "  worker_connections -> 4096"
+  echo "  worker_connections -> 16384"
 
   # worker_rlimit_nofile 65535
   if grep -qE '^\s*worker_rlimit_nofile\s+' "$NGINX_CONF"; then
@@ -4997,6 +5008,8 @@ LimitNOFILE=65535
 SYSTEMDEOF
   systemctl daemon-reload
   echo "  systemd LimitNOFILE -> 65535 (override.conf)"
+  # v0.6.9: таблица conntrack (по умолчанию 8192) забивается флудом — поднимаем (без снижения существующего)
+  conntrack_guard_apply
 
   # Валидируем конфиг сразу после правок — если sed что-то сломал,
   # ошибка всплывёт здесь с точной привязкой к шагу, а не позже
@@ -5129,6 +5142,8 @@ stream {
         proxy_pass \$backend_pool;
         ssl_preread on;
         proxy_protocol on;
+        # v0.6.9: до Xray по loopback соединение занимает миллисекунды; дефолт 60 с держал два слота на каждую неудачную попытку
+        proxy_connect_timeout 5s;
     }
 }
 EOF
@@ -5808,6 +5823,25 @@ cmd_healthcheck() {
       check "nginx: worker_connections=${wc:-<не найден>} (< 4096) — риск 'worker_connections are not enough'" fail
     fi
 
+    # v0.6.9: заполнение conntrack и сохранность значения после перезагрузки
+    if [[ -r /proc/sys/net/netfilter/nf_conntrack_count && -r /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+      HC_CT_N=$(< /proc/sys/net/netfilter/nf_conntrack_count); HC_CT_M=$(< /proc/sys/net/netfilter/nf_conntrack_max)
+      if [[ "$HC_CT_N" =~ ^[0-9]+$ && "$HC_CT_M" =~ ^[0-9]+$ && "$HC_CT_M" -gt 0 ]]; then
+        HC_CT_P=$(( HC_CT_N * 100 / HC_CT_M ))
+        if (( HC_CT_P >= 95 )); then
+          check "conntrack: таблица заполнена на ${HC_CT_P}% (${HC_CT_N}/${HC_CT_M}) — новые соединения отбрасываются; смотри: ss -s, bash $0 conntrack-guard" fail
+        elif (( HC_CT_P >= 80 )); then
+          check "conntrack: таблица заполнена на ${HC_CT_P}% (${HC_CT_N}/${HC_CT_M}) — близко к пределу; bash $0 conntrack-guard" warn
+        elif (( HC_CT_M < 16384 )); then
+          check "conntrack: ${HC_CT_N}/${HC_CT_M} (${HC_CT_P}%), но предел таблицы мал (< 16384) — флуд забьёт её за минуты; bash $0 conntrack-guard" warn
+        elif ! grep -rqsE '^\s*net\.netfilter\.nf_conntrack_max\s*=' /etc/sysctl.conf /etc/sysctl.d/ 2>/dev/null; then
+          check "conntrack: ${HC_CT_N}/${HC_CT_M} (${HC_CT_P}%), но предел не записан в sysctl и пропадёт после перезагрузки; bash $0 conntrack-guard" warn
+        else
+          check "conntrack: ${HC_CT_N}/${HC_CT_M} (${HC_CT_P}%)" ok
+        fi
+      fi
+    fi
+
     if grep -qE '^\s*worker_rlimit_nofile\s+65535' /etc/nginx/nginx.conf; then
       check "nginx: worker_rlimit_nofile=65535" ok
     else
@@ -6341,6 +6375,10 @@ cmd_healthcheck() {
       if [[ -n "$HC11_LINE" ]]; then HC11_ALLOW_UDP+="${HC11_LINE} "; fi
     done < "$HC11_EXC_UDP"
   fi
+  # v0.6.9: один и тот же порт приходил из AWG_PORT_HC, из списка AWG-инбаундов и из файла исключений — в строке белого списка
+  # был дубль («UDP: 443 52911 52911»). Убираем повторы, сохраняя порядок.
+  HC11_ALLOW_TCP=" $(tr ' ' '\n' <<<"$HC11_ALLOW_TCP" | awk 'NF && !s[$0]++' | tr '\n' ' ')"
+  HC11_ALLOW_UDP=" $(tr ' ' '\n' <<<"$HC11_ALLOW_UDP" | awk 'NF && !s[$0]++' | tr '\n' ' ')"
   HC11_UFW_TXT=$(ufw status 2>/dev/null || true)   # v0.6.5: один вызов, без pipe в grep -q (SIGPIPE под pipefail)
   HC11_UFW_ALLOWS() {
     # $1 = порт, $2 = протокол; строка ufw: "<port>/<proto>  ALLOW  Anywhere"
@@ -6557,6 +6595,81 @@ cmd_healthcheck() {
 stream_set_listen_ip() {  # $1=IPv4 $2=файл
   sed -i -E "s/^(\s*)listen\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:)?443;/\1listen $1:443;/" "$2"
   grep -qE "^\s*listen\s+${1//./\\.}:443;" "$2"
+}
+
+# ---- v0.6.9: таблица conntrack ----
+# Таблица по умолчанию 8192 на малых ВМ забивается за минуты при флуде; established живёт 5 суток.
+# Поднимаем максимум и опускаем таймаут established до суток, но НИКОГДА не снижаем уже большее значение.
+# Постоянство после перезагрузки: nf_conntrack грузится рано (modules-load.d), иначе systemd-sysctl запускается раньше модуля
+# и молча пропускает ключи net.netfilter.*; hashsize в modprobe.d задан как max/8 (ядро 5.15+ при явном hashsize берёт
+# max = 8 × hashsize, поэтому после загрузки max тот же, что мы записали). Файл sysctl.d с префиксом 20-, чтобы собственные
+# файлы администратора (60-, 99-) переопределяли наши значения. Файлы пишутся ВСЕГДА по итоговым значениям (а не только когда
+# значение в ядре меньше): если max уже подняли вручную через sysctl -w, оно всё равно будет сохранено. 0 = ок.
+conntrack_guard_apply() {
+  local cnt_max="/proc/sys/net/netfilter/nf_conntrack_max" cnt_est="/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established"
+  local want cur est mem cap hs curhs newmax newest conf="/etc/sysctl.d/20-lucx-conntrack.conf" tmp applied=1
+  local ml="/etc/modules-load.d/lucx-nf_conntrack.conf" mp="/etc/modprobe.d/lucx-nf_conntrack.conf"
+  [[ -r "$cnt_max" ]] || modprobe nf_conntrack >/dev/null 2>&1 || true
+  if [[ ! -r "$cnt_max" ]]; then
+    echo "  conntrack: модуль не загружен (контейнер или ядро без conntrack) — пропуск"
+    return 0
+  fi
+  mem=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || true)
+  want="${LUCX_CONNTRACK_MAX:-}"
+  if [[ "$want" =~ ^[0-9]+$ ]]; then want=$((10#$want)); else want=0; fi
+  if (( want < 8192 )); then
+    want=65536
+    if [[ "$mem" =~ ^[0-9]+$ ]] && (( mem < 600000 )); then want=32768; fi
+  fi
+  if (( want > 1048576 )); then want=1048576; fi
+  # запись conntrack ~320 байт: не отдаём таблице больше четверти ОЗУ
+  if [[ "$mem" =~ ^[0-9]+$ ]]; then
+    cap=$(( mem * 1024 / 4 / 320 ))
+    if (( cap >= 8192 && want > cap )); then want=$cap; fi
+  fi
+  cur=$(cat "$cnt_max" 2>/dev/null || echo 0); est=$(cat "$cnt_est" 2>/dev/null || echo 0)
+  [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+  [[ "$est" =~ ^[0-9]+$ ]] || est=0
+  newmax=$want; if (( cur > newmax )); then newmax=$cur; fi
+  newest=86400; if (( est > 0 && est < newest )); then newest=$est; fi
+  tmp=$(mktemp /etc/sysctl.d/.lucx-ct.XXXXXX 2>/dev/null) || { echo "  conntrack: нет записи в /etc/sysctl.d — пропуск"; return 0; }
+  printf '# v0.6.9 (3x-ui-dual-domain): таблица conntrack не должна забиваться флудом\nnet.netfilter.nf_conntrack_max = %s\nnet.netfilter.nf_conntrack_tcp_timeout_established = %s\n' \
+    "$newmax" "$newest" > "$tmp" || { rm -f "$tmp"; echo "  conntrack: не удалось записать файл — пропуск"; return 0; }
+  chmod 644 "$tmp"
+  if [[ -f "$conf" && -f "$ml" ]] && cmp -s "$tmp" "$conf" && (( cur >= newmax && est <= newest )); then
+    rm -f "$tmp"
+    echo "  conntrack: max=${cur}, established=${est}с — уже достаточно и записано в ${conf}, не меняю"
+    return 0
+  fi
+  rm -f /etc/sysctl.d/99-lucx-conntrack.conf   # имя из предрелизной сборки: префикс 99- перекрывал бы файлы администратора
+  mv -f "$tmp" "$conf"
+  mkdir -p /etc/modules-load.d /etc/modprobe.d
+  echo "nf_conntrack" > "$ml"
+  hs=$(( newmax / 8 )); if (( hs < 1024 )); then hs=1024; fi
+  curhs=$(cat /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || echo 0)
+  [[ "$curhs" =~ ^[0-9]+$ ]] || curhs=0
+  if (( curhs < hs )); then   # hashsize никогда не снижаем
+    echo "options nf_conntrack hashsize=${hs}" > "$mp"
+    { echo "$hs" > /sys/module/nf_conntrack/parameters/hashsize; } 2>/dev/null || true
+  fi
+  if sysctl -q -p "$conf" >/dev/null 2>&1; then applied=0; fi
+  if (( applied == 0 )); then
+    echo "  conntrack: max ${cur} -> $(cat "$cnt_max" 2>/dev/null), established ${est}с -> $(cat "$cnt_est" 2>/dev/null) (файл ${conf})"
+  else
+    echo "  conntrack: на лету не применено — значения записаны в ${conf} и вступят в силу после перезагрузки (в контейнере не вступят: conntrack настраивает хост)"
+  fi
+  return 0
+}
+
+# Отдельная команда для уже работающих нод: меняет только параметры ядра (sysctl, modprobe), nginx и клиентов не трогает.
+cmd_conntrack_guard() {
+  if [[ $EUID -ne 0 ]]; then
+    echo "Запусти от root: sudo bash $0 conntrack-guard"
+    exit 1
+  fi
+  echo "=== conntrack-guard: таблица conntrack против переполнения флудом ==="
+  conntrack_guard_apply || true
+  echo "Готово. Проверка: sudo bash $0 healthcheck"
 }
 
 cmd_rebind_ip() {
@@ -9051,6 +9164,9 @@ case "${1:-install}" in
   rebind-ip|rebind|newip)
     cmd_rebind_ip
     ;;
+  conntrack-guard|conntrack)
+    cmd_conntrack_guard
+    ;;
   add-vls|vls|tls)
     cmd_switch_mode tls
     ;;
@@ -9113,6 +9229,7 @@ case "${1:-install}" in
     echo "  sudo bash $0 remove-bot    — удалить Telegram-бота"
     echo "  sudo bash $0 healthcheck   — проверить текущую связку"
     echo "  sudo bash $0 rebind-ip     — сменить IP в stream-роутере"
+    echo "  sudo bash $0 conntrack-guard — поднять таблицу conntrack (защита от флуда; только параметры ядра)"
     echo "                               (после смены IP у провайдера)"
     echo "  sudo bash $0 backup        — зашифрованный архив сервера (клиенты, инбаунды, настройки, конфиги; --with-certs"
     echo "                               кладёт и сертификаты); перенос: A-записи -> install -> restore"

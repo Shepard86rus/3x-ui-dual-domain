@@ -6609,15 +6609,15 @@ stream_set_listen_ip() {  # $1=IPv4 $2=файл
 # Чужие файлы sysctl, которые читаются ПОСЛЕ нашего (/etc/sysctl.conf и файлы с именем позже 20-lucx-conntrack.conf), перебьют
 # наше значение после перезагрузки: предупреждаем, ничего в чужих файлах не меняем. $1=нужное max, $2=наш файл
 conntrack_override_warn() {
-  local newmax="$1" conf="$2" LC_COLLATE=C of ov="" ov_v
-  for of in /etc/sysctl.conf /etc/sysctl.d/*.conf /run/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf; do
+  local newmax="$1" conf="$2" LC_ALL=C of ov="" ov_v
+  for of in /etc/sysctl.conf /etc/sysctl.d/*.conf /run/sysctl.d/*.conf /usr/local/lib/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf; do
     [[ -f "$of" && "$of" != "$conf" ]] || continue
     if [[ "$of" != "/etc/sysctl.conf" && ! "$(basename "$of")" > "20-lucx-conntrack.conf" ]]; then continue; fi
-    ov_v=$(grep -E '^\s*-?\s*net[./](netfilter[./])?nf_conntrack_max\s*=' "$of" 2>/dev/null | tail -n1 | sed -E 's/.*=\s*//; s/\s+$//' || true)
-    if [[ "$ov_v" =~ ^[0-9]+$ ]] && (( ov_v < newmax )); then ov+=" ${of} (=${ov_v})"; fi
+    ov_v=$(grep -E '^\s*-?\s*net[./](netfilter[./])?nf_conntrack_max\s*=' "$of" 2>/dev/null | tail -n1 | sed -E 's/^[^=]*=[[:space:]]*//; s/^([0-9]+).*/\1/' || true)
+    if [[ "$ov_v" =~ ^(0|[1-9][0-9]{0,9})$ ]] && (( ov_v < newmax )); then ov+=" ${of} (=${ov_v})"; fi
   done
   if [[ -n "$ov" ]]; then
-    echo "  ВНИМАНИЕ: после перезагрузки значение conntrack_max перебьют чужие файлы:${ov} — там меньше, чем нужно (${newmax}). Поправьте их вручную."
+    echo "  ВНИМАНИЕ: после перезагрузки значение conntrack_max могут перебить чужие файлы:${ov} — там меньше, чем нужно (${newmax}). Поправьте их вручную."
   fi
   return 0
 }

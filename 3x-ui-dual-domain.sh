@@ -5008,8 +5008,8 @@ LimitNOFILE=65535
 SYSTEMDEOF
   systemctl daemon-reload
   echo "  systemd LimitNOFILE -> 65535 (override.conf)"
-  # v0.6.9: таблица conntrack (по умолчанию 8192) забивается флудом — поднимаем (без снижения существующего)
-  conntrack_guard_apply || echo "  WARN: conntrack не настроен — продолжаю установку (потом: bash $0 conntrack-guard)"
+  # v0.6.9: таблица conntrack (на малых ВМ часто 8192) забивается флудом — поднимаем (без снижения существующего)
+  conntrack_guard_apply || true   # необязательная настройка ядра: сбой не должен ронять установку (повтор: bash $0 conntrack-guard)
 
   # Валидируем конфиг сразу после правок — если sed что-то сломал,
   # ошибка всплывёт здесь с точной привязкой к шагу, а не позже
@@ -5828,14 +5828,22 @@ cmd_healthcheck() {
       HC_CT_N=$(< /proc/sys/net/netfilter/nf_conntrack_count); HC_CT_M=$(< /proc/sys/net/netfilter/nf_conntrack_max)
       if [[ "$HC_CT_N" =~ ^[0-9]+$ && "$HC_CT_M" =~ ^[0-9]+$ && "$HC_CT_M" -gt 0 ]]; then
         HC_CT_P=$(( HC_CT_N * 100 / HC_CT_M ))
+        # какое значение ядро выставит само после перезагрузки: при автоматическом hashsize max = hashsize (ядро 5.15+) или 4×hashsize
+        # (старше), при явном hashsize (modprobe.d / cmdline) max = 8×hashsize; поднятое вручную без файла в sysctl на эту оценку не опирается
+        HC_CT_HS=$(cat /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || echo 0); [[ "$HC_CT_HS" =~ ^[0-9]+$ ]] || HC_CT_HS=0
+        HC_CT_KV=$(uname -r 2>/dev/null || echo 0.0); HC_CT_KMAJ=${HC_CT_KV%%.*}; HC_CT_KMIN=${HC_CT_KV#*.}; HC_CT_KMIN=${HC_CT_KMIN%%.*}
+        [[ "$HC_CT_KMAJ" =~ ^[0-9]+$ ]] || HC_CT_KMAJ=0; [[ "$HC_CT_KMIN" =~ ^[0-9]+$ ]] || HC_CT_KMIN=0
+        HC_CT_F=1; if (( HC_CT_KMAJ < 5 || (HC_CT_KMAJ == 5 && HC_CT_KMIN < 15) )); then HC_CT_F=4; fi
+        if grep -rqsE --include='*.conf' '^\s*options\s+nf_conntrack\b.*\bhashsize=' /etc/modprobe.d/ 2>/dev/null \
+          || grep -qs 'nf_conntrack.hashsize=' /proc/cmdline 2>/dev/null; then HC_CT_F=8; fi
         if (( HC_CT_P >= 95 )); then
           check "conntrack: таблица заполнена на ${HC_CT_P}% (${HC_CT_N}/${HC_CT_M}) — новые соединения отбрасываются; смотри: ss -s, bash $0 conntrack-guard" fail
         elif (( HC_CT_P >= 80 )); then
           check "conntrack: таблица заполнена на ${HC_CT_P}% (${HC_CT_N}/${HC_CT_M}) — близко к пределу; bash $0 conntrack-guard" warn
         elif (( HC_CT_M < 16384 )); then
           check "conntrack: ${HC_CT_N}/${HC_CT_M} (${HC_CT_P}%), но предел таблицы мал (< 16384) — флуд забьёт её за минуты; bash $0 conntrack-guard" warn
-        elif (( $(cat /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || echo 0) * 8 < HC_CT_M )) \
-          && ! grep -rqsE --include='*.conf' '^\s*-?\s*net[./](netfilter[./])?nf_conntrack_max\s*=' /etc/sysctl.conf /etc/sysctl.d/ 2>/dev/null; then
+        elif (( HC_CT_HS * HC_CT_F < HC_CT_M )) \
+          && ! grep -rqsE --include='*.conf' '^\s*-?\s*net[./](netfilter[./])?nf_conntrack_max\s*=' /etc/sysctl.conf /etc/sysctl.d/ /run/sysctl.d/ /usr/lib/sysctl.d/ 2>/dev/null; then
           check "conntrack: ${HC_CT_N}/${HC_CT_M} (${HC_CT_P}%), но предел не записан в sysctl и пропадёт после перезагрузки; bash $0 conntrack-guard" warn
         else
           check "conntrack: ${HC_CT_N}/${HC_CT_M} (${HC_CT_P}%)" ok
@@ -6618,7 +6626,7 @@ conntrack_guard_apply() {
   mem=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || true)
   want="${LUCX_CONNTRACK_MAX:-}"
   if [[ "$want" =~ ^[0-9]{1,7}$ ]]; then want=$((10#$want)); else want=0; fi
-  if (( want < 8192 )); then
+  if (( want < 16384 )); then
     want=65536
     if [[ "$mem" =~ ^[0-9]+$ ]] && (( mem < 600000 )); then want=32768; fi
   fi
@@ -6646,18 +6654,22 @@ conntrack_guard_apply() {
   rm -f /etc/sysctl.d/99-lucx-conntrack.conf   # имя из предрелизной сборки: префикс 99- перекрывал бы файлы администратора
   mv -f "$tmp" "$conf" || { rm -f "$tmp"; echo "  conntrack: не удалось записать ${conf} — пропуск"; return 0; }
   mkdir -p /etc/modules-load.d /etc/modprobe.d 2>/dev/null || true
-  echo "nf_conntrack" > "$ml" 2>/dev/null || echo "  conntrack: не удалось записать ${ml} (значение может не пережить перезагрузку)"
+  { echo "nf_conntrack" > "$ml"; } 2>/dev/null || echo "  conntrack: не удалось записать ${ml} (значение может не пережить перезагрузку)"
   hs=$(( newmax / 8 )); if (( hs < 1024 )); then hs=1024; fi
   curhs=$(cat /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || echo 0)
   [[ "$curhs" =~ ^[0-9]+$ ]] || curhs=0
   if (( curhs < hs )); then   # hashsize никогда не снижаем
-    echo "options nf_conntrack hashsize=${hs}" > "$mp" 2>/dev/null || true
+    { echo "options nf_conntrack hashsize=${hs}" > "$mp"; } 2>/dev/null || true
     { echo "$hs" > /sys/module/nf_conntrack/parameters/hashsize; } 2>/dev/null || true
   fi
   sysctl -q -p "$conf" >/dev/null 2>&1 || true
-  [[ "$(cat "$cnt_max" 2>/dev/null || echo 0)" =~ ^[0-9]+$ ]] && (( $(cat "$cnt_max") >= newmax )) && applied=0
+  cur=$(cat "$cnt_max" 2>/dev/null || echo 0); est=$(cat "$cnt_est" 2>/dev/null || echo 0)
+  [[ "$cur" =~ ^[0-9]+$ ]] || cur=0
+  [[ "$est" =~ ^[0-9]+$ ]] || est=0
+  # «применено» только если ядро реально держит оба значения (в LXC /proc бывает только для чтения)
+  if (( cur >= newmax )) && { [[ ! -r "$cnt_est" ]] || (( est <= newest )); }; then applied=0; fi
   if (( applied == 0 )); then
-    echo "  conntrack: max ${cur} -> $(cat "$cnt_max" 2>/dev/null), established ${est}с -> $(cat "$cnt_est" 2>/dev/null) (файл ${conf})"
+    echo "  conntrack: max ${cur}, established ${est}с (файл ${conf})"
   else
     echo "  conntrack: на лету не применено — значения записаны в ${conf} и вступят в силу после перезагрузки (в контейнере не вступят: conntrack настраивает хост)"
   fi

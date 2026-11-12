@@ -112,7 +112,7 @@ EOS
       ;;
     disk)    echo 'df -h /' ;;
     log)     echo 'journalctl -u x-ui -n 15 --no-pager 2>/dev/null | tail -15 | cut -c1-200' ;;
-    backup)  echo 'f="/root/x-ui-backup-$(date +%F-%H%M).db"; cp /etc/x-ui/x-ui.db "$f" && echo "бэкап: $f" || echo "ОШИБКА бэкапа"' ;;
+    backup)  echo 'f="/root/x-ui-backup-$(date +%F-%H%M).db"; sqlite3 /etc/x-ui/x-ui.db ".backup \"$f\"" && echo "бэкап: $f" || echo "ОШИБКА бэкапа"' ;;
     hc)
       cat <<'EOS'
 s=/root/3x-ui-dual-domain.sh; [ -f "$s" ] || s=$(ls -1 /root/3x-ui-dual-domain-*.sh 2>/dev/null | tail -1)

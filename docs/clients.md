@@ -29,7 +29,7 @@
 |---|---|---|
 | Платформы | Android, iOS/iPadOS, Apple TV, Windows, macOS, Linux | Windows, macOS, Linux |
 | Ядро | Xray | mihomo (Clash.Meta) |
-| Входы схемы | все: VLESS+TLS, Reality, Hysteria2, XHTTP+Reality (проверено) | Reality и XHTTP+Reality на свежем Xray могут не подключаться — [см. xhttp.md](xhttp.md#если-клиент-не-подключается) |
+| Входы схемы | все: Reality, Hysteria2, XHTTP+Reality (проверено); VLESS+TLS — в прежней схеме `TLS_MODE=1` | Reality и XHTTP+Reality на свежем Xray могут не подключаться — [см. xhttp.md](xhttp.md#если-клиент-не-подключается) |
 | Правила маршрутизации | профиль [hydraponique](https://github.com/hydraponique/roscomvpn-routing): РФ напрямую, YouTube/Telegram/GitHub и остальное через VPN | наш [`clash-universal.yaml`](../clash-universal.yaml): российское напрямую, заблокированное и нужные сервисы (Telegram и др.) через VPN, остальное напрямую |
 | Когда брать | телефон, планшет, ТВ и компьютер; если какой-то вход не подключается | компьютер, нужны правила «напрямую всё, кроме заблокированного» |
 

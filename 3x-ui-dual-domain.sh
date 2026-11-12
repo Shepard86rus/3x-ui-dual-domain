@@ -2204,7 +2204,7 @@ panel_h2_enable() {
 }
 
 REALITY_ONLY_ROLLBACK_ARMED=0
-RO_DB_BAK=""; RO_CONF_BAK=""; RO_STREAM_CONF=""; RO_FRONT=0
+RO_DB_BAK=""; RO_CONF_BAK=""; RO_STREAM_CONF=""; RO_FRONT=0; RO_HUP=0
 reality_only_rollback() { # причина
   [[ "${REALITY_ONLY_ROLLBACK_ARMED:-0}" == "1" ]] || return 0
   REALITY_ONLY_ROLLBACK_ARMED=0
@@ -2213,7 +2213,10 @@ reality_only_rollback() { # причина
   # откат не должен обрываться на первом сбое (даже если вызван из ловушки под set -e)
   set +e
   # при обрыве SSH (HUP) терминала уже нет — пишем ход отката в журнал
-  exec >>"${REALITY_ONLY_DIR}/run.log" 2>&1 </dev/null || true
+  if [[ "${RO_HUP:-0}" == "1" ]]; then
+    mkdir -p "$REALITY_ONLY_DIR" 2>/dev/null
+    exec >>"${REALITY_ONLY_DIR}/run.log" 2>&1 </dev/null || true
+  fi
   echo "ОТКАТ Reality-only: $1"
   lucx_xui_stop || true
   sleep 1
@@ -2409,7 +2412,8 @@ cmd_reality_only() {
   RO_FRONT=0
   [[ -n "$fid" ]] && RO_FRONT=1
   cp -a "$stream_conf" "$RO_CONF_BAK" || { echo "ОШИБКА: не сохранён nginx-конфиг. Ничего не изменено."; exit 1; }
-  trap 'reality_only_rollback "прерван сигналом"; exit 130' INT TERM HUP
+  trap 'reality_only_rollback "прерван сигналом"; exit 130' INT TERM
+  trap 'RO_HUP=1; reality_only_rollback "обрыв терминала (HUP)"; exit 129' HUP
   trap 'reality_only_rollback "неожиданное завершение (set -e)"; lucx_xui_guard_fire' EXIT
   lucx_xui_stop
   sleep 1

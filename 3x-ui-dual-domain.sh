@@ -1400,7 +1400,7 @@ create_hy2_inbound() {
   fi
   sleep 1
   hy2_bak="${XUIDB}.backup.$(date +%s)"
-  if ! cp -p "$XUIDB" "$hy2_bak"; then
+  if ! lucx_db_snapshot "$hy2_bak"; then
     echo "ОШИБКА: не удалось сделать бэкап БД."
     systemctl start x-ui
     return 1
@@ -1749,7 +1749,7 @@ create_reality_front_inbound() {
   bak="${XUIDB}.backup.$(date +%s)"
   # v0.6.5: функция вызывается под `||`, set -e внутри не действует: сбой cp (нет места) раньше не ловился,
   # вставка шла без бэкапа, а откат копировал несуществующий файл
-  if ! cp -a "$XUIDB" "$bak"; then
+  if ! lucx_db_snapshot "$bak"; then
     echo "  ОШИБКА: бэкап БД не создан — Reality-инбаунд не добавлен."
     rm -f "$bak"
     lucx_xui_start || true
@@ -1769,7 +1769,7 @@ create_reality_front_inbound() {
     echo "  ОШИБКА: Reality-инбаунд не поднялся (x-ui не active или xray не слушает 127.0.0.1:${REALITY_FRONT_PORT}) — возвращаю БД из ${bak}"
     lucx_xui_stop
     sleep 1
-    cp -a "$bak" "$XUIDB"
+    lucx_db_restore "$bak"
     lucx_xui_start
     return 1
   fi
@@ -1988,7 +1988,7 @@ reality_only_stream_json() {
 reality_only_first_client() { # inbound_id
   local now
   now=$(( $(date +%s) * 1000 ))
-  sqlite3 "$XUIDB" "SELECT json_extract(c.value,'\$.id')||'|'||COALESCE(json_extract(c.value,'\$.flow'),'') FROM (SELECT settings FROM inbounds WHERE id=${1}) i, json_each(i.settings,'\$.clients') c WHERE COALESCE(json_extract(c.value,'\$.enable'),1) IN (1,'true') AND (COALESCE(json_extract(c.value,'\$.expiryTime'),0)=0 OR json_extract(c.value,'\$.expiryTime')>${now}) LIMIT 1;" 2>/dev/null || true
+  sqlite3 "$XUIDB" "SELECT json_extract(c.value,'\$.id')||'|'||COALESCE(json_extract(c.value,'\$.flow'),'') FROM (SELECT settings FROM inbounds WHERE id=${1}) i, json_each(i.settings,'\$.clients') c WHERE COALESCE(json_extract(c.value,'\$.enable'),1) IN (1,'true') AND (COALESCE(json_extract(c.value,'\$.expiryTime'),0)=0 OR json_extract(c.value,'\$.expiryTime')>${now}) ORDER BY (COALESCE(json_extract(c.value,'\$.flow'),'')<>'') DESC LIMIT 1;" 2>/dev/null || true
 }
 
 # Самотест Reality-only через публичный IP: сайт 200 (nginx), Reality-клиенты (аргументы "uuid|flow"), нет слушателя :8446.
@@ -2595,7 +2595,7 @@ cmd_add_h2() {
   lucx_xui_stop
   sleep 1
   bak="${XUIDB}.backup.$(date +%s)"
-  if ! cp -a "$XUIDB" "$bak"; then
+  if ! lucx_db_snapshot "$bak"; then
     echo "ОШИБКА: бэкап БД не создан — ничего не меняю."
     rm -f "$bak"
     lucx_xui_start || true
@@ -2623,13 +2623,13 @@ cmd_add_h2() {
     echo "================= ГОТОВО ================="
     echo "h2 включён: alpn [h2, http/1.1], fallback по ALPN h2 -> 127.0.0.1:${H2C_PORT} (h2c), http/1.1 -> 127.0.0.1:8080."
     echo "Клиентские ссылки подписки получат alpn=h2,http/1.1 сами (панель берёт из инбаунда)."
-    echo "Откат: systemctl stop x-ui && cp ${bak} ${XUIDB} && systemctl start x-ui"
+    echo "Откат: systemctl stop x-ui && rm -f ${XUIDB}-wal ${XUIDB}-shm && cp ${bak} ${XUIDB} && systemctl start x-ui"
     echo "=========================================="
   else
     echo "ОШИБКА: самотест не прошёл — возвращаю БД из ${bak}"
     lucx_xui_stop
     sleep 1
-    cp -a "$bak" "$XUIDB"
+    lucx_db_restore "$bak"
     lucx_xui_start
     sleep 2
     systemctl is-active --quiet x-ui && echo "БД возвращена, x-ui active (схема как была)." || echo "ВНИМАНИЕ: x-ui не active после отката — journalctl -u x-ui -n 50"
@@ -2687,7 +2687,7 @@ cmd_switch_mode() {
       echo "Уже в TLS-режиме; перенаправляю fallback на :8080 (фасад decoy, v0.4.0)..."
       systemctl stop x-ui
       sleep 1
-      cp "$XUIDB" "${XUIDB}.backup.$(date +%s)"
+      lucx_db_snapshot "${XUIDB}.backup.$(date +%s)"
       ensure_decoy2_http_vhost || { systemctl start x-ui; echo "ОШИБКА: не создать decoy2-http vhost."; exit 1; }
       if ! sqlite3 "$XUIDB" "UPDATE inbounds SET settings = json_set(settings, '\$.fallbacks', json('[{\"dest\":\"127.0.0.1:8080\",\"xver\":0}]')) WHERE protocol='vless' AND port=443 AND listen='127.0.0.1';"; then
         echo "ОШИБКА: не удалось добавить fallback. Бэкап: ${XUIDB}.backup.*"
@@ -2732,7 +2732,7 @@ cmd_switch_mode() {
   systemctl stop x-ui
   sleep 1
   mkdir -p /root/.lucx-mode-backup
-  cp "$XUIDB" "${XUIDB}.backup.$(date +%s)"
+  lucx_db_snapshot "${XUIDB}.backup.$(date +%s)"
   local stream_backup="" stamp2
   stamp2=$(date +%Y%m%d-%H%M%S)
 
@@ -3919,7 +3919,7 @@ SQL
   # subClashAutoDetect по умолчанию false — включаются в apply_sub_recommended.)
   # Новые ключи 3.8.x (subJsonPath/subClashPath/...) на нашу запись не влияют.
   if [[ -f "$XUIDB" ]]; then
-    cp "$XUIDB" "${XUIDB}.backup.$(date +%s)"
+    lucx_db_snapshot "${XUIDB}.backup.$(date +%s)"
 
     sub_uri="https://${DOMAIN}${SUB_SECRET_PATH}"
     sqlite3 "$XUIDB" <<SQL
@@ -5837,7 +5837,7 @@ EOF
     else
       systemctl stop x-ui
       sleep 1
-      cp "$XUIDB" "${XUIDB}.backup.$(date +%s)"
+      lucx_db_snapshot "${XUIDB}.backup.$(date +%s)"
 
       CLIENT_UUID=$(cat /proc/sys/kernel/random/uuid)
       NOW_MS=$(( $(date +%s) * 1000 ))
@@ -8694,7 +8694,7 @@ create_xhttp_inbound() {
   lucx_xui_stop
   sleep 1
   XH_BAK="${XUIDB}.backup.$(date +%s)"
-  if ! cp -a "$XUIDB" "$XH_BAK"; then
+  if ! lucx_db_snapshot "$XH_BAK"; then
     rm -f "$XH_BAK"; XH_BAK=""   # частичную копию не оставляем: откат из ловушки не должен ставить её поверх рабочей БД
     echo "  ОШИБКА: не удалось сделать бэкап БД — диск полон? БД не тронута."
     lucx_xui_start || true
@@ -8715,7 +8715,7 @@ create_xhttp_inbound() {
     echo "  ОШИБКА: XHTTP-инбаунд не поднялся (x-ui не active или xray не слушает 127.0.0.1:${XHTTP_PORT}) — возвращаю БД из ${XH_BAK}"
     lucx_xui_stop
     sleep 1
-    cp -a "$XH_BAK" "$XUIDB"
+    lucx_db_restore "$XH_BAK"
     lucx_xui_start
     return 1
   fi
@@ -8750,8 +8750,7 @@ xhttp_rollback_all() { # stream_backup db_backup
   if [[ -n "$dbak" && -f "$dbak" ]]; then
     lucx_xui_stop
     sleep 1
-    cp -a "$dbak" "$XUIDB"
-    rm -f "${XUIDB}-wal" "${XUIDB}-shm"
+    lucx_db_restore "$dbak"
     lucx_xui_start || echo "  ВНИМАНИЕ: x-ui не запустился после отката — journalctl -u x-ui -n 50"
     sleep 2
   fi
@@ -9077,7 +9076,12 @@ cmd_remove_xhttp() {
     ids=$(sqlite3 "$XUIDB" "SELECT group_concat(client_id) FROM client_inbounds WHERE inbound_id=${iid};" 2>/dev/null || true)
     lucx_xui_stop
     sleep 1
-    cp -a "$XUIDB" "$dbak"
+    if ! lucx_db_snapshot "$dbak"; then
+      rm -f "$dbak"
+      lucx_xui_start || true
+      echo "ОШИБКА: бэкап БД не создан — инбаунд не удалён."
+      exit 1
+    fi
     echo "Бэкап БД: ${dbak}"
     sqlite3 "$XUIDB" "DELETE FROM client_traffics WHERE inbound_id=${iid};" 2>/dev/null || true
     sqlite3 "$XUIDB" "DELETE FROM client_inbounds WHERE inbound_id=${iid};" 2>/dev/null || true
@@ -9087,7 +9091,7 @@ cmd_remove_xhttp() {
     fi
     if ! sqlite3 "$XUIDB" "DELETE FROM inbounds WHERE id=${iid};"; then
       echo "ОШИБКА: не удалось удалить инбаунд — возвращаю БД из ${dbak}"
-      cp -a "$dbak" "$XUIDB"
+      lucx_db_restore "$dbak"
       lucx_xui_start || echo "ВНИМАНИЕ: x-ui не запустился — journalctl -u x-ui -n 50"
       exit 1
     fi

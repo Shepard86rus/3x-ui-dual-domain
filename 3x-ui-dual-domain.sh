@@ -1255,13 +1255,36 @@ LUCX_XUI_STOPPED=0
 lucx_xui_guard_fire() {
   if [[ "${LUCX_XUI_STOPPED:-0}" == "1" ]]; then
     LUCX_XUI_STOPPED=0
-    echo "ВНИМАНИЕ: скрипт завершился при остановленном x-ui — запускаю его обратно (бэкап БД: ${BK_SAFE:-${XUIDB}.backup.*})"
-    systemctl start x-ui 2>/dev/null || true
+    set +e
+    systemctl start x-ui 2>/dev/null
+    echo "ВНИМАНИЕ: скрипт завершился при остановленном x-ui — запустил его обратно (бэкап БД: ${BK_SAFE:-${XUIDB}.backup.*})" 2>/dev/null
+    return 0
   fi
 }
 trap lucx_xui_guard_fire EXIT
 lucx_xui_stop()  { LUCX_XUI_STOPPED=1; systemctl stop x-ui; }
 lucx_xui_start() { local rc=0; systemctl start x-ui || rc=$?; LUCX_XUI_STOPPED=0; return $rc; }
+
+# v0.7.0: WAL-безопасные снимок/восстановление БД. x-ui держит БД в режиме WAL и при stop
+# не делает checkpoint: голый cp основного файла даёт устаревший бэкап, а после отката
+# остаются чужие -wal/-shm. Снимок — через sqlite3 .backup (учитывает WAL), восстановление —
+# с удалением -wal/-shm. Вызывать при остановленном x-ui.
+lucx_db_snapshot() { # dst
+  local dst="$1" tmp="$1.tmp.$$" chk
+  rm -f "$tmp"
+  sqlite3 "$XUIDB" ".backup '${tmp}'" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  chk=$(sqlite3 "$tmp" "PRAGMA integrity_check;" 2>/dev/null | head -n1)
+  [[ "$chk" == "ok" ]] || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$dst"
+}
+lucx_db_restore() { # src
+  local src="$1" tmp="${XUIDB}.restore.$$"
+  [[ -f "$src" ]] || return 1
+  cp -a "$src" "$tmp" || { rm -f "$tmp"; return 1; }
+  rm -f "${XUIDB}-wal" "${XUIDB}-shm"
+  mv -f "$tmp" "$XUIDB"
+}
 
 # v0.5.5 (С2): параметры Reality-пробы из БД — первый ВКЛЮЧЁННЫЙ неистёкший клиент инбаунда 8446.
 # Возврат 1 (и пустые FRONT_*) = проба невозможна (нет подходящих клиентов).
@@ -2185,13 +2208,17 @@ RO_DB_BAK=""; RO_CONF_BAK=""; RO_STREAM_CONF=""; RO_FRONT=0
 reality_only_rollback() { # причина
   [[ "${REALITY_ONLY_ROLLBACK_ARMED:-0}" == "1" ]] || return 0
   REALITY_ONLY_ROLLBACK_ARMED=0
-  trap - INT TERM HUP
-  # откат не должен обрываться на первом сбое (под set -e): каждый шаг своим условием
+  trap '' HUP
+  trap - INT TERM
+  # откат не должен обрываться на первом сбое (даже если вызван из ловушки под set -e)
+  set +e
+  # при обрыве SSH (HUP) терминала уже нет — пишем ход отката в журнал
+  exec >>"${REALITY_ONLY_DIR}/run.log" 2>&1 </dev/null || true
   echo "ОТКАТ Reality-only: $1"
   lucx_xui_stop || true
   sleep 1
   if [[ -n "$RO_DB_BAK" && -f "$RO_DB_BAK" ]]; then
-    cp -a "$RO_DB_BAK" "$XUIDB" || echo "ВНИМАНИЕ: БД не возвращена из ${RO_DB_BAK} — верни вручную: cp -a ${RO_DB_BAK} ${XUIDB}"
+    lucx_db_restore "$RO_DB_BAK" || echo "ВНИМАНИЕ: БД не возвращена из ${RO_DB_BAK} — верни вручную: rm -f ${XUIDB}-wal ${XUIDB}-shm; cp -a ${RO_DB_BAK} ${XUIDB}"
   fi
   if [[ -n "$RO_CONF_BAK" && -f "$RO_CONF_BAK" ]]; then
     cp -a "$RO_CONF_BAK" "$RO_STREAM_CONF" || echo "ВНИМАНИЕ: nginx-конфиг не возвращён из ${RO_CONF_BAK} — верни вручную: cp -a ${RO_CONF_BAK} ${RO_STREAM_CONF}"
@@ -2234,14 +2261,15 @@ reality_only_status() {
 
 cmd_reality_only() {
   local sub="${1:-apply}" yes=0 a
+  sub=apply
   for a in "$@"; do
     case "$a" in
       --yes|-y) yes=1 ;;
-      apply|on|status) ;;
+      apply|on) sub=apply ;;
+      status) sub=status ;;
       *) echo "Использование: sudo bash $0 reality-only [status] [--yes]"; exit 1 ;;
     esac
   done
-  [[ "$sub" == "--yes" || "$sub" == "-y" ]] && sub=apply
   if [[ $EUID -ne 0 ]]; then
     echo "Запусти от root: sudo bash $0 reality-only"
     exit 1
@@ -2329,6 +2357,16 @@ cmd_reality_only() {
     echo "ОШИБКА: на TLS-инбаунде есть свои fallback'и (${ncustom}), кроме штатных :8080/:8081 — они пропадут. Если так и нужно: LUCX_FORCE_FALLBACKS=1 sudo bash $0 reality-only"
     exit 1
   fi
+  # хосты подписок и балансировщики ссылаются на inbound_id: после удаления front ссылка повиснет
+  if [[ -n "$fid" ]]; then
+    nrows=0
+    sqlite_has_table hosts && nrows=$(( nrows + $(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM hosts WHERE inbound_id IN (${tid},${fid});" 2>/dev/null || echo 0) ))
+    sqlite_has_table sub_balancers && nrows=$(( nrows + $(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM sub_balancers WHERE EXISTS (SELECT 1 FROM json_each(inbound_ids) WHERE value=${fid});" 2>/dev/null || echo 0) ))
+    if [[ "${nrows:-0}" != "0" && "${LUCX_FORCE_HOSTS:-0}" != "1" ]]; then
+      echo "ОШИБКА: на инбаунды (TLS #${tid} / front #${fid}) ссылаются хосты или балансировщики подписок (${nrows}) — после удаления front они повиснут. Перенеси их на #${tid} в панели и повтори (или LUCX_FORCE_HOSTS=1). Ничего не изменено."
+      exit 1
+    fi
+  fi
   if [[ -n "$fid" ]]; then
     if sqlite3 "$XUIDB" "SELECT 1 FROM settings WHERE key='xrayTemplateConfig' AND value LIKE '%${REALITY_FRONT_TAG}%' LIMIT 1;" 2>/dev/null | grep -q 1; then
       echo "ОШИБКА: шаблон xray (маршруты/балансировщики) ссылается на тег ${REALITY_FRONT_TAG} — после удаления front правило сломается. Поправь шаблон и повтори. Ничего не изменено."
@@ -2375,7 +2413,7 @@ cmd_reality_only() {
   trap 'reality_only_rollback "неожиданное завершение (set -e)"; lucx_xui_guard_fire' EXIT
   lucx_xui_stop
   sleep 1
-  if ! cp -a "$XUIDB" "$RO_DB_BAK"; then
+  if ! lucx_db_snapshot "$RO_DB_BAK"; then
     rm -f "$RO_DB_BAK"
     lucx_xui_start || true
     trap - INT TERM HUP
@@ -2445,8 +2483,8 @@ cmd_reality_only() {
   fi
   # nginx: reality_backend -> 443 (если был Reality-front)
   if [[ -n "$fid" ]]; then
-    sed -i "s#^\([[:space:]]*upstream reality_backend { server 127.0.0.1:\)${REALITY_FRONT_PORT}; }#\1443; }#" "$stream_conf"
-    if ! grep -qE "^[[:space:]]*upstream reality_backend \{ server 127\.0\.0\.1:443; \}" "$stream_conf" || ! nginx -t >/dev/null 2>&1; then
+    sed -i -E "s#^([[:space:]]*upstream[[:space:]]+reality_backend[[:space:]]*\{[[:space:]]*server[[:space:]]+127\.0\.0\.1:)${REALITY_FRONT_PORT}(;[[:space:]]*\})#\1443\2#" "$stream_conf"
+    if ! grep -qE "^[[:space:]]*upstream[[:space:]]+reality_backend[[:space:]]*\{[[:space:]]*server[[:space:]]+127\.0\.0\.1:443;[[:space:]]*\}" "$stream_conf" || ! nginx -t >/dev/null 2>&1; then
       reality_only_rollback "nginx -t не прошёл после смены upstream"
       exit 1
     fi
@@ -2484,7 +2522,7 @@ cmd_reality_only() {
   echo "Reality-only: nginx -> 127.0.0.1:443 (xray Reality) ; target -> nginx 127.0.0.1:${REALITY_SELF_TARGET_PORT}."
   echo "Клиентам: обновить подписку; ссылки со security=tls больше не работают. Ссылка вида:"
   echo "  vless://<UUID>@${REALITY_DOMAIN}:443?type=tcp&security=reality&pbk=<publicKey>&fp=firefox&sni=${REALITY_DOMAIN}&sid=<shortId>&flow=xtls-rprx-vision&spx=%2F"
-  echo "Откат вручную: systemctl stop x-ui && cp -a ${RO_DB_BAK} ${XUIDB} && cp -a ${RO_CONF_BAK} ${stream_conf} && nginx -t && systemctl reload nginx && systemctl start x-ui"
+  echo "Откат вручную: systemctl stop x-ui && rm -f ${XUIDB}-wal ${XUIDB}-shm && cp -a ${RO_DB_BAK} ${XUIDB} && cp -a ${RO_CONF_BAK} ${stream_conf} && nginx -t && systemctl reload nginx && systemctl start x-ui"
   echo "Проверка: bash $0 healthcheck ; статус: bash $0 reality-only status"
   echo "=========================================="
 }

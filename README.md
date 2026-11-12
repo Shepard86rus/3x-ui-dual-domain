@@ -9,7 +9,7 @@
 Разработка ведётся совместно с ИИ-ассистентом (**ZCode AI** / Claude).
 
 Установщик и проверка (healthcheck) для панели на собственном сервере: два домена,
-nginx на 443, VLESS TLS (h2) и Reality на одном домене, Hysteria2, AmneziaWG, подписки,
+nginx на 443 (снаружи по TLS отвечает только он, h2 включён), VLESS+Reality (Vision), Hysteria2, AmneziaWG, подписки,
 decoy-сайты, ufw + fail2ban. Опционально — Telegram-бот управления нодой.
 
 > **Disclaimer.** Инструмент для управления собственным сервером. Используйте
@@ -179,7 +179,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-doma
 
 | Документ | О чём |
 |---|---|
-| [docs/scheme.md](docs/scheme.md) | как устроена схема, зачем два домена, TLS + h2 + Reality на 443, режим «только Reality» |
+| [docs/scheme.md](docs/scheme.md) | как устроена схема, зачем два домена, Reality-only на 443 (с 0.7.0), h2 на nginx, прежняя схема TLS + h2 + Reality |
 | [docs/install.md](docs/install.md) | установка по этапам, ручная настройка панели |
 | [docs/menu.md](docs/menu.md) | интерактивное меню скрипта: пункты, `?номер`, подтверждение опасных команд |
 | [docs/service-commands.md](docs/service-commands.md) | служебные команды для старых серверов и сбоев установки (`panel-path`, `add-h2`, `add-reality-front`, `add-hy2`, `add-vls` / `add-reality`) |

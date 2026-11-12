@@ -2012,6 +2012,9 @@ nginx_http2_directive_ok() {
   [[ "$(printf '%s\n%s\n' "$v" "1.25.1" | sort -V | head -n1)" == "1.25.1" ]]
 }
 
+# curl с поддержкой HTTP/2 нужен для проверки результата (без него проверка всегда «провалилась» бы и откатила правку)
+curl_has_http2() { curl -V 2>/dev/null | grep -qwi 'HTTP2'; }
+
 # Реальный файл вхоста с listen 127.0.0.1:<порт> ssl... ($1, по умолчанию порт вхоста-мишени); код возврата 1, если не найден
 reality_only_vhost_file() { # [порт]
   local f port="${1:-$REALITY_SELF_TARGET_PORT}"
@@ -2070,6 +2073,10 @@ reality_only_h2_enable() {
   fi
   if ! nginx -t >/dev/null 2>&1; then
     echo "h2: nginx -t не проходит ещё до правки — сначала почини nginx. Ничего не изменено."
+    return 1
+  fi
+  if ! curl_has_http2; then
+    echo "h2: curl на этом сервере без HTTP/2 — результат проверить нечем. Ничего не изменено."
     return 1
   fi
   stamp=$(date +%Y%m%d-%H%M%S)
@@ -2137,6 +2144,10 @@ panel_h2_enable() {
   fi
   if ! nginx -t >/dev/null 2>&1; then
     echo "h2 панели: nginx -t не проходит ещё до правки — сначала почини nginx. Ничего не изменено."
+    return 1
+  fi
+  if ! curl_has_http2; then
+    echo "h2 панели: curl на этом сервере без HTTP/2 — результат проверить нечем. Ничего не изменено."
     return 1
   fi
   h1p=$(panel_h2_probe --http1.1 "$ppath")
@@ -5691,7 +5702,7 @@ server {
 EOF
 
   # v0.7.0: Reality-only — панельное имя тоже по h2 (как вхост-мишень ниже), чтобы все имена на IP вели себя одинаково
-  if [[ "$VLESS_MODE" == "reality" ]]; then
+  if [[ "$VLESS_MODE" == "reality" && "${H2:-1}" != "0" ]]; then
     nginx_vhost_http2_patch "/etc/nginx/sites-available/${DOMAIN}.conf" "$PANEL_INTERNAL_PORT" \
       || echo "WARN: h2 на панельном вхосте 127.0.0.1:${PANEL_INTERNAL_PORT} не включён — панель будет только по http/1.1."
   fi
@@ -5713,7 +5724,7 @@ server {
 }
 EOF
   # v0.7.0: Reality-only — вхост-мишень отвечает по h2 (TLS заканчивается в nginx)
-  if [[ "$VLESS_MODE" == "reality" ]]; then
+  if [[ "$VLESS_MODE" == "reality" && "${H2:-1}" != "0" ]]; then
     nginx_vhost_http2_patch "/etc/nginx/sites-available/${REALITY_DOMAIN}.conf" "$REALITY_DECOY_INTERNAL_PORT" \
       || echo "WARN: h2 на вхосте 127.0.0.1:${REALITY_DECOY_INTERNAL_PORT} не включён — сайт-заглушка будет только по http/1.1."
   fi
@@ -6409,7 +6420,8 @@ cmd_healthcheck() {
 
   PANEL_CONF="/etc/nginx/sites-available/${DOMAIN}.conf"
 
-  if [[ -f "$PANEL_CONF" ]] && grep -qF "listen 127.0.0.1:8443 ssl proxy_protocol;" "$PANEL_CONF" 2>/dev/null; then
+  # v0.7.0: после включения h2 строка listen выглядит «ssl http2 proxy_protocol;» — ищем proxy_protocol среди параметров
+  if [[ -f "$PANEL_CONF" ]] && grep -qE "listen[[:space:]]+127\.0\.0\.1:8443[[:space:]]+ssl[^;]*proxy_protocol;" "$PANEL_CONF" 2>/dev/null; then
     if grep -qF "set_real_ip_from 127.0.0.1;" "$PANEL_CONF" && grep -qF "real_ip_header proxy_protocol;" "$PANEL_CONF"; then
       check "nginx: set_real_ip_from/real_ip_header на панели настроены" ok
     else

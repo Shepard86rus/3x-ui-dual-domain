@@ -100,7 +100,7 @@ bash 3x-ui-dual-domain.sh reality-only status   # только чтение
 окружения перед командой `install`.
 
 ```bash
-H2=0 bash 3x-ui-dual-domain.sh install               # без h2
+H2=0 bash 3x-ui-dual-domain.sh install               # без h2 (в схеме 0.7.0 Reality-only — nginx-вхосты без http2)
 REALITY_FRONT=0 bash 3x-ui-dual-domain.sh install   # без Reality перед TLS
 ```
 
@@ -116,11 +116,12 @@ bash 3x-ui-dual-domain.sh add-reality-front
 Если самотест при установке не прошёл, установщик возвращает nginx на обычный 443 и
 продолжает установку без Reality-front, затем это видно в `healthcheck`.
 
-### Режим «только Reality» (для установок до 0.5.4 и `REALITY_FRONT=0`)
+### Устройство Reality-only и ручной переход (`add-vls` / `add-reality`)
 
-Ниже описан отдельный режим, где на 443 нет TLS-инбаунда. Он нужен для старых установок
-и редких случаев; пока активен Reality перед TLS, `add-reality` заблокирован.
-Переход туда-обратно: `add-vls` (→ TLS) и `add-reality` (→ Reality), без переустановки.
+С 0.7.0 это схема по умолчанию (описана вверху); ниже подробности. Раньше этот режим был отдельным
+вариантом для старых установок и `REALITY_FRONT=0`. Пока активен Reality перед TLS (прежняя схема),
+`add-reality` заблокирован: сначала `reality-only`. Переход туда-обратно без переустановки:
+`add-vls` (→ TLS) и `add-reality` (→ Reality).
 
 Что делает установщик в этом режиме:
 

@@ -9,7 +9,7 @@
 Разработка ведётся совместно с ИИ-ассистентом (**ZCode AI** / Claude).
 
 Установщик и проверка (healthcheck) для панели на собственном сервере: два домена,
-nginx на 443 (снаружи по TLS отвечает только он, h2 включён), VLESS+Reality (Vision), Hysteria2, AmneziaWG, подписки,
+nginx на 443 (снаружи отвечает только он, h2 включён; xray Reality за ним), VLESS+Reality (Vision), Hysteria2, AmneziaWG, подписки,
 decoy-сайты, ufw + fail2ban. Опционально — Telegram-бот управления нодой.
 
 > **Disclaimer.** Инструмент для управления собственным сервером. Используйте
@@ -25,7 +25,7 @@ decoy-сайты, ufw + fail2ban. Опционально — Telegram-бот у�
 
 - Снаружи слушает **только nginx на 443**: панель и подписки не висят на публичных портах,
   а чужие подключения и браузеры видят обычный сайт-заглушку (decoy).
-- На порту 443 работает **VLESS+Reality (Vision)**: снаружи по TLS отвечает только настоящий nginx (с 0.7.0; прежняя схема с TLS — `TLS_MODE=1`), рядом — Hysteria2 (UDP/443) и AmneziaWG.
+- На порту 443 работает **VLESS+Reality (Vision)** по схеме «Reality-only» (с 0.7.0): TLS-инбаунда xray нет, снаружи отвечает только настоящий nginx, а xray Reality стоит за ним; браузеры, сканеры и чужой SNI получают сайт-заглушку (по h2). Рядом — Hysteria2 (UDP/443) и AmneziaWG. Прежняя схема с TLS-инбаундом — `TLS_MODE=1`.
   Необязательно — третий вход **XHTTP+Reality** на отдельном имени ([docs/xhttp.md](docs/xhttp.md)).
 - Закрытый firewall (ufw) и fail2ban на SSH и панель.
 - Команда `healthcheck` проверяет весь сервер и говорит, что сломалось.
@@ -81,8 +81,8 @@ bash 3x-ui-dual-domain.sh healthcheck
 ```
 
 **Этап 5. Клиенты.** Ссылку подписки выдавайте только после этапа 3. Рекомендуем **[INCY](https://incy.cc)**
-(Android, iOS, Windows, macOS, Linux, все входы схемы) и **[Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev/releases)**
-(Windows, macOS, Linux). Ссылки подписки (SUB для INCY и Happ, CLASH для Clash Verge) берутся в панели: Клиенты → кнопка ⓘ → «Информация о подписке». Для AmneziaWG подписки нет: конфиг берётся там же, в блоке «AWG-конфиг». Где скачать приложения и как добавить подписку — в **[docs/clients.md](docs/clients.md)**.
+(Android, iOS, Windows, macOS, Linux, все входы схемы); Happ тоже проверен. **[Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev/releases)**
+(Windows, macOS, Linux) подходит только если его ядро mihomo подключается к Reality: на свежем Xray оно может не работать, а в схеме 0.7.0 других TLS-входов, кроме Hysteria2, нет (подробно: [docs/clients.md](docs/clients.md)). Ссылки подписки (SUB для INCY и Happ, CLASH для Clash Verge) берутся в панели: Клиенты → кнопка ⓘ → «Информация о подписке». Для AmneziaWG подписки нет: конфиг берётся там же, в блоке «AWG-конфиг». Где скачать приложения и как добавить подписку — в **[docs/clients.md](docs/clients.md)**.
 
 ## Команды
 
@@ -145,6 +145,7 @@ bash 3x-ui-dual-domain.sh healthcheck
 | Команда | Что делает и когда нужна |
 |---|---|
 | `bash 3x-ui-dual-domain.sh add-xhttp <имя>` / `remove-xhttp` | Третий вход XHTTP+Reality на отдельном имени (нужна A-запись на этот сервер, см. [docs/xhttp.md](docs/xhttp.md)). Нужен, только если вы этого хотите. На установке его спрашивали необязательным вопросом: если уже ответили именем, команда не нужна |
+| `sudo bash 3x-ui-dual-domain.sh reality-only` / `reality-only status` | Перевести **уже работающий** сервер, поставленный до 0.7.0 (TLS-инбаунд, при желании с Reality перед ним), в схему Reality-only; `status` показывает текущий режим и ничего не меняет. Само сливает клиентов, делает бэкап БД и конфига (`/root/.lucx-reality-only/`), проверяет Reality-клиентов и при любом сбое откатывает. Старые ссылки со `security=tls` перестанут работать — клиентам нужно обновить подписку. Новая установка уже Reality-only, команда ей не нужна. Подробно: [docs/service-commands.md](docs/service-commands.md) |
 | `bash 3x-ui-dual-domain.sh add-bot` / `remove-bot` | Поставить или удалить Telegram-бота управления. Нужен, если не поставили его при установке |
 | `bash 3x-ui-dual-domain.sh add-swap` / `remove-swap` | Swap-файл для сервера с малой памятью (около 1 ГБ). `healthcheck` сам подскажет, если он нужен |
 | `bash 3x-ui-dual-domain.sh rebind-ip` | Только если сервер сменил IP: перепрописать конфиги (порядок действий: [docs/ip-change.md](docs/ip-change.md)) |
@@ -167,6 +168,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-doma
 
 Версии скрипта и релизы — на странице [Releases](https://github.com/Shepard86rus/3x-ui-dual-domain/releases).
 Скрипт `upgrade` скачивает релиз и сверяет sha256; версии ≤0.5.4 качали `main` без проверки — обновите их до 0.5.5 или новее.
+`upgrade` заменяет только сам скрипт и схему работающего сервера не меняет: чтобы перейти на Reality-only (0.7.0), после `upgrade` запустите `sudo bash 3x-ui-dual-domain.sh reality-only` (заранее: `reality-only status`; перевод занимает около минуты, x-ui перезапускается).
 
 > ℹ️ **Клиенты на ядре mihomo** (Clash Verge, XKeen на роутерах) могут не подключаться к Reality и XHTTP+Reality на свежем Xray (≥ 26.9.8); клиенты на Xray (INCY и др.) работают; на роутере с XKeen-UI помогает источник Mihomo Prizrak-Core. Причины и обходы — в [docs/xhttp.md](docs/xhttp.md#если-клиент-не-подключается).
 

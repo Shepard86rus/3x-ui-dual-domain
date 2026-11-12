@@ -978,7 +978,23 @@
 #   нодах эти две правки не применяются сами. (3) healthcheck: заполнение conntrack (warn от 80%, fail от 95%), малый предел таблицы
 #   и значение, не записанное в файлы (не переживёт перезагрузку); в [11] из строки белого списка UDP убран дубль порта AWG.
 #   Лимит соединений с одного IP сознательно не вводится: клиенты разные (каскады, CGNAT, мобильные сети).
-VERSION="0.6.9"
+#
+# v0.7.0: Reality-only — xray больше не принимает TLS на 443 (по требованию: снаружи по TLS должен отвечать только настоящий nginx;
+#   Go-TLS xray отличается от nginx: нет билетов сессии TLS1.3, другой выбор шифра, свой формат ответа на мусор). Схема: nginx stream
+#   (SNI) -> reality_backend -> xray Reality-инбаунд 127.0.0.1:443 (acceptProxyProtocol, flow Vision у клиентов); всё, что не
+#   Reality-клиент (браузеры, сканеры, чужой SNI, мусор), xray проксирует на target = nginx-вхост 127.0.0.1:8444 (сертификат основного
+#   домена, сайт-заглушка). (1) новая команда `reality-only` (из командной строки, в меню не выводится): на работающей ноде TLS-инбаунд становится Reality-инбаундом,
+#   клиенты и ключи Reality-front переносятся (settings инбаунда, client_inbounds, client_traffics, трафик), front :8446 удаляется,
+#   nginx reality_backend -> 443; название инбаунда берётся от front (или «Tls» -> «Reality»). Предпроверки (ничего не меняется при отказе):
+#   штатный вид nginx и БД, вхост :8444 отвечает 200, нет своих fallback'ов (LUCX_FORCE_FALLBACKS=1 — игнорировать), шаблон xray не ссылается
+#   на тег front, нет совпадающих email у разных UUID. Бэкапы в /root/.lucx-reality-only/, самотест (сайт 200 + Reality-клиент на каждого
+#   из двух источников клиентов, нет слушателя :8446), автооткат БД и nginx-конфига при любом сбое и по сигналу, x-ui поднимается
+#   обратно при любом выходе. `reality-only status` — только чтение. (2) install по умолчанию ставит Reality-only (прежняя схема:
+#   TLS_MODE=1), с самотестом после установки; разбор ключей xray 26 («PrivateKey/Password») починен в Reality-ветке install и в
+#   switch-mode (прежний разбор ничего не находил). (3) healthcheck: блок [7a] для Reality-only (target, PROXY, serverNames, privateKey,
+#   upstream, вхост :8444, оставшийся front, признак nginx у зонда по билетам TLS1.3). (4) add-reality-front при Reality-only сообщает,
+#   что не нужен. Цена схемы: клиенты без Reality (Clash Verge, FlClash на обычном mihomo) подключиться не смогут.
+VERSION="0.7.0"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -1787,12 +1803,27 @@ selftest_443() {
   tf="${trow#*|}"
   [[ -n "$trow" ]] || tu=""
   if [[ -n "$tu" ]]; then
-    ttip=$(xray_probe_client '{"network":"tcp","security":"tls","tlsSettings":{"serverName":"'"${REALITY_DOMAIN}"'","fingerprint":"firefox"}}' "$tu" "$tf" "$SERVER_IP" "$(lucx_free_port 10861)")
-    if [[ "$ttip" == "NOXRAY" ]]; then
-      echo "  TLS-клиент: НЕ проверен (xray-бинарь не найден) — это не провал схемы"
+    # v0.7.0: в схеме Reality-only инбаунд 127.0.0.1:443 — Reality, TLS-клиентом его не проверить: берём Reality-пробу с его же ключами
+    local sec443 pbk443 sid443
+    sec443=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.security') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+    if [[ "$sec443" == "reality" ]]; then
+      pbk443=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.realitySettings.settings.publicKey') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+      sid443=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.realitySettings.shortIds[0]') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+      ttip=$(xray_probe_client '{"network":"tcp","security":"reality","realitySettings":{"serverName":"'"${REALITY_DOMAIN}"'","fingerprint":"firefox","publicKey":"'"${pbk443}"'","shortId":"'"${sid443}"'","spiderX":"/"}}' "$tu" "$tf" "$SERVER_IP" "$(lucx_free_port 10861)")
+      if [[ "$ttip" == "NOXRAY" ]]; then
+        echo "  Reality-клиент основного входа: НЕ проверен (xray-бинарь не найден) — это не провал схемы"
+      else
+        echo "  Reality-клиент основного входа (первый включённый клиент 443-инбаунда) -> выходной IP '${ttip:-нет}'"
+        [[ -n "$ttip" ]] || ok=1
+      fi
     else
-      echo "  TLS-клиент (первый включённый клиент TLS-инбаунда) -> выходной IP '${ttip:-нет}'"
-      [[ -n "$ttip" ]] || ok=1
+      ttip=$(xray_probe_client '{"network":"tcp","security":"tls","tlsSettings":{"serverName":"'"${REALITY_DOMAIN}"'","fingerprint":"firefox"}}' "$tu" "$tf" "$SERVER_IP" "$(lucx_free_port 10861)")
+      if [[ "$ttip" == "NOXRAY" ]]; then
+        echo "  TLS-клиент: НЕ проверен (xray-бинарь не найден) — это не провал схемы"
+      else
+        echo "  TLS-клиент (первый включённый клиент TLS-инбаунда) -> выходной IP '${ttip:-нет}'"
+        [[ -n "$ttip" ]] || ok=1
+      fi
     fi
   fi
   if [[ -n "$fuuid" ]]; then
@@ -1843,6 +1874,10 @@ cmd_add_reality_front() {
   fi
   sec=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.security') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
   pp=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.tcpSettings.acceptProxyProtocol') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  if [[ "$sec" == "reality" ]]; then
+    echo "Инбаунд 127.0.0.1:443 уже Reality (схема Reality-only, v0.7.0): Reality-front не нужен — ничего не делаю."
+    exit 0
+  fi
   if [[ "$sec" != "tls" ]]; then
     echo "ОШИБКА: инбаунд 127.0.0.1:443 в режиме '${sec:-?}', нужен tls (сначала: sudo bash $0 add-vls)."
     exit 1
@@ -1899,6 +1934,371 @@ cmd_add_reality_front() {
     echo "Созданный Reality-инбаунд на 127.0.0.1:${REALITY_FRONT_PORT} оставлен (loopback, безвреден); смотри: journalctl -u x-ui -n 50"
     exit 1
   fi
+}
+
+# ================== v0.7.0: REALITY-ONLY (xray TLS-инбаунд убран; Reality + Vision, target = nginx) ==================
+# Схема: nginx stream (443, SNI) -> reality_backend -> xray Reality-инбаунд 127.0.0.1:443 (acceptProxyProtocol,
+# serverNames = основной домен, flow xtls-rprx-vision у клиентов) ; всё, что не Reality-клиент (браузеры, сканеры,
+# чужой SNI), xray проксирует на target = nginx-вхост 127.0.0.1:8444 (серт основного домена, сайт-заглушка).
+# Снаружи по TLS отвечает только настоящий nginx; xray со своим Go-TLS в ответ на чужие рукопожатия не участвует.
+# Платой за это клиенты, не умеющие Reality (Clash Verge/FlClash на обычном mihomo и т.п.), в этой схеме не подключаются.
+REALITY_SELF_TARGET_PORT=8444
+REALITY_ONLY_DIR="/root/.lucx-reality-only"
+
+sqlite_has_table() { # table
+  sqlite3 "$XUIDB" "SELECT 1 FROM sqlite_master WHERE type='table' AND name='$1' LIMIT 1;" 2>/dev/null | grep -q 1
+}
+
+# streamSettings Reality-инбаунда 127.0.0.1:443 (одна строка, без одинарных кавычек). $1=privateKey $2=publicKey $3=shortId
+reality_only_stream_json() {
+  echo '{"network":"tcp","security":"reality","realitySettings":{"show":false,"xver":0,"target":"127.0.0.1:'"${REALITY_SELF_TARGET_PORT}"'","serverNames":["'"${REALITY_DOMAIN}"'"],"privateKey":"'"$1"'","minClientVer":"'"${REALITY_MIN_CLIENT}"'","maxClientVer":"","maxTimediff":0,"shortIds":["'"$3"'"],"settings":{"publicKey":"'"$2"'","fingerprint":"firefox","serverName":"","spiderX":"/","mldsa65Verify":""}},"tcpSettings":{"acceptProxyProtocol":true,"header":{"type":"none"}}}'
+}
+
+# Первый ВКЛЮЧЁННЫЙ неистёкший клиент инбаунда с id=$1 -> "uuid|flow" (пусто = нет подходящего)
+reality_only_first_client() { # inbound_id
+  local now
+  now=$(( $(date +%s) * 1000 ))
+  sqlite3 "$XUIDB" "SELECT json_extract(c.value,'\$.id')||'|'||COALESCE(json_extract(c.value,'\$.flow'),'') FROM (SELECT settings FROM inbounds WHERE id=${1}) i, json_each(i.settings,'\$.clients') c WHERE COALESCE(json_extract(c.value,'\$.enable'),1) IN (1,'true') AND (COALESCE(json_extract(c.value,'\$.expiryTime'),0)=0 OR json_extract(c.value,'\$.expiryTime')>${now}) LIMIT 1;" 2>/dev/null || true
+}
+
+# Самотест Reality-only через публичный IP: сайт 200 (nginx), Reality-клиенты (аргументы "uuid|flow"), нет слушателя :8446.
+# Возврат 0 = всё прошло. Требует SERVER_IP, REALITY_DOMAIN.
+reality_only_selftest() {
+  local ok=0 site pbk sid row u f ip n=0 tk
+  site=$(curl -sk -m 10 -o /dev/null -w "%{http_code}" --resolve "${REALITY_DOMAIN}:443:${SERVER_IP}" "https://${REALITY_DOMAIN}/" 2>/dev/null || echo 000)
+  echo "  сайт https://${REALITY_DOMAIN}/ (через nginx и Reality-инбаунд как зонд) -> ${site}"
+  [[ "$site" == "200" ]] || ok=1
+  pbk=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.realitySettings.settings.publicKey') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  sid=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.realitySettings.shortIds[0]') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  if [[ -z "$pbk" || -z "$sid" ]]; then
+    echo "  ОШИБКА: в БД нет publicKey/shortId Reality-инбаунда"
+    return 1
+  fi
+  for row in "$@"; do
+    [[ -n "$row" ]] || continue
+    u="${row%%|*}"; f="${row#*|}"
+    ip=$(xray_probe_client '{"network":"tcp","security":"reality","realitySettings":{"serverName":"'"${REALITY_DOMAIN}"'","fingerprint":"firefox","publicKey":"'"${pbk}"'","shortId":"'"${sid}"'","spiderX":"/"}}' "$u" "$f" "$SERVER_IP" "$(lucx_free_port $((10870+n)))")
+    n=$((n+1))
+    if [[ "$ip" == "NOXRAY" ]]; then
+      echo "  Reality-клиент ${u:0:8}…: НЕ проверен (xray-бинарь не найден) — это не провал схемы"
+    else
+      echo "  Reality-клиент ${u:0:8}… (flow '${f:-пусто}') -> выходной IP '${ip:-нет}'"
+      [[ -n "$ip" ]] || ok=1
+    fi
+  done
+  if ss -ltn 2>/dev/null | grep -qE "[:.]${REALITY_FRONT_PORT} "; then
+    echo "  ОШИБКА: на :${REALITY_FRONT_PORT} всё ещё кто-то слушает (Reality-front должен быть удалён)"
+    ok=1
+  fi
+  tk=$(printf 'GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$REALITY_DOMAIN" | timeout 10 openssl s_client -connect "${SERVER_IP}:443" -servername "$REALITY_DOMAIN" -tls1_3 -ign_eof 2>&1 | grep -c 'New Session Ticket' || true)
+  echo "  INFO: зонд без Reality-ключа получает билетов TLS1.3: ${tk:-0} (nginx отдаёт 2, Go-TLS xray — 0)"
+  return $ok
+}
+
+REALITY_ONLY_ROLLBACK_ARMED=0
+RO_DB_BAK=""; RO_CONF_BAK=""; RO_STREAM_CONF=""; RO_FRONT=0
+reality_only_rollback() { # причина
+  [[ "${REALITY_ONLY_ROLLBACK_ARMED:-0}" == "1" ]] || return 0
+  REALITY_ONLY_ROLLBACK_ARMED=0
+  trap - INT TERM HUP
+  # откат не должен обрываться на первом сбое (под set -e): каждый шаг своим условием
+  echo "ОТКАТ Reality-only: $1"
+  lucx_xui_stop || true
+  sleep 1
+  if [[ -n "$RO_DB_BAK" && -f "$RO_DB_BAK" ]]; then
+    cp -a "$RO_DB_BAK" "$XUIDB" || echo "ВНИМАНИЕ: БД не возвращена из ${RO_DB_BAK} — верни вручную: cp -a ${RO_DB_BAK} ${XUIDB}"
+  fi
+  if [[ -n "$RO_CONF_BAK" && -f "$RO_CONF_BAK" ]]; then
+    cp -a "$RO_CONF_BAK" "$RO_STREAM_CONF" || echo "ВНИМАНИЕ: nginx-конфиг не возвращён из ${RO_CONF_BAK} — верни вручную: cp -a ${RO_CONF_BAK} ${RO_STREAM_CONF}"
+    if nginx -t >/dev/null 2>&1; then systemctl reload nginx || echo "ВНИМАНИЕ: nginx не перечитал конфиг: systemctl reload nginx"; fi
+  fi
+  lucx_xui_start || echo "ВНИМАНИЕ: x-ui не запустился: journalctl -u x-ui -n 50"
+  if wait_xray_listener 443 && { [[ "$RO_FRONT" != "1" ]] || wait_xray_listener "$REALITY_FRONT_PORT"; }; then
+    echo "ОТКАТ завершён: БД и nginx-конфиг возвращены, xray слушает как до запуска."
+  else
+    echo "ВНИМАНИЕ: после отката xray не подтверждён на 443/${REALITY_FRONT_PORT}. Вручную: journalctl -u x-ui -n 50; бэкап БД: ${RO_DB_BAK}; конфиг nginx: ${RO_CONF_BAK}"
+  fi
+  return 0
+}
+
+reality_only_status() {
+  read_domains
+  local sec fid up code n
+  if [[ -z "${REALITY_DOMAIN:-}" || ! -f "$XUIDB" ]]; then
+    echo "ОШИБКА: домены или ${XUIDB} не найдены — схема не развёрнута."
+    return 1
+  fi
+  sec=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.security') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  fid=$(sqlite3 "$XUIDB" "SELECT id FROM inbounds WHERE protocol='vless' AND port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  up=$(awk '/upstream reality_backend/,/}/' /etc/nginx/stream-sni-router.conf 2>/dev/null | grep -oP "server 127\.0\.0\.1:\K[0-9]+" | head -n1 || true)
+  code=$(curl -sk -m 5 -o /dev/null -w "%{http_code}" --resolve "${REALITY_DOMAIN}:${REALITY_SELF_TARGET_PORT}:127.0.0.1" "https://${REALITY_DOMAIN}:${REALITY_SELF_TARGET_PORT}/" 2>/dev/null || echo 000)
+  n=$(sqlite3 "$XUIDB" "SELECT json_array_length(settings,'\$.clients') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  echo "Инбаунд 127.0.0.1:443: security=${sec:-<нет>}, клиентов: ${n:-?}"
+  echo "Reality-front :${REALITY_FRONT_PORT}: $([[ -n "$fid" ]] && echo "есть (id ${fid})" || echo "нет")"
+  echo "nginx reality_backend -> 127.0.0.1:${up:-?}"
+  echo "nginx-вхост target 127.0.0.1:${REALITY_SELF_TARGET_PORT}: HTTP ${code}"
+  if [[ "$sec" == "reality" && -z "$fid" && "$up" == "443" ]]; then
+    echo "Режим: Reality-only (xray TLS-инбаунда нет)."
+  elif [[ "$sec" == "tls" ]]; then
+    echo "Режим: TLS$([[ -n "$fid" ]] && echo " + Reality перед TLS"). Перевод: sudo bash $0 reality-only"
+  else
+    echo "Режим: нештатный — смотри healthcheck."
+  fi
+  return 0
+}
+
+cmd_reality_only() {
+  local sub="${1:-apply}" yes=0 a
+  for a in "$@"; do
+    case "$a" in
+      --yes|-y) yes=1 ;;
+      apply|on|status) ;;
+      *) echo "Использование: sudo bash $0 reality-only [status] [--yes]"; exit 1 ;;
+    esac
+  done
+  [[ "$sub" == "--yes" || "$sub" == "-y" ]] && sub=apply
+  if [[ $EUID -ne 0 ]]; then
+    echo "Запусти от root: sudo bash $0 reality-only"
+    exit 1
+  fi
+  REALITY_XRAY_PORT=443
+  if [[ "$sub" == "status" ]]; then
+    reality_only_status
+    return $?
+  fi
+  read_domains
+  if [[ -z "${DOMAIN:-}" || -z "${REALITY_DOMAIN:-}" ]]; then
+    echo "ОШИБКА: не удалось определить домены из ${CREDS_FILE}."
+    exit 1
+  fi
+  local stream_conf="/etc/nginx/stream-sni-router.conf" stamp
+  local sec tid fid up pp ncustom nrows nemail nt nf row_t row_f exp_clients=0 got_clients
+  # адрес для самотеста — тот, что слушает stream-роутер (за NAT или без внешних сервисов определения IP он надёжнее)
+  SERVER_IP=$(grep -oP '^\s*listen\s+\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(?=:443;)' "$stream_conf" 2>/dev/null | head -n1 || true)
+  [[ -n "$SERVER_IP" ]] || SERVER_IP=$(get_server_ip)
+  if [[ -z "$SERVER_IP" ]]; then
+    echo "ОШИБКА: публичный IP сервера не определён (нет доступа к внешним сервисам?). Ничего не изменено."
+    exit 1
+  fi
+  if [[ ! -f "$XUIDB" || ! -f "$stream_conf" ]]; then
+    echo "ОШИБКА: ${XUIDB} или ${stream_conf} не найдены — схема скрипта не развёрнута."
+    exit 1
+  fi
+  if ! systemctl is-active --quiet x-ui || ! systemctl is-active --quiet nginx; then
+    echo "ОШИБКА: x-ui или nginx не active — сначала почини (healthcheck). Ничего не изменено."
+    exit 1
+  fi
+  sec=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.security') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  if [[ "$sec" == "reality" ]]; then
+    echo "Инбаунд 127.0.0.1:443 уже в режиме Reality — ничего не делаю (статус: sudo bash $0 reality-only status)."
+    exit 0
+  fi
+  if [[ "$sec" != "tls" ]]; then
+    echo "ОШИБКА: инбаунд 127.0.0.1:443 в режиме '${sec:-<не найден>}', ожидался tls. Ничего не изменено."
+    exit 1
+  fi
+  tid=$(sqlite3 "$XUIDB" "SELECT id FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  fid=$(sqlite3 "$XUIDB" "SELECT id FROM inbounds WHERE protocol='vless' AND port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  [[ "$tid" =~ ^[0-9]+$ ]] || { echo "ОШИБКА: не прочитан id TLS-инбаунда. Ничего не изменено."; exit 1; }
+  if [[ -n "$fid" && ! "$fid" =~ ^[0-9]+$ ]]; then echo "ОШИБКА: нечитаемый id Reality-front. Ничего не изменено."; exit 1; fi
+  up=$(awk '/upstream reality_backend/,/}/' "$stream_conf" | grep -oP "server 127\.0\.0\.1:\K[0-9]+" | head -n1 || true)
+  pp=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.tcpSettings.acceptProxyProtocol') FROM inbounds WHERE id=${tid};" 2>/dev/null || true)
+  if [[ "$pp" != "1" && "$pp" != "true" ]]; then
+    echo "ОШИБКА: у инбаунда 127.0.0.1:443 нет acceptProxyProtocol — нештатно, не трогаю."
+    exit 1
+  fi
+  if [[ -n "$fid" ]]; then
+    if [[ "$up" != "$REALITY_FRONT_PORT" ]]; then
+      echo "ОШИБКА: есть инбаунд на :${REALITY_FRONT_PORT}, но nginx reality_backend смотрит на 127.0.0.1:${up:-?} — нештатно (ручная правка?). Ничего не изменено."
+      exit 1
+    fi
+    if ! sqlite3 "$XUIDB" "SELECT 1 FROM inbounds WHERE id=${fid} AND json_extract(stream_settings,'\$.security')='reality' AND COALESCE(json_extract(stream_settings,'\$.realitySettings.privateKey'),'')<>'' LIMIT 1;" 2>/dev/null | grep -q 1; then
+      echo "ОШИБКА: инбаунд :${REALITY_FRONT_PORT} не Reality или без privateKey. Ничего не изменено."
+      exit 1
+    fi
+  else
+    if [[ "$up" != "443" ]]; then
+      echo "ОШИБКА: nginx reality_backend смотрит на 127.0.0.1:${up:-?}, ожидался 443 (штатный вид без Reality-front). Ничего не изменено."
+      exit 1
+    fi
+    if [[ -z "$(find /usr/local/x-ui -maxdepth 3 -name 'xray-linux-*' -type f 2>/dev/null | head -n1 || true)" ]]; then
+      echo "ОШИБКА: xray не найден — нечем сгенерировать ключи Reality. Ничего не изменено."
+      exit 1
+    fi
+  fi
+  if ! grep -qE '^\s*upstream reality_backend\s*\{\s*server 127\.0\.0\.1:[0-9]+;\s*\}' "$stream_conf"; then
+    echo "ОШИБКА: upstream reality_backend не одной строкой '{ server 127.0.0.1:порт; }' — ручная правка? Ничего не изменено."
+    exit 1
+  fi
+  if [[ "$(curl -sk -m 8 -o /dev/null -w "%{http_code}" --resolve "${REALITY_DOMAIN}:${REALITY_SELF_TARGET_PORT}:127.0.0.1" "https://${REALITY_DOMAIN}:${REALITY_SELF_TARGET_PORT}/" 2>/dev/null || echo 000)" != "200" ]]; then
+    echo "ОШИБКА: nginx-вхост 127.0.0.1:${REALITY_SELF_TARGET_PORT} (target Reality, сертификат ${REALITY_DOMAIN}) не отвечает 200. Ничего не изменено."
+    exit 1
+  fi
+  # свои fallback'и на TLS-инбаунде пропадут вместе с ним: молча терять их нельзя
+  ncustom=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM (SELECT settings FROM inbounds WHERE id=${tid}) i, json_each(i.settings,'\$.fallbacks') f WHERE CAST(COALESCE(json_extract(f.value,'\$.dest'),'') AS TEXT) NOT IN ('127.0.0.1:8080','127.0.0.1:8081','8080','8081');" 2>/dev/null || echo 0)
+  if sqlite_has_table inbound_fallbacks; then
+    nrows=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM inbound_fallbacks WHERE master_id=${tid} OR child_id=${tid};" 2>/dev/null || echo 0)
+    ncustom=$(( ${ncustom:-0} + ${nrows:-0} ))
+  fi
+  if [[ "${ncustom:-0}" != "0" && "${LUCX_FORCE_FALLBACKS:-0}" != "1" ]]; then
+    echo "ОШИБКА: на TLS-инбаунде есть свои fallback'и (${ncustom}), кроме штатных :8080/:8081 — они пропадут. Если так и нужно: LUCX_FORCE_FALLBACKS=1 sudo bash $0 reality-only"
+    exit 1
+  fi
+  if [[ -n "$fid" ]]; then
+    if sqlite3 "$XUIDB" "SELECT 1 FROM settings WHERE key='xrayTemplateConfig' AND value LIKE '%${REALITY_FRONT_TAG}%' LIMIT 1;" 2>/dev/null | grep -q 1; then
+      echo "ОШИБКА: шаблон xray (маршруты/балансировщики) ссылается на тег ${REALITY_FRONT_TAG} — после удаления front правило сломается. Поправь шаблон и повтори. Ничего не изменено."
+      exit 1
+    fi
+    nemail=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM (SELECT settings s FROM inbounds WHERE id=${tid}) t, json_each(t.s,'\$.clients') a, (SELECT settings s FROM inbounds WHERE id=${fid}) f, json_each(f.s,'\$.clients') b WHERE json_extract(a.value,'\$.email')=json_extract(b.value,'\$.email') AND json_extract(a.value,'\$.id') IS NOT json_extract(b.value,'\$.id');" 2>/dev/null || echo 0)
+    if [[ "${nemail:-0}" != "0" ]]; then
+      echo "ОШИБКА: у клиентов TLS-инбаунда и Reality-front совпадают email при разных UUID (${nemail}) — слияние невозможно. Ничего не изменено."
+      exit 1
+    fi
+  fi
+  nt=$(sqlite3 "$XUIDB" "SELECT json_array_length(settings,'\$.clients') FROM inbounds WHERE id=${tid};" 2>/dev/null || echo "?")
+  nf=0
+  [[ -n "$fid" ]] && nf=$(sqlite3 "$XUIDB" "SELECT json_array_length(settings,'\$.clients') FROM inbounds WHERE id=${fid};" 2>/dev/null || echo "?")
+  if [[ -n "$fid" ]]; then
+    exp_clients=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM (SELECT json_extract(value,'\$.id') AS i FROM json_each((SELECT settings FROM inbounds WHERE id=${tid}),'\$.clients') UNION SELECT json_extract(value,'\$.id') FROM json_each((SELECT settings FROM inbounds WHERE id=${fid}),'\$.clients'));" 2>/dev/null || echo 0)
+  fi
+  row_t=$(reality_only_first_client "$tid")
+  row_f=""
+  [[ -n "$fid" ]] && row_f=$(reality_only_first_client "$fid")
+
+  echo "Перевод 443 в Reality-only на ${REALITY_DOMAIN}:"
+  echo "  - TLS-инбаунд xray (127.0.0.1:443) становится Reality-инбаундом (клиенты: ${nt}$([[ -n "$fid" ]] && echo " + ${nf} из Reality-front")),"
+  echo "  - target Reality = nginx 127.0.0.1:${REALITY_SELF_TARGET_PORT}$([[ -n "$fid" ]] && echo "; инбаунд Reality-front :${REALITY_FRONT_PORT} удаляется, его ключи и клиенты переносятся"),"
+  echo "  - nginx reality_backend -> 127.0.0.1:443."
+  echo "ВАЖНО: ссылки и конфиги со security=tls перестанут работать; подписки панели обновятся сами. Клиенты без Reality"
+  echo "(Clash Verge/FlClash на обычном mihomo и др.) подключаться не смогут. x-ui будет перезапущен на несколько секунд."
+  if [[ "$yes" != "1" ]]; then
+    local ans=""
+    read -rp "Продолжить? [y/N]: " ans || ans=""
+    [[ "$ans" =~ ^[Yy]$ ]] || { echo "Отменено. Ничего не изменено."; exit 0; }
+  fi
+
+  stamp=$(date +%Y%m%d-%H%M%S)
+  mkdir -p "$REALITY_ONLY_DIR"
+  chmod 700 "$REALITY_ONLY_DIR"
+  RO_STREAM_CONF="$stream_conf"
+  RO_DB_BAK="${REALITY_ONLY_DIR}/x-ui.db.pre-${stamp}"
+  RO_CONF_BAK="${REALITY_ONLY_DIR}/stream-sni-router.conf.pre-${stamp}"
+  RO_FRONT=0
+  [[ -n "$fid" ]] && RO_FRONT=1
+  cp -a "$stream_conf" "$RO_CONF_BAK" || { echo "ОШИБКА: не сохранён nginx-конфиг. Ничего не изменено."; exit 1; }
+  trap 'reality_only_rollback "прерван сигналом"; exit 130' INT TERM HUP
+  trap 'reality_only_rollback "неожиданное завершение (set -e)"; lucx_xui_guard_fire' EXIT
+  lucx_xui_stop
+  sleep 1
+  if ! cp -a "$XUIDB" "$RO_DB_BAK"; then
+    rm -f "$RO_DB_BAK"
+    lucx_xui_start || true
+    trap - INT TERM HUP
+    echo "ОШИБКА: бэкап БД не создан (нет места?). Ничего не изменено."
+    exit 1
+  fi
+  REALITY_ONLY_ROLLBACK_ARMED=1
+
+  # --- ключи и SQL ---
+  local priv="" pub="" sid="" xray_bin keys stream_expr sql remark_expr
+  if [[ -z "$fid" ]]; then
+    xray_bin=$(find /usr/local/x-ui -maxdepth 3 -name "xray-linux-*" -type f 2>/dev/null | head -n1 || true)
+    keys=$("$xray_bin" x25519 2>/dev/null || true)
+    priv=$(echo "$keys" | awk -F': *' 'tolower($1) ~ /^private ?key$/ {print $2; exit}')
+    pub=$(echo "$keys" | awk -F': *' 'tolower($1) ~ /public ?key|^password/ {print $2; exit}')
+    sid=$(openssl rand -hex 8)
+    if [[ -z "$priv" || -z "$pub" || -z "$sid" ]]; then
+      reality_only_rollback "не удалось сгенерировать ключи Reality"
+      exit 1
+    fi
+    stream_expr="json('$(reality_only_stream_json "$priv" "$pub" "$sid")')"
+    remark_expr="replace(replace(remark,'Tls','Reality'),'TLS','Reality')"
+  else
+    stream_expr="json_set(json_remove((SELECT stream_settings FROM inbounds WHERE id=${fid}),'\$.externalProxy','\$.realitySettings.dest'),'\$.realitySettings.target','127.0.0.1:${REALITY_SELF_TARGET_PORT}','\$.realitySettings.xver',0,'\$.tcpSettings.acceptProxyProtocol',json('true'))"
+    remark_expr="(SELECT remark FROM inbounds WHERE id=${fid})"
+  fi
+  sql="BEGIN IMMEDIATE;"
+  if [[ -n "$fid" ]]; then
+    sql+="UPDATE inbounds SET settings=json_set(settings,'\$.clients',json((SELECT json_group_array(json(v)) FROM (SELECT value AS v FROM json_each((SELECT settings FROM inbounds WHERE id=${tid}),'\$.clients') UNION ALL SELECT value FROM json_each((SELECT settings FROM inbounds WHERE id=${fid}),'\$.clients') WHERE json_extract(value,'\$.id') NOT IN (SELECT json_extract(value,'\$.id') FROM json_each((SELECT settings FROM inbounds WHERE id=${tid}),'\$.clients'))))),'\$.fallbacks',json('[]')) WHERE id=${tid};"
+    if sqlite_has_table client_inbounds; then
+      sql+="INSERT OR IGNORE INTO client_inbounds (client_id,inbound_id,flow_override,created_at) SELECT client_id,${tid},flow_override,created_at FROM client_inbounds WHERE inbound_id=${fid};DELETE FROM client_inbounds WHERE inbound_id=${fid};"
+    fi
+    sql+="UPDATE client_traffics SET inbound_id=${tid} WHERE inbound_id=${fid};"
+    sql+="UPDATE inbounds SET up=up+COALESCE((SELECT up FROM inbounds WHERE id=${fid}),0), down=down+COALESCE((SELECT down FROM inbounds WHERE id=${fid}),0) WHERE id=${tid};"
+  else
+    sql+="UPDATE inbounds SET settings=json_set(settings,'\$.fallbacks',json('[]')) WHERE id=${tid};"
+  fi
+  # remark и stream читают front (id=fid), поэтому обновляются ДО удаления front
+  sql+="UPDATE inbounds SET stream_settings=${stream_expr}, remark=${remark_expr} WHERE id=${tid};"
+  if [[ -n "$fid" ]]; then
+    sql+="DELETE FROM inbounds WHERE id=${fid};"
+    if sqlite_has_table inbound_fallbacks; then sql+="DELETE FROM inbound_fallbacks WHERE master_id=${fid} OR child_id=${fid};"; fi
+  fi
+  sql+="COMMIT;"
+  if ! sqlite3 -bail "$XUIDB" "$sql"; then
+    reality_only_rollback "SQL-изменения БД не применились"
+    exit 1
+  fi
+  if ! sqlite3 "$XUIDB" "SELECT 1 FROM inbounds WHERE id=${tid} AND json_extract(stream_settings,'\$.security')='reality' AND json_extract(stream_settings,'\$.realitySettings.target')='127.0.0.1:${REALITY_SELF_TARGET_PORT}' AND COALESCE(json_extract(stream_settings,'\$.realitySettings.privateKey'),'')<>'' LIMIT 1;" 2>/dev/null | grep -q 1; then
+    reality_only_rollback "после UPDATE в БД не тот stream_settings"
+    exit 1
+  fi
+  if [[ -n "$fid" ]]; then
+    got_clients=$(sqlite3 "$XUIDB" "SELECT json_array_length(settings,'\$.clients') FROM inbounds WHERE id=${tid};" 2>/dev/null || echo 0)
+    if [[ "${got_clients:-0}" != "$exp_clients" || "$exp_clients" == "0" ]]; then
+      reality_only_rollback "после слияния клиентов ${got_clients:-0}, ожидалось ${exp_clients}"
+      exit 1
+    fi
+    if [[ "$(sqlite3 "$XUIDB" "SELECT (SELECT COUNT(*) FROM client_traffics WHERE inbound_id=${fid})+(SELECT COUNT(*) FROM inbounds WHERE id=${fid});" 2>/dev/null || echo 1)" != "0" ]]; then
+      reality_only_rollback "после переноса остались записи Reality-front (client_traffics/inbounds)"
+      exit 1
+    fi
+    if sqlite_has_table client_inbounds && [[ "$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM client_inbounds WHERE inbound_id=${fid};" 2>/dev/null || echo 1)" != "0" ]]; then
+      reality_only_rollback "после переноса остались client_inbounds Reality-front"
+      exit 1
+    fi
+  fi
+  # nginx: reality_backend -> 443 (если был Reality-front)
+  if [[ -n "$fid" ]]; then
+    sed -i "s#^\([[:space:]]*upstream reality_backend { server 127.0.0.1:\)${REALITY_FRONT_PORT}; }#\1443; }#" "$stream_conf"
+    if ! grep -qE "^[[:space:]]*upstream reality_backend \{ server 127\.0\.0\.1:443; \}" "$stream_conf" || ! nginx -t >/dev/null 2>&1; then
+      reality_only_rollback "nginx -t не прошёл после смены upstream"
+      exit 1
+    fi
+  fi
+  lucx_xui_start || { reality_only_rollback "x-ui не запустился"; exit 1; }
+  sleep 3
+  if ! systemctl is-active --quiet x-ui || ! wait_xray_listener 443; then
+    reality_only_rollback "x-ui не active или xray не слушает 127.0.0.1:443"
+    exit 1
+  fi
+  [[ -n "$fid" ]] && { systemctl reload nginx || { reality_only_rollback "nginx reload не удался"; exit 1; }; }
+  sleep 1
+  echo "Самотест через публичный IP ${SERVER_IP}:"
+  local st_ok=1
+  if reality_only_selftest "$row_t" "$row_f"; then st_ok=0; else echo "  повтор самотеста через 5 с"; sleep 5; reality_only_selftest "$row_t" "$row_f" && st_ok=0; fi
+  if [[ "$st_ok" != "0" ]]; then
+    reality_only_rollback "самотест не прошёл"
+    exit 1
+  fi
+  REALITY_ONLY_ROLLBACK_ARMED=0
+  trap - INT TERM HUP
+  trap lucx_xui_guard_fire EXIT
+  echo "$VERSION" > /root/.lucx-script-version
+  if [[ -f "$CREDS_FILE" ]]; then
+    {
+      echo
+      echo "# Reality-only (reality-only, $(date -Iseconds)): xray TLS-инбаунд убран, 443 = Reality+Vision (target nginx :${REALITY_SELF_TARGET_PORT}); ссылки TLS выше устарели"
+    } >> "$CREDS_FILE"
+  fi
+  echo
+  echo "================= ГОТОВО ================="
+  echo "Reality-only: nginx -> 127.0.0.1:443 (xray Reality) ; target -> nginx 127.0.0.1:${REALITY_SELF_TARGET_PORT}."
+  echo "Клиентам: обновить подписку; ссылки со security=tls больше не работают. Ссылка вида:"
+  echo "  vless://<UUID>@${REALITY_DOMAIN}:443?type=tcp&security=reality&pbk=<publicKey>&fp=firefox&sni=${REALITY_DOMAIN}&sid=<shortId>&flow=xtls-rprx-vision&spx=%2F"
+  echo "Откат вручную: systemctl stop x-ui && cp -a ${RO_DB_BAK} ${XUIDB} && cp -a ${RO_CONF_BAK} ${stream_conf} && nginx -t && systemctl reload nginx && systemctl start x-ui"
+  echo "Проверка: bash $0 healthcheck ; статус: bash $0 reality-only status"
+  echo "=========================================="
 }
 
 # ================== РЕЖИМ: ADD-H2 (h2 в TLS-инбаунде) ==================
@@ -2138,8 +2538,9 @@ cmd_switch_mode() {
         exit 1
       fi
       keys_out=$("$xray_bin" x25519 2>/dev/null || true)
-      priv=$(echo "$keys_out" | jq -r '.privateKey // empty' 2>/dev/null || echo "$keys_out" | grep -oP '(?<=Private key: ).*' || true)
-      pub=$(echo "$keys_out" | jq -r '.publicKey // empty' 2>/dev/null || echo "$keys_out" | grep -oP '(?<=Public key: ).*' || true)
+      # v0.7.0: разбор вывода xray 26 («PrivateKey: …» / «Password: …»), как в Reality-front; прежний разбор на новых ядрах ничего не находил
+      priv=$(echo "$keys_out" | awk -F': *' 'tolower($1) ~ /^private ?key$/ {print $2; exit}')
+      pub=$(echo "$keys_out" | awk -F': *' 'tolower($1) ~ /public ?key|^password/ {print $2; exit}')
       if [[ -z "$priv" || -z "$pub" ]]; then
         echo "ОШИБКА: не сгенерировать Reality-ключи."
         systemctl start x-ui
@@ -2388,8 +2789,12 @@ install_print_summary() {
   echo
   echo "  Что работает:"
   if [[ "${REALITY_OK:-0}" == "1" ]]; then
-    echo "    ✓ VLESS + TLS (Vision)        на ${REALITY_DOMAIN}"
-    [[ "${FRONT_ACTIVE:-0}" == "1" ]] && echo "    ✓ VLESS + Reality             на ${REALITY_DOMAIN}"
+    if [[ "${VLESS_MODE:-tls}" == "reality" ]]; then
+      echo "    ✓ VLESS + Reality (Vision)    на ${REALITY_DOMAIN} (снаружи отвечает nginx)"
+    else
+      echo "    ✓ VLESS + TLS (Vision)        на ${REALITY_DOMAIN}"
+      [[ "${FRONT_ACTIVE:-0}" == "1" ]] && echo "    ✓ VLESS + Reality             на ${REALITY_DOMAIN}"
+    fi
   fi
   [[ "${HY2_OK:-0}" == "1" && -n "${HY2_AUTH:-}" ]] && echo "    ✓ Hysteria 2 (UDP/443)        на ${REALITY_DOMAIN}"
   if xhttp_active; then
@@ -2423,6 +2828,10 @@ install_print_summary() {
   echo "         SUB   — для INCY и Happ;"
   echo "         CLASH — для Clash Verge Rev."
   echo "       SUB и CLASH работают только в этих приложениях (INCY, Happ, Clash)."
+  if [[ "${VLESS_MODE:-tls}" == "reality" ]]; then
+    echo "       ⚠ Режим 443 — Reality: Clash Verge и FlClash на обычном mihomo Reality не поддерживают (клиенты с ядром xray/sing-box"
+    echo "         и INCY — работают). Нужна поддержка таких клиентов: установка с TLS_MODE=1 (прежняя схема с TLS)."
+  fi
   echo "       AmneziaWG подпиской не выдаётся: у клиента в окне ⓘ блок «AWG-конфиг» -> «Конфигурация»"
   echo "       (копировать или скачать) или ссылка AmneziaWG в блоке «Копировать ссылку»; для приложения Amnezia."
   echo
@@ -2785,7 +3194,7 @@ cmd_install() {
 
   PANEL_PORT=$(( (RANDOM % 40000) + 20000 ))
   PANEL_INTERNAL_PORT=8443
-  REALITY_DECOY_INTERNAL_PORT=8444
+  REALITY_DECOY_INTERNAL_PORT="$REALITY_SELF_TARGET_PORT"
   REALITY_XRAY_PORT=443
   SUB_PORT=2096
   SUB_SECRET_PATH="/sb-$(openssl rand -hex 4)/"
@@ -2813,8 +3222,17 @@ cmd_install() {
   # (схема из changelog 0.5.4): Reality-клиенты и TLS-клиенты живут на одном домене и 443.
   # Отдельный «чисто Reality» режим установки больше не предлагается (ветка кода оставлена,
   # старые версии скрипта лежат в релизах — откат установщика = взять прежнюю версию).
-  VLESS_MODE="tls"
-  echo "  Режим 443: VLESS+TLS + Reality перед ним (без выбора, v0.5.4)"
+  # v0.7.0: по умолчанию «Reality-only»: xray на 443 принимает только Reality (Vision), а всё чужое (браузеры, сканеры, чужой SNI)
+  # отдаёт на target = nginx 127.0.0.1:8444 (сертификат основного домена, сайт-заглушка). Снаружи по TLS отвечает настоящий nginx,
+  # xray с Go-TLS в ответ на чужие рукопожатия не участвует. Цена: клиенты без Reality (Clash Verge/FlClash на обычном mihomo
+  # и т.п.) не подключаются. Прежняя схема (VLESS+TLS + h2 + Reality перед TLS) — TLS_MODE=1 при запуске install.
+  if [[ "${TLS_MODE:-0}" == "1" ]]; then
+    VLESS_MODE="tls"
+    echo "  Режим 443: VLESS+TLS + Reality перед ним (TLS_MODE=1, прежняя схема: подходит и клиентам без Reality)"
+  else
+    VLESS_MODE="reality"
+    echo "  Режим 443: Reality (Vision), снаружи отвечает только nginx (v0.7.0; прежняя схема с TLS — TLS_MODE=1)"
+  fi
 
   # v0.5.3: рекомендованные настройки подписок (Clash/Happ/Incy) — Enter = да
   read -rp "Применить рекомендованные настройки подписок (Clash/Mihomo, Happ, Incy)? [Y/n]: " SUB_REC
@@ -5181,25 +5599,19 @@ EOF
       NOW_MS=$(( $(date +%s) * 1000 ))
 
       if [[ "$VLESS_MODE" == "reality" ]]; then
+        # v0.7.0: ключи разбираются так же, как в Reality-front (формат вывода xray 26: «PrivateKey: …» / «Password: …»);
+        # прежний разбор «Private key: …» на новых ядрах ничего не находил
         KEYS_OUT=$("$XRAY_BIN" x25519 2>/dev/null || true)
-        if command -v jq >/dev/null 2>&1; then
-          REALITY_PRIVATE=$(echo "$KEYS_OUT" | jq -r '.privateKey // empty' 2>/dev/null || true)
-          REALITY_PUBLIC=$(echo "$KEYS_OUT" | jq -r '.publicKey // empty' 2>/dev/null || true)
-        fi
-        if [[ -z "$REALITY_PRIVATE" || -z "$REALITY_PUBLIC" ]]; then
-          REALITY_PRIVATE=$(echo "$KEYS_OUT" | grep -oP '(?<=Private key: ).*' || echo "$KEYS_OUT" | grep -i 'Private' | awk '{print $NF}')
-          REALITY_PUBLIC=$(echo "$KEYS_OUT" | grep -oP '(?<=Public key: ).*' || echo "$KEYS_OUT" | grep -i 'Public' | awk '{print $NF}')
-        fi
+        REALITY_PRIVATE=$(echo "$KEYS_OUT" | awk -F': *' 'tolower($1) ~ /^private ?key$/ {print $2; exit}')
+        REALITY_PUBLIC=$(echo "$KEYS_OUT" | awk -F': *' 'tolower($1) ~ /public ?key|^password/ {print $2; exit}')
         if [[ -z "$REALITY_PRIVATE" || -z "$REALITY_PUBLIC" ]]; then
           echo "ОШИБКА: не удалось сгенерировать Reality-ключи."
           systemctl start x-ui
           exit 1
         fi
         SHORT_ID_1=$(openssl rand -hex 8)
-        SHORT_ID_2=$(openssl rand -hex 8)
-        # Vision + проба-фасад через dest (классическая схема до v0.3.9)
         SETTINGS_JSON='{"clients":[{"id":"'"${CLIENT_UUID}"'","flow":"xtls-rprx-vision","email":"client1","limitIp":0,"totalGB":0,"expiryTime":0,"enable":true,"tgId":0,"subId":"primary","reset":0,"created_at":'"${NOW_MS}"',"updated_at":'"${NOW_MS}"'}],"decryption":"none","fallbacks":[]}'
-        STREAM_JSON='{"network":"tcp","security":"reality","realitySettings":{"show":false,"dest":"127.0.0.1:'"${REALITY_DECOY_INTERNAL_PORT}"'","xver":0,"serverNames":["'"${REALITY_DOMAIN}"'"],"privateKey":"'"${REALITY_PRIVATE}"'","minClient":"","maxClient":"","maxTimediff":0,"shortIds":["'"${SHORT_ID_1}"'","'"${SHORT_ID_2}"'"],"settings":{"publicKey":"'"${REALITY_PUBLIC}"'","fingerprint":"chrome","serverName":"","spiderX":"/"}},"tcpSettings":{"acceptProxyProtocol":true,"header":{"type":"none"}}}'
+        STREAM_JSON=$(reality_only_stream_json "$REALITY_PRIVATE" "$REALITY_PUBLIC" "$SHORT_ID_1")
       else
         # v0.3.9 TLS-режим: конфигурация, проверенная живьём на
         # тестовой ноде (2026-09-30). xray терминирует TLS сам, серт с
@@ -5314,6 +5726,17 @@ EOF
     fi
   fi
 
+  # --- [10/10+] v0.7.0: самотест Reality-only (только режим reality) ---
+  if [[ "${REALITY_OK:-0}" == "1" && "$VLESS_MODE" == "reality" && -n "${CLIENT_UUID:-}" ]]; then
+    echo "=== [10/10+] Самотест Reality-only через публичный IP ${SERVER_IP} ==="
+    INST_RO_OK=0
+    if reality_only_selftest "${CLIENT_UUID}|xtls-rprx-vision"; then INST_RO_OK=1; else echo "  повтор через 5 с"; sleep 5; reality_only_selftest "${CLIENT_UUID}|xtls-rprx-vision" && INST_RO_OK=1; fi
+    if [[ "$INST_RO_OK" != "1" ]]; then
+      echo "  WARN: самотест Reality-only не прошёл (DNS ещё не обновился? сертификат? ) — разберись: sudo bash $0 healthcheck"
+      INSTALL_RO_FAILED=1
+    fi
+  fi
+
   # --- [10a] Hysteria 2 inbound на UDP/443 (SQLite) ---
   echo "=== [10a] Hysteria 2 inbound на UDP/443 (SQLite) ==="
   # v0.6.5: сбой hy2 больше не обрывает установку: БД возвращается из копии (hy2_rollback_db), а креды панели и строка
@@ -5322,6 +5745,9 @@ EOF
 
   # --- Финал: подробности — в лог/креды, на экран — install_print_summary в самом конце ---
   INSTALL_PROBLEMS=()
+  if [[ "${INSTALL_RO_FAILED:-0}" == "1" ]]; then
+    INSTALL_PROBLEMS+=("самотест Reality-only не прошёл — проверь DNS доменов и сертификат, затем: sudo bash $0 healthcheck")
+  fi
   if [[ "${REALITY_OK:-0}" != "1" ]]; then
     INSTALL_PROBLEMS+=("VLESS-инбаунд не создан — создай вручную через панель (причина — в логе выше)")
   fi
@@ -5355,7 +5781,7 @@ EOF
     echo "Reality UUID: ${CLIENT_UUID}" >> "$CREDS_FILE"
     if [[ "${VLESS_MODE}" == "reality" ]]; then
       echo "Public Key: ${REALITY_PUBLIC}" >> "$CREDS_FILE"
-      echo "Short IDs: ${SHORT_ID_1}, ${SHORT_ID_2}" >> "$CREDS_FILE"
+      echo "Short ID: ${SHORT_ID_1}" >> "$CREDS_FILE"
     else
       echo "VLESS Link: vless://${CLIENT_UUID}@${REALITY_DOMAIN}:443?type=tcp&security=tls&sni=${REALITY_DOMAIN}&fp=firefox&flow=xtls-rprx-vision#${REALITY_REMARK}" >> "$CREDS_FILE"
       if [[ "${FRONT_ACTIVE:-0}" == "1" ]]; then
@@ -6114,7 +6540,7 @@ cmd_healthcheck() {
   fi
   echo
 
-  echo "=== [7a] h2 и Reality перед TLS (v0.5.4) ==="
+  echo "=== [7a] h2 и Reality перед TLS (v0.5.4) / Reality-only (v0.7.0) ==="
   if [[ -f "$XUIDB" && "${VLESS_SEC:-}" == "tls" ]]; then
     hc_ip=$(get_server_ip 2>/dev/null || true)
     hc_alpn=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.tlsSettings.alpn') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
@@ -6169,8 +6595,39 @@ cmd_healthcheck() {
     else
       check "Reality перед TLS не включён — INFO: включить: sudo bash $0 add-reality-front" warn
     fi
+  elif [[ -f "$XUIDB" && "${VLESS_SEC:-}" == "reality" ]]; then
+    # v0.7.0: Reality-only — xray принимает только Reality, чужое отдаёт target = nginx (вхост 127.0.0.1:8444)
+    hc_row="SELECT %s FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;"
+    # shellcheck disable=SC2059
+    hc_tgt=$(sqlite3 "$XUIDB" "$(printf "$hc_row" "COALESCE(json_extract(stream_settings,'\$.realitySettings.target'),json_extract(stream_settings,'\$.realitySettings.dest'))")" 2>/dev/null || true)
+    # shellcheck disable=SC2059
+    hc_pp=$(sqlite3 "$XUIDB" "$(printf "$hc_row" "json_extract(stream_settings,'\$.tcpSettings.acceptProxyProtocol')")" 2>/dev/null || true)
+    # shellcheck disable=SC2059
+    hc_sn=$(sqlite3 "$XUIDB" "$(printf "$hc_row" "json_extract(stream_settings,'\$.realitySettings.serverNames[0]')")" 2>/dev/null || true)
+    # shellcheck disable=SC2059
+    hc_pk=$(sqlite3 "$XUIDB" "$(printf "$hc_row" "COALESCE(json_extract(stream_settings,'\$.realitySettings.privateKey'),'')")" 2>/dev/null || true)
+    hc_ip=$(get_server_ip 2>/dev/null || true)
+    [[ "$hc_tgt" == "127.0.0.1:${REALITY_SELF_TARGET_PORT}" ]] && check "Reality-only: target = 127.0.0.1:${REALITY_SELF_TARGET_PORT} (nginx, сертификат ${REALITY_DOMAIN})" ok || check "Reality-only: target '${hc_tgt:-?}' != 127.0.0.1:${REALITY_SELF_TARGET_PORT} — чужие рукопожатия получат не nginx-заглушку: снаружи станет виден xray" fail
+    [[ "$hc_pp" == "1" || "$hc_pp" == "true" ]] && check "Reality-only: acceptProxyProtocol включён" ok || check "Reality-only: нет acceptProxyProtocol — nginx шлёт PROXY, соединения оборвутся" fail
+    [[ "$hc_sn" == "${REALITY_DOMAIN:-}" ]] && check "Reality-only: serverNames[0] = ${REALITY_DOMAIN}" ok || check "Reality-only: serverNames[0] '${hc_sn:-?}' != '${REALITY_DOMAIN:-?}'" fail
+    [[ -n "$hc_pk" ]] && check "Reality-only: privateKey задан" ok || check "Reality-only: нет privateKey — инбаунд не стартует" fail
+    hc_up=$(awk '/upstream reality_backend/,/}/' /etc/nginx/stream-sni-router.conf 2>/dev/null | grep -oP "server 127\.0\.0\.1:\K[0-9]+" | head -n1 || true)
+    [[ "$hc_up" == "443" ]] && check "Reality-only: nginx reality_backend -> 127.0.0.1:443" ok || check "Reality-only: reality_backend -> 127.0.0.1:${hc_up:-?} (ожидался 443)" fail
+    hc_c=$(curl -sk -m 5 -o /dev/null -w "%{http_code}" --resolve "${REALITY_DOMAIN}:${REALITY_SELF_TARGET_PORT}:127.0.0.1" "https://${REALITY_DOMAIN}:${REALITY_SELF_TARGET_PORT}/" 2>/dev/null || echo 000)
+    [[ "$hc_c" == "200" ]] && check "Reality-only: вхост-мишень 127.0.0.1:${REALITY_SELF_TARGET_PORT} отвечает 200" ok || check "Reality-only: вхост-мишень 127.0.0.1:${REALITY_SELF_TARGET_PORT} не отвечает 200 (код ${hc_c}) — зонды и браузеры домена получат обрыв" fail
+    if sqlite3 "$XUIDB" "SELECT 1 FROM inbounds WHERE protocol='vless' AND port=${REALITY_FRONT_PORT} AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null | grep -q 1; then
+      check "Reality-only: остался инбаунд на :${REALITY_FRONT_PORT} (Reality-front прежней схемы) — не нужен и ссылается на 127.0.0.1:443; удалить в панели" warn
+    fi
+    if [[ -n "$hc_ip" && -n "${REALITY_DOMAIN:-}" ]]; then
+      hc_tk=$(printf 'GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$REALITY_DOMAIN" | timeout 10 openssl s_client -connect "${hc_ip}:443" -servername "$REALITY_DOMAIN" -tls1_3 -ign_eof 2>&1 | grep -c 'New Session Ticket' || true)
+      if [[ "${hc_tk:-0}" -ge 1 ]]; then
+        check "Reality-only: зонд без ключа получает билеты сессии TLS1.3 (${hc_tk}) — отвечает nginx" ok
+      else
+        check "Reality-only: зонд без ключа не получил билетов сессии TLS1.3 — похоже на Go-TLS xray, а не nginx (проверь target/upstream)" warn
+      fi
+    fi
   else
-    check "Блок пропущен: режим 443 не TLS или x-ui.db не найден" warn
+    check "Блок пропущен: режим 443 не TLS/Reality или x-ui.db не найден" warn
   fi
   echo
 
@@ -8870,7 +9327,7 @@ cmd_restore() {
 # Слой над готовыми командами: каждый пункт запускает ту же команду отдельным процессом скрипта
 # (команды завершаются через exit, поэтому внутри меню они не вызываются). Сами команды не менялись.
 # Не показываются в меню (остаются доступными из командной строки): add-vls, add-reality, add-hy2, add-h2,
-# add-reality-front, panel-path — install ставит всё это сам.
+# add-reality-front, panel-path — install ставит всё это сам; reality-only — разовый перевод уже работающей ноды на Reality-only.
 
 menu_self() {
   local s
@@ -8918,14 +9375,16 @@ menu_card() {
   case "$1" in
     1) cat <<'EOF'
 install — установка с нуля
-  Что делает: ставит lucx-ui, nginx с SNI-роутером на 443, вход TLS + h2 + Reality перед TLS, сайты-заглушки,
+  Что делает: ставит lucx-ui, nginx с SNI-роутером на 443, вход Reality (Vision; снаружи отвечает nginx), сайты-заглушки,
               сертификаты Let's Encrypt, Hysteria 2; настраивает ufw; по желанию спрашивает третье имя для XHTTP.
               В начале спрашивает, проверять ли доступ к GitHub (ответ n или SKIP_GITHUB_PREFLIGHT=1 пропускает проверку).
               По ходу спрашивает, в том числе: порт AmneziaWG и «Доверяешь этому скрипту?», ставить ли Telegram-бота,
               в конце — перезагружать ли сервер. Если нужно новое ядро, проверка ядра в начале может перезагрузить
               сервер посреди установки (после перезагрузки запустите install снова).
   Варианты:   sudo XHTTP_DOMAIN=имя bash скрипт install — сразу включить XHTTP на третьем имени
-              (sudo сбрасывает окружение, поэтому переменная идёт после sudo).
+              (sudo сбрасывает окружение, поэтому переменная идёт после sudo);
+              sudo TLS_MODE=1 bash скрипт install — прежняя схема с TLS-инбаундом xray (+ h2 + Reality перед TLS):
+              подходит клиентам без Reality (Clash Verge/FlClash), но xray по TLS виден снаружи.
   Подводные камни:
     - только для чистого сервера: на рабочий сервер не запускать;
     - до запуска у двух доменов должны быть A-записи на IP этого сервера;
@@ -9175,6 +9634,10 @@ case "${1:-install}" in
   add-h2|h2)
     cmd_add_h2
     ;;
+  reality-only|only-reality)
+    shift
+    cmd_reality_only "$@"
+    ;;
   add-xhttp|xhttp)
     shift
     cmd_add_xhttp "$@"
@@ -9239,7 +9702,7 @@ case "${1:-install}" in
     echo "  sudo bash $0 menu          — интерактивное меню: пункты с описанием (?N), вариантами и подводными камнями"
     echo "  sudo bash $0 install       — установить всё с нуля (чистый сервер; по желанию спросит третье"
     echo "                               имя и сразу включит XHTTP+Reality; или env XHTTP_DOMAIN=...;"
-    echo "                               ставит TLS + h2 + Reality перед TLS без вопросов)"
+    echo "                               ставит Reality-only (xray без TLS; прежняя схема TLS + h2 + Reality перед TLS: TLS_MODE=1))"
     echo "  sudo bash $0 upgrade       — обновить сам этот скрипт до новейшей версии"
     echo "                               с GitHub (патч без переустановки)"
     echo "  sudo bash $0 panel-path    — сменить путь панели /panel/ на случайный (или свой: panel-path /my-path/);"
@@ -9252,6 +9715,8 @@ case "${1:-install}" in
     echo "  sudo bash $0 add-hy2       — добавить Hysteria 2 на существующий сервер"
     echo "  sudo bash $0 add-h2        — включить h2 в TLS-инбаунде (alpn + fallback на h2c :8081;"
     echo "                               бэкап БД, самотест, автооткат)"
+    echo "  sudo bash $0 reality-only  — убрать TLS-инбаунд xray: 443 = только Reality (Vision), снаружи отвечает nginx;"
+    echo "                               клиенты и ключи Reality-front переносятся; бэкап, самотест, автооткат; status — только чтение"
     echo "  sudo bash $0 add-reality-front — Reality перед TLS на том же домене/443 (без 3-го домена;"
     echo "                               nginx -> 127.0.0.1:8446; бэкап, самотест, автооткат)"
     echo "  sudo bash $0 add-xhttp <имя> — третий вход: VLESS+XHTTP+Reality на отдельном имени (A-запись на этот"

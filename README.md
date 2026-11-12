@@ -41,7 +41,7 @@ decoy-сайты, ufw + fail2ban. Опционально — Telegram-бот у�
 | 2. Установка | скачать скрипт и запустить его без аргументов: меню, пункт `1` (install) |
 | 3. Панель | обновить ключи у созданных клиентов и (по желанию) создать инбаунд AmneziaWG (вручную, в браузере) |
 | 4. Проверка | `healthcheck` |
-| 5. Клиенты | поставить приложение (INCY, Clash Verge Rev) и добавить подписку |
+| 5. Клиенты | поставить приложение (Happ) и добавить подписку |
 
 **Этап 1. Подготовка.** Нужен сервер с Ubuntu 22.04/24.04 (root) и **два домена** с A-записями на IP сервера
 (DNS должен резолвиться до установки): панельный — для панели и подписок, основной — для клиентов. Третье имя для
@@ -80,9 +80,10 @@ AmneziaWG из-за массовых банов. Подробно, с табли
 bash 3x-ui-dual-domain.sh healthcheck
 ```
 
-**Этап 5. Клиенты.** Ссылку подписки выдавайте только после этапа 3. Рекомендуем **[INCY](https://incy.cc)**
-(Android, iOS, Windows, macOS, Linux, все входы схемы); Happ тоже проверен. **[Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev/releases)**
-(Windows, macOS, Linux) подходит только если его ядро mihomo подключается к Reality: на свежем Xray оно может не работать, а в схеме 0.7.0 других TLS-входов, кроме Hysteria2, нет (подробно: [docs/clients.md](docs/clients.md)). Ссылки подписки (SUB для INCY и Happ, CLASH для Clash Verge) берутся в панели: Клиенты → кнопка ⓘ → «Информация о подписке». Для AmneziaWG подписки нет: конфиг берётся там же, в блоке «AWG-конфиг». Где скачать приложения и как добавить подписку — в **[docs/clients.md](docs/clients.md)**.
+**Этап 5. Клиенты.** Ссылку подписки выдавайте только после этапа 3. Сейчас рекомендуем **[Happ](https://github.com/Happ-proxy)**
+(Android, iOS, Windows, macOS, Linux; проверен с нашей подпиской). Ссылки подписки (SUB для Happ и INCY, CLASH для Clash Verge) берутся в панели: Клиенты → кнопка ⓘ → «Информация о подписке». Для AmneziaWG подписки нет: конфиг берётся там же, в блоке «AWG-конфиг». Где скачать приложение и как добавить подписку — в **[docs/clients.md](docs/clients.md)**.
+
+> ⚠️ **Временно не рекомендуем INCY и Clash Verge Rev.** У INCY на только что установленном приложении подписка с маршрутизацией может не запускаться (ошибка «code "TORRENT" not found in loaded geodata»): без правил весь трафик, включая российские сайты, пойдёт через VPN. Мы разбираемся. Clash Verge Rev на обычном ядре mihomo не подключается к Reality, а в схеме 0.7.0 других TLS-входов, кроме Hysteria2, нет. Когда ситуация изменится, этот блок будет обновлён.
 
 ## Команды
 
@@ -170,7 +171,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-doma
 Скрипт `upgrade` скачивает релиз и сверяет sha256; версии ≤0.5.4 качали `main` без проверки — обновите их до 0.5.5 или новее.
 `upgrade` заменяет только сам скрипт и схему работающего сервера не меняет: чтобы перейти на Reality-only (0.7.0), после `upgrade` запустите `sudo bash 3x-ui-dual-domain.sh reality-only` (заранее: `reality-only status`; перевод занимает около минуты, x-ui перезапускается).
 
-> ℹ️ **Клиенты на ядре mihomo** (Clash Verge, XKeen на роутерах) могут не подключаться к Reality и XHTTP+Reality на свежем Xray (≥ 26.9.8); клиенты на Xray (INCY и др.) работают; на роутере с XKeen-UI помогает источник Mihomo Prizrak-Core. Причины и обходы — в [docs/xhttp.md](docs/xhttp.md#если-клиент-не-подключается).
+> ℹ️ **Клиенты на ядре mihomo** (Clash Verge, XKeen на роутерах) могут не подключаться к Reality и XHTTP+Reality на свежем Xray (≥ 26.9.8); клиенты на Xray (Happ и др.) работают; на роутере с XKeen-UI помогает источник Mihomo Prizrak-Core. Причины и обходы — в [docs/xhttp.md](docs/xhttp.md#если-клиент-не-подключается).
 
 ## Что можно и что нельзя в панели
 
@@ -185,7 +186,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-doma
 | [docs/install.md](docs/install.md) | установка по этапам, ручная настройка панели |
 | [docs/menu.md](docs/menu.md) | интерактивное меню скрипта: пункты, `?номер`, подтверждение опасных команд |
 | [docs/service-commands.md](docs/service-commands.md) | служебные команды для старых серверов и сбоев установки (`panel-path`, `add-h2`, `add-reality-front`, `add-hy2`, `add-vls` / `add-reality`) |
-| [docs/clients.md](docs/clients.md) | приложения-клиенты (INCY, Clash Verge Rev), ссылка подписки, как подключиться |
+| [docs/clients.md](docs/clients.md) | приложение-клиент (Happ; INCY и Clash Verge Rev временно не рекомендуются), ссылка подписки, как подключиться |
 | [docs/xhttp.md](docs/xhttp.md) | необязательный третий вход XHTTP+Reality (`add-xhttp`) |
 | [docs/panel-rules.md](docs/panel-rules.md) | что можно и нельзя в панели, как добавлять новые протоколы |
 | [docs/telegram-bot.md](docs/telegram-bot.md) | Telegram-бот, управление клиентами, безопасность |

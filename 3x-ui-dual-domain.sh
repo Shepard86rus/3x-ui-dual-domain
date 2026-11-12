@@ -2371,8 +2371,17 @@ cmd_reality_only() {
     fi
   fi
   if [[ -n "$fid" ]]; then
-    if sqlite3 "$XUIDB" "SELECT 1 FROM settings WHERE key='xrayTemplateConfig' AND value LIKE '%${REALITY_FRONT_TAG}%' LIMIT 1;" 2>/dev/null | grep -q 1; then
-      echo "ОШИБКА: шаблон xray (маршруты/балансировщики) ссылается на тег ${REALITY_FRONT_TAG} — после удаления front правило сломается. Поправь шаблон и повтори. Ничего не изменено."
+    # тег в списках inboundTag правил маршрутизации безвреден (xray сопоставляет строки, мёртвый тег просто не сработает);
+    # опасно упоминание вне inboundTag (балансировщик, outbound, selector и т. п.) — его считаем отдельно.
+    # Если шаблон не разобрался как JSON — считаем по старому: любое упоминание тега
+    local tplref=0
+    if [[ "$(sqlite3 "$XUIDB" "SELECT json_valid(value) FROM settings WHERE key='xrayTemplateConfig' LIMIT 1;" 2>/dev/null || echo 1)" == "1" ]]; then
+      tplref=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM settings s, json_tree(s.value) t LEFT JOIN json_tree(s.value) p ON p.id=t.parent WHERE s.key='xrayTemplateConfig' AND t.atom='${REALITY_FRONT_TAG}' AND COALESCE(p.key,'')<>'inboundTag';" 2>/dev/null || echo 1)
+    else
+      tplref=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM settings WHERE key='xrayTemplateConfig' AND value LIKE '%${REALITY_FRONT_TAG}%';" 2>/dev/null || echo 1)
+    fi
+    if [[ "${tplref:-0}" != "0" ]]; then
+      echo "ОШИБКА: шаблон xray (маршруты/балансировщики) ссылается на тег ${REALITY_FRONT_TAG} вне списков inboundTag — после удаления front правило сломается. Поправь шаблон и повтори. Ничего не изменено."
       exit 1
     fi
     nemail=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM (SELECT settings s FROM inbounds WHERE id=${tid}) t, json_each(t.s,'\$.clients') a, (SELECT settings s FROM inbounds WHERE id=${fid}) f, json_each(f.s,'\$.clients') b WHERE json_extract(a.value,'\$.email')=json_extract(b.value,'\$.email') AND json_extract(a.value,'\$.id') IS NOT json_extract(b.value,'\$.id');" 2>/dev/null || echo 0)

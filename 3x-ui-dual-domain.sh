@@ -1769,7 +1769,7 @@ create_reality_front_inbound() {
     echo "  ОШИБКА: Reality-инбаунд не поднялся (x-ui не active или xray не слушает 127.0.0.1:${REALITY_FRONT_PORT}) — возвращаю БД из ${bak}"
     lucx_xui_stop
     sleep 1
-    lucx_db_restore "$bak"
+    lucx_db_restore "$bak" || echo "ВНИМАНИЕ: БД не возвращена из ${bak} — верни вручную (x-ui остановить): rm -f ${XUIDB}-wal ${XUIDB}-shm; cp -a ${bak} ${XUIDB}"
     lucx_xui_start
     return 1
   fi
@@ -2208,7 +2208,7 @@ RO_DB_BAK=""; RO_CONF_BAK=""; RO_STREAM_CONF=""; RO_FRONT=0; RO_HUP=0
 reality_only_rollback() { # причина
   [[ "${REALITY_ONLY_ROLLBACK_ARMED:-0}" == "1" ]] || return 0
   REALITY_ONLY_ROLLBACK_ARMED=0
-  trap '' HUP
+  trap '' HUP PIPE
   trap - INT TERM
   # откат не должен обрываться на первом сбое (даже если вызван из ловушки под set -e)
   set +e
@@ -2221,7 +2221,7 @@ reality_only_rollback() { # причина
   lucx_xui_stop || true
   sleep 1
   if [[ -n "$RO_DB_BAK" && -f "$RO_DB_BAK" ]]; then
-    lucx_db_restore "$RO_DB_BAK" || echo "ВНИМАНИЕ: БД не возвращена из ${RO_DB_BAK} — верни вручную: rm -f ${XUIDB}-wal ${XUIDB}-shm; cp -a ${RO_DB_BAK} ${XUIDB}"
+    lucx_db_restore "$RO_DB_BAK" || echo "ВНИМАНИЕ: БД не возвращена из ${RO_DB_BAK} — верни вручную: systemctl stop x-ui; rm -f ${XUIDB}-wal ${XUIDB}-shm; cp -a ${RO_DB_BAK} ${XUIDB}"
   fi
   if [[ -n "$RO_CONF_BAK" && -f "$RO_CONF_BAK" ]]; then
     cp -a "$RO_CONF_BAK" "$RO_STREAM_CONF" || echo "ВНИМАНИЕ: nginx-конфиг не возвращён из ${RO_CONF_BAK} — верни вручную: cp -a ${RO_CONF_BAK} ${RO_STREAM_CONF}"
@@ -2288,7 +2288,7 @@ cmd_reality_only() {
     exit 1
   fi
   local stream_conf="/etc/nginx/stream-sni-router.conf" stamp
-  local sec tid fid up pp ncustom nrows nemail nt nf row_t row_f exp_clients=0 got_clients
+  local sec tid fid up pp ncustom nrows nemail nflow nt nf row_t row_f exp_clients=0 got_clients
   # адрес для самотеста — тот, что слушает stream-роутер (за NAT или без внешних сервисов определения IP он надёжнее)
   SERVER_IP=$(grep -oP '^\s*listen\s+\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(?=:443;)' "$stream_conf" 2>/dev/null | head -n1 || true)
   [[ -n "$SERVER_IP" ]] || SERVER_IP=$(get_server_ip)
@@ -2363,10 +2363,10 @@ cmd_reality_only() {
   # хосты подписок и балансировщики ссылаются на inbound_id: после удаления front ссылка повиснет
   if [[ -n "$fid" ]]; then
     nrows=0
-    sqlite_has_table hosts && nrows=$(( nrows + $(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM hosts WHERE inbound_id IN (${tid},${fid});" 2>/dev/null || echo 0) ))
+    sqlite_has_table hosts && nrows=$(( nrows + $(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM hosts WHERE inbound_id=${fid};" 2>/dev/null || echo 0) ))
     sqlite_has_table sub_balancers && nrows=$(( nrows + $(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM sub_balancers WHERE EXISTS (SELECT 1 FROM json_each(inbound_ids) WHERE value=${fid});" 2>/dev/null || echo 0) ))
     if [[ "${nrows:-0}" != "0" && "${LUCX_FORCE_HOSTS:-0}" != "1" ]]; then
-      echo "ОШИБКА: на инбаунды (TLS #${tid} / front #${fid}) ссылаются хосты или балансировщики подписок (${nrows}) — после удаления front они повиснут. Перенеси их на #${tid} в панели и повтори (или LUCX_FORCE_HOSTS=1). Ничего не изменено."
+      echo "ОШИБКА: на инбаунды (TLS #${tid} / front #${fid}) ссылаются хосты или балансировщики подписок (${nrows}) — после удаления front они повиснут. Перенеси хосты на #${tid} (балансировщики — убери #${fid} из состава) в панели и повтори (или LUCX_FORCE_HOSTS=1). Ничего не изменено."
       exit 1
     fi
   fi
@@ -2378,6 +2378,14 @@ cmd_reality_only() {
     nemail=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM (SELECT settings s FROM inbounds WHERE id=${tid}) t, json_each(t.s,'\$.clients') a, (SELECT settings s FROM inbounds WHERE id=${fid}) f, json_each(f.s,'\$.clients') b WHERE json_extract(a.value,'\$.email')=json_extract(b.value,'\$.email') AND json_extract(a.value,'\$.id') IS NOT json_extract(b.value,'\$.id');" 2>/dev/null || echo 0)
     if [[ "${nemail:-0}" != "0" ]]; then
       echo "ОШИБКА: у клиентов TLS-инбаунда и Reality-front совпадают email при разных UUID (${nemail}) — слияние невозможно. Ничего не изменено."
+      exit 1
+    fi
+    nflow=$(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM (SELECT settings s FROM inbounds WHERE id=${tid}) t, json_each(t.s,'\$.clients') a, (SELECT settings s FROM inbounds WHERE id=${fid}) f, json_each(f.s,'\$.clients') b WHERE json_extract(a.value,'\$.id')=json_extract(b.value,'\$.id') AND COALESCE(json_extract(a.value,'\$.flow'),'')<>COALESCE(json_extract(b.value,'\$.flow'),'');" 2>/dev/null || echo 0)
+    if sqlite_has_table client_inbounds; then
+      nflow=$(( ${nflow:-0} + $(sqlite3 "$XUIDB" "SELECT COUNT(*) FROM client_inbounds a JOIN client_inbounds b ON a.client_id=b.client_id WHERE a.inbound_id=${tid} AND b.inbound_id=${fid} AND COALESCE(a.flow_override,'')<>COALESCE(b.flow_override,'');" 2>/dev/null || echo 0) ))
+    fi
+    if [[ "${nflow:-0}" != "0" ]]; then
+      echo "ОШИБКА: у ${nflow} клиентов, общих для TLS-инбаунда #${tid} и Reality-front #${fid}, разный flow — при слиянии победил бы flow TLS-инбаунда и их старые ссылки перестали бы работать. Выровняй flow (xtls-rprx-vision) в панели и повтори. Ничего не изменено."
       exit 1
     fi
   fi
@@ -2633,7 +2641,7 @@ cmd_add_h2() {
     echo "ОШИБКА: самотест не прошёл — возвращаю БД из ${bak}"
     lucx_xui_stop
     sleep 1
-    lucx_db_restore "$bak"
+    lucx_db_restore "$bak" || echo "ВНИМАНИЕ: БД не возвращена из ${bak} — верни вручную (x-ui остановить): rm -f ${XUIDB}-wal ${XUIDB}-shm; cp -a ${bak} ${XUIDB}"
     lucx_xui_start
     sleep 2
     systemctl is-active --quiet x-ui && echo "БД возвращена, x-ui active (схема как была)." || echo "ВНИМАНИЕ: x-ui не active после отката — journalctl -u x-ui -n 50"
@@ -2691,7 +2699,7 @@ cmd_switch_mode() {
       echo "Уже в TLS-режиме; перенаправляю fallback на :8080 (фасад decoy, v0.4.0)..."
       systemctl stop x-ui
       sleep 1
-      lucx_db_snapshot "${XUIDB}.backup.$(date +%s)"
+      lucx_db_snapshot "${XUIDB}.backup.$(date +%s)" || { echo "ОШИБКА: бэкап БД не создан (нет места?) — ничего не меняю."; lucx_xui_start || true; exit 1; }
       ensure_decoy2_http_vhost || { systemctl start x-ui; echo "ОШИБКА: не создать decoy2-http vhost."; exit 1; }
       if ! sqlite3 "$XUIDB" "UPDATE inbounds SET settings = json_set(settings, '\$.fallbacks', json('[{\"dest\":\"127.0.0.1:8080\",\"xver\":0}]')) WHERE protocol='vless' AND port=443 AND listen='127.0.0.1';"; then
         echo "ОШИБКА: не удалось добавить fallback. Бэкап: ${XUIDB}.backup.*"
@@ -2736,7 +2744,7 @@ cmd_switch_mode() {
   systemctl stop x-ui
   sleep 1
   mkdir -p /root/.lucx-mode-backup
-  lucx_db_snapshot "${XUIDB}.backup.$(date +%s)"
+  lucx_db_snapshot "${XUIDB}.backup.$(date +%s)" || { echo "ОШИБКА: бэкап БД не создан (нет места?) — ничего не меняю."; lucx_xui_start || true; exit 1; }
   local stream_backup="" stamp2
   stamp2=$(date +%Y%m%d-%H%M%S)
 
@@ -3026,7 +3034,11 @@ install_print_summary() {
   echo
   echo "  Что работает:"
   if [[ "${REALITY_OK:-0}" == "1" ]]; then
-    if [[ "${VLESS_MODE:-tls}" == "reality" ]]; then
+    # режим берём из БД: при повторной установке без TLS_MODE=1 переиспользуется уже существующий TLS-инбаунд
+    local real_sec
+    real_sec=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.security') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+    [[ -n "$real_sec" ]] || real_sec=$([[ "${VLESS_MODE:-tls}" == "reality" ]] && echo reality || echo tls)
+    if [[ "$real_sec" == "reality" ]]; then
       echo "    ✓ VLESS + Reality (Vision)    на ${REALITY_DOMAIN} (снаружи отвечает nginx)"
     else
       echo "    ✓ VLESS + TLS (Vision)        на ${REALITY_DOMAIN}"
@@ -3923,7 +3935,7 @@ SQL
   # subClashAutoDetect по умолчанию false — включаются в apply_sub_recommended.)
   # Новые ключи 3.8.x (subJsonPath/subClashPath/...) на нашу запись не влияют.
   if [[ -f "$XUIDB" ]]; then
-    lucx_db_snapshot "${XUIDB}.backup.$(date +%s)"
+    lucx_db_snapshot "${XUIDB}.backup.$(date +%s)" || echo "ВНИМАНИЕ: бэкап БД не создан (нет места?)"
 
     sub_uri="https://${DOMAIN}${SUB_SECRET_PATH}"
     sqlite3 "$XUIDB" <<SQL
@@ -5841,7 +5853,7 @@ EOF
     else
       systemctl stop x-ui
       sleep 1
-      lucx_db_snapshot "${XUIDB}.backup.$(date +%s)"
+      lucx_db_snapshot "${XUIDB}.backup.$(date +%s)" || { echo "ОШИБКА: бэкап БД не создан (нет места?) — ничего не меняю."; lucx_xui_start || true; exit 1; }
 
       CLIENT_UUID=$(cat /proc/sys/kernel/random/uuid)
       NOW_MS=$(( $(date +%s) * 1000 ))
@@ -8719,7 +8731,7 @@ create_xhttp_inbound() {
     echo "  ОШИБКА: XHTTP-инбаунд не поднялся (x-ui не active или xray не слушает 127.0.0.1:${XHTTP_PORT}) — возвращаю БД из ${XH_BAK}"
     lucx_xui_stop
     sleep 1
-    lucx_db_restore "$XH_BAK"
+    lucx_db_restore "$XH_BAK" || echo "ВНИМАНИЕ: БД не возвращена из ${XH_BAK} — верни вручную (x-ui остановить): rm -f ${XUIDB}-wal ${XUIDB}-shm; cp -a ${XH_BAK} ${XUIDB}"
     lucx_xui_start
     return 1
   fi
@@ -8754,7 +8766,7 @@ xhttp_rollback_all() { # stream_backup db_backup
   if [[ -n "$dbak" && -f "$dbak" ]]; then
     lucx_xui_stop
     sleep 1
-    lucx_db_restore "$dbak"
+    lucx_db_restore "$dbak" || echo "ВНИМАНИЕ: БД не возвращена из ${dbak} — верни вручную (x-ui остановить): rm -f ${XUIDB}-wal ${XUIDB}-shm; cp -a ${dbak} ${XUIDB}"
     lucx_xui_start || echo "  ВНИМАНИЕ: x-ui не запустился после отката — journalctl -u x-ui -n 50"
     sleep 2
   fi
@@ -9095,7 +9107,7 @@ cmd_remove_xhttp() {
     fi
     if ! sqlite3 "$XUIDB" "DELETE FROM inbounds WHERE id=${iid};"; then
       echo "ОШИБКА: не удалось удалить инбаунд — возвращаю БД из ${dbak}"
-      lucx_db_restore "$dbak"
+      lucx_db_restore "$dbak" || echo "ВНИМАНИЕ: БД не возвращена из ${dbak} — верни вручную (x-ui остановить): rm -f ${XUIDB}-wal ${XUIDB}-shm; cp -a ${dbak} ${XUIDB}"
       lucx_xui_start || echo "ВНИМАНИЕ: x-ui не запустился — journalctl -u x-ui -n 50"
       exit 1
     fi

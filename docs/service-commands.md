@@ -42,7 +42,7 @@
 | Команда | Что делает |
 |---|---|
 | `bash 3x-ui-dual-domain.sh reality-only` | Перевод работающего сервера (TLS + Reality перед TLS) в Reality-only: TLS-инбаунд xray убирается, снаружи по TLS отвечает только nginx (с 0.7.0; бэкап, самотест, автооткат; `status` — только чтение). Ссылки со `security=tls` перестают работать, клиенты без Reality (Clash Verge, FlClash) не подключатся |
-| `bash 3x-ui-dual-domain.sh add-h2` | Включить h2 в TLS-инбаунде (бэкап БД, самотест, автооткат) |
+| `bash 3x-ui-dual-domain.sh add-h2` | Включить h2: в схеме `TLS_MODE=1` — в TLS-инбаунде (бэкап БД, самотест, автооткат); на Reality-only (0.7.0) — на nginx-вхосте `127.0.0.1:8444` (бэкап файла, `nginx -t`, проверка h2 снаружи и Reality-клиента, автооткат). Идемпотентна |
 | `bash 3x-ui-dual-domain.sh add-reality-front` | Reality перед TLS на том же домене и 443 (бэкап, самотест, автооткат) |
 | `bash 3x-ui-dual-domain.sh add-hy2` | Добавить Hysteria2-инбаунд на сервер, поставленный до v0.3.1 |
 | `bash 3x-ui-dual-domain.sh add-vls` / `add-reality` | Перевод режима 443 между TLS и «только Reality» (для старых установок; описано в [scheme.md](scheme.md)) |

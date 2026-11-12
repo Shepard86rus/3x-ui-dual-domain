@@ -994,6 +994,11 @@
 #   switch-mode (прежний разбор ничего не находил). (3) healthcheck: блок [7a] для Reality-only (target, PROXY, serverNames, privateKey,
 #   upstream, вхост :8444, оставшийся front, признак nginx у зонда по билетам TLS1.3). (4) add-reality-front при Reality-only сообщает,
 #   что не нужен. Цена схемы: клиенты без Reality (Clash Verge, FlClash на обычном mihomo) подключиться не смогут.
+#   (5) h2 на вхосте-мишени: TLS заканчивается в nginx, поэтому зонд (браузер, сканер, чужой SNI) получает ALPN h2, как на обычном
+#   сайте. install в режиме Reality ставит вхост :8444 сразу с http2; на работающем сервере h2 включают `reality-only` (последним
+#   шагом) и `add-h2` (на Reality-only правит только nginx-вхост: бэкап, nginx -t, reload, проверка 200/2 локально и снаружи,
+#   200/1.1 по http/1.1 и Reality-клиент, при провале файл возвращается). nginx >= 1.25.1: `http2 on;`, ранее: параметр у listen.
+#   healthcheck [7a]: проверка «сайт снаружи отвечает по h2». Клиентам Reality h2 на nginx не нужен (они идут внутри туннеля).
 VERSION="0.7.0"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
@@ -1995,6 +2000,105 @@ reality_only_selftest() {
   return $ok
 }
 
+# ---- v0.7.0: h2 на nginx-вхосте-мишени (127.0.0.1:8444) ----
+# TLS на этом вхосте заканчивается в nginx (xray отдаёт ему не-Reality трафик сырым TCP), поэтому h2 включается
+# в nginx. nginx >= 1.25.1: директива `http2 on;`, раньше: параметр http2 у listen.
+nginx_http2_directive_ok() {
+  local v
+  v=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
+  [[ -n "$v" ]] || return 1
+  [[ "$(printf '%s\n%s\n' "$v" "1.25.1" | sort -V | head -n1)" == "1.25.1" ]]
+}
+
+# Реальный файл вхоста-мишени (listen 127.0.0.1:8444 ssl); код возврата 1, если не найден
+reality_only_vhost_file() {
+  local f
+  f=$(grep -lE "^[[:space:]]*listen[[:space:]]+127\.0\.0\.1:${REALITY_SELF_TARGET_PORT}[[:space:]]+ssl" /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf 2>/dev/null | head -n1 || true)
+  [[ -n "$f" ]] || return 1
+  readlink -f "$f"
+}
+
+# Включает h2 в файле вхоста (идемпотентно, без перезагрузки nginx). $1=файл. 0 = h2 в файле есть
+nginx_vhost_http2_patch() {
+  local file="$1" port="${2:-$REALITY_SELF_TARGET_PORT}"
+  [[ -f "$file" ]] || return 1
+  if grep -qE "^[[:space:]]*listen[[:space:]]+127\.0\.0\.1:${port}[[:space:]]+ssl[[:space:]]+http2;" "$file" \
+     || grep -qE "^[[:space:]]*http2[[:space:]]+on;" "$file"; then
+    return 0
+  fi
+  if nginx_http2_directive_ok; then
+    sed -i -E "/^[[:space:]]*listen[[:space:]]+127\.0\.0\.1:${port}[[:space:]]+ssl;/a\\    http2 on;" "$file"
+  else
+    sed -i -E "s#^([[:space:]]*listen[[:space:]]+127\.0\.0\.1:${port}[[:space:]]+ssl);#\1 http2;#" "$file"
+  fi
+  grep -qE "^[[:space:]]*listen[[:space:]]+127\.0\.0\.1:${port}[[:space:]]+ssl[[:space:]]+http2;" "$file" \
+    || grep -qE "^[[:space:]]*http2[[:space:]]+on;" "$file"
+}
+
+# Версия протокола ответа "код/версия" по прямому запросу к вхосту 127.0.0.1:8444 (h2: 200/2)
+reality_only_h2_local_probe() { # [--http1.1|--http2]
+  curl -sk "${1:---http2}" -m 8 -o /dev/null -w "%{http_code}/%{http_version}" --resolve "${REALITY_DOMAIN}:${REALITY_SELF_TARGET_PORT}:127.0.0.1" "https://${REALITY_DOMAIN}:${REALITY_SELF_TARGET_PORT}/" 2>/dev/null || echo "000/0"
+}
+
+# Снаружи через публичный IP:443 (nginx stream -> xray Reality как зонд -> вхост 8444): "код/версия"
+reality_only_h2_public_probe() {
+  curl -sk "${1:---http2}" -m 10 -o /dev/null -w "%{http_code}/%{http_version}" --resolve "${REALITY_DOMAIN}:443:${SERVER_IP}" "https://${REALITY_DOMAIN}/" 2>/dev/null || echo "000/0"
+}
+
+# Включает h2 на вхосте-мишени работающего Reality-only сервера: бэкап файла, nginx -t, reload, проверка
+# h2 локально и снаружи + самотест Reality-клиента; при провале файл возвращается. Нужны REALITY_DOMAIN, SERVER_IP, XUIDB.
+# Возврат: 0 = h2 работает; 1 = не удалось (всё возвращено).
+reality_only_h2_enable() {
+  local vf bak stamp tid h2l h2p h1p row
+  vf=$(reality_only_vhost_file || true)
+  if [[ -z "$vf" ]]; then
+    echo "h2: вхост 127.0.0.1:${REALITY_SELF_TARGET_PORT} (ssl) не найден в /etc/nginx/sites-enabled — ничего не меняю."
+    return 1
+  fi
+  if grep -qE "^[[:space:]]*listen[[:space:]]+127\.0\.0\.1:${REALITY_SELF_TARGET_PORT}[[:space:]]+ssl[[:space:]]+http2;" "$vf" || grep -qE "^[[:space:]]*http2[[:space:]]+on;" "$vf"; then
+    h2p=$(reality_only_h2_public_probe --http2)
+    echo "h2 уже включён в ${vf}; снаружи: ${h2p}"
+    [[ "$h2p" == "200/2" ]]
+    return
+  fi
+  if ! nginx -t >/dev/null 2>&1; then
+    echo "h2: nginx -t не проходит ещё до правки — сначала почини nginx. Ничего не изменено."
+    return 1
+  fi
+  stamp=$(date +%Y%m%d-%H%M%S)
+  mkdir -p "$REALITY_ONLY_DIR"; chmod 700 "$REALITY_ONLY_DIR"
+  bak="${REALITY_ONLY_DIR}/$(basename "$vf").pre-h2-${stamp}"
+  cp -a "$vf" "$bak" || { echo "h2: не сохранён бэкап ${vf}. Ничего не изменено."; return 1; }
+  # на время правки: при сигнале вернуть файл (reload после этого не нужен — nginx ещё не перечитывал)
+  trap 'cp -a "'"$bak"'" "'"$vf"'" 2>/dev/null; trap - INT TERM HUP; exit 130' INT TERM HUP
+  if ! nginx_vhost_http2_patch "$vf" "$REALITY_SELF_TARGET_PORT" || ! nginx -t >/dev/null 2>&1; then
+    cp -a "$bak" "$vf"; trap - INT TERM HUP
+    echo "h2: правка вхоста не прошла nginx -t — файл возвращён."
+    return 1
+  fi
+  if ! systemctl reload nginx; then
+    cp -a "$bak" "$vf"; systemctl reload nginx >/dev/null 2>&1 || true; trap - INT TERM HUP
+    echo "h2: nginx reload не удался — файл возвращён."
+    return 1
+  fi
+  sleep 1
+  h2l=$(reality_only_h2_local_probe --http2)
+  h2p=$(reality_only_h2_public_probe --http2)
+  h1p=$(reality_only_h2_public_probe --http1.1)
+  echo "h2: локально ${h2l}; снаружи по h2 ${h2p}; снаружи по http/1.1 ${h1p}"
+  tid=$(sqlite3 "$XUIDB" "SELECT id FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  row=""
+  [[ "$tid" =~ ^[0-9]+$ ]] && row=$(reality_only_first_client "$tid")
+  if [[ "$h2l" != "200/2" || "$h2p" != "200/2" || "$h1p" != "200/1.1" ]] || ! reality_only_selftest "$row" >/dev/null 2>&1; then
+    cp -a "$bak" "$vf"; systemctl reload nginx >/dev/null 2>&1 || true; trap - INT TERM HUP
+    echo "h2: проверка не прошла (ожидалось 200/2, 200/2, 200/1.1 и рабочий Reality-клиент) — файл возвращён, nginx перезагружен."
+    return 1
+  fi
+  trap - INT TERM HUP
+  echo "h2: включён на 127.0.0.1:${REALITY_SELF_TARGET_PORT}; бэкап ${bak}. Откат: cp -a ${bak} ${vf} && nginx -t && systemctl reload nginx"
+  return 0
+}
+
 REALITY_ONLY_ROLLBACK_ARMED=0
 RO_DB_BAK=""; RO_CONF_BAK=""; RO_STREAM_CONF=""; RO_FRONT=0
 reality_only_rollback() { # причина
@@ -2284,6 +2388,8 @@ cmd_reality_only() {
   REALITY_ONLY_ROLLBACK_ARMED=0
   trap - INT TERM HUP
   trap lucx_xui_guard_fire EXIT
+  echo "h2 на вхосте-мишени (nginx):"
+  reality_only_h2_enable || echo "  ВНИМАНИЕ: h2 не включён (схема Reality-only работает); повтор: sudo bash $0 add-h2"
   echo "$VERSION" > /root/.lucx-script-version
   if [[ -f "$CREDS_FILE" ]]; then
     {
@@ -2327,6 +2433,11 @@ cmd_add_h2() {
     exit 1
   fi
   sec=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.security') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  if [[ "$sec" == "reality" ]]; then
+    # v0.7.0: Reality-only — h2 включается в nginx-вхосте-мишени 127.0.0.1:8444, xray не трогается
+    if reality_only_h2_enable; then exit 0; fi
+    exit 1
+  fi
   if [[ "$sec" != "tls" ]]; then
     echo "ОШИБКА: инбаунд 127.0.0.1:443 в режиме '${sec:-?}', h2 включается только в TLS-режиме."
     exit 1
@@ -5522,6 +5633,11 @@ server {
     location / { try_files \$uri \$uri/ =404; }
 }
 EOF
+  # v0.7.0: Reality-only — вхост-мишень отвечает по h2 (TLS заканчивается в nginx)
+  if [[ "$VLESS_MODE" == "reality" ]]; then
+    nginx_vhost_http2_patch "/etc/nginx/sites-available/${REALITY_DOMAIN}.conf" "$REALITY_DECOY_INTERNAL_PORT" \
+      || echo "WARN: h2 на вхосте 127.0.0.1:${REALITY_DECOY_INTERNAL_PORT} не включён — сайт-заглушка будет только по http/1.1."
+  fi
 
   # v0.4.0: plain-HTTP фасад decoy №2 (:8080, loopback) — цель fallback'а TLS-режима
   ensure_decoy2_http_vhost || exit 1
@@ -6624,6 +6740,12 @@ cmd_healthcheck() {
         check "Reality-only: зонд без ключа получает билеты сессии TLS1.3 (${hc_tk}) — отвечает nginx" ok
       else
         check "Reality-only: зонд без ключа не получил билетов сессии TLS1.3 — похоже на Go-TLS xray, а не nginx (проверь target/upstream)" warn
+      fi
+      hc_h2=$(curl -sk --http2 -m 10 -o /dev/null -w "%{http_code}/%{http_version}" --resolve "${REALITY_DOMAIN}:443:${hc_ip}" "https://${REALITY_DOMAIN}/" 2>/dev/null || echo "000/0")
+      if [[ "$hc_h2" == "200/2" ]]; then
+        check "Reality-only: сайт ${REALITY_DOMAIN} снаружи отвечает по h2 (ALPN h2 согласуется)" ok
+      else
+        check "Reality-only: сайт ${REALITY_DOMAIN} снаружи без h2 (${hc_h2}) — зонд видит только http/1.1. Лечение: sudo bash $0 add-h2" warn
       fi
     fi
   else
@@ -9715,6 +9837,7 @@ case "${1:-install}" in
     echo "  sudo bash $0 add-hy2       — добавить Hysteria 2 на существующий сервер"
     echo "  sudo bash $0 add-h2        — включить h2 в TLS-инбаунде (alpn + fallback на h2c :8081;"
     echo "                               бэкап БД, самотест, автооткат)"
+    echo "                               на Reality-only (0.7.0): включает http2 на nginx-вхосте :8444, xray не трогается)"
     echo "  sudo bash $0 reality-only  — убрать TLS-инбаунд xray: 443 = только Reality (Vision), снаружи отвечает nginx;"
     echo "                               клиенты и ключи Reality-front переносятся; бэкап, самотест, автооткат; status — только чтение"
     echo "  sudo bash $0 add-reality-front — Reality перед TLS на том же домене/443 (без 3-го домена;"

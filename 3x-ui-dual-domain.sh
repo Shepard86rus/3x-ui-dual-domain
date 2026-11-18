@@ -1001,7 +1001,23 @@
 #   healthcheck [7a]: проверка «сайт снаружи отвечает по h2». Клиентам Reality h2 на nginx не нужен (они идут внутри туннеля).
 #   Панельное имя (вхост 127.0.0.1:8443, ssl proxy_protocol) получает h2 тем же путём (panel_h2_enable): проверка, что заглушка и страница
 #   входа отвечают и по h2, и по http/1.1 одним кодом; WebSocket панели браузеры открывают отдельным http/1.1-соединением. XHTTP-вхост уже с h2.
-VERSION="0.7.0"
+# v0.7.1 (2026-11-18): DBIP-СТРАЖ — зеркала для гео-баз панели (dbip-*-lite.mmdb).
+#   СЛУЧАЙ: при установке новой ноды 18.11 панель не смогла скачать dbip-asn-lite.mmdb и
+#   dbip-city-lite.mmdb — download.db-ip.com лежал ЦЕЛИКОМ (проверено из двух независимых
+#   сетей, 000 даже на главную). Панель качает их только оттуда; без файлов пустует
+#   гео-инфо IP в панели (провайдер/город). VPN/Reality/подписки НЕ зависят — файлы
+#   вспомогательные. РЕШЕНИЕ: ensure_dbip() — вызывается рядом с ensure_geodata во всех
+#   режимах (install/add-*), идемпотентна: панели нет → тихий выход; файлы есть (или
+#   лежат GeoLite2-*.mmdb — их панель берёт в приоритете) → ничего не делает; нет —
+#   качает те же DB-IP базы с GitHub-зеркала sapics/ip-location-db (готовые mmdb,
+#   без .gz; city-зеркало ipv4-only: город для IPv6-клиентов определится после
+#   первого успешного самообновления панели с живого db-ip.com), 3 попытки с
+#   докачкой (-C -; city ~62 МБ), через .part+mv (atomic). При провале — только предупреждение
+#   с готовой curl-строкой (как гео-страж v0.4.2: не останавливаем установку).
+#   healthcheck [6]: новая проверка наличия mmdb (ok/warn — на итог не влияет; warn
+#   подсказывает зеркальные ссылки). Прямых правок панели нет: при живом db-ip.com
+#   панель обновит файлы сама, наши копии просто перезапишутся свежими.
+VERSION="0.7.1"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -1343,6 +1359,52 @@ ensure_geodata() {
   return 0
 }
 
+# v0.7.1: DBIP-СТРАЖ — гео-базы панели (dbip-*-lite.mmdb) с зеркала, когда
+# download.db-ip.com лежит (случай 18.11: свежая нода, «download failed» при
+# установке). Идемпотентен и ничего не ломает: панель при живом db-ip.com
+# обновит файлы сама — наши копии просто перезапишутся свежими.
+ensure_dbip() {
+  local dbip_bin="/usr/local/x-ui/bin"
+  [[ -d "$dbip_bin" ]] || return 0  # панель не установлена — лечить нечего
+  local -a dlist=(
+    "dbip-asn-lite.mmdb|https://github.com/sapics/ip-location-db/releases/download/latest/dbip-asn.mmdb"
+    "dbip-city-lite.mmdb|https://github.com/sapics/ip-location-db/releases/download/latest/dbip-city-ipv4.mmdb"
+  )
+  local entry dfile durl dok dto
+  for entry in "${dlist[@]}"; do
+    dfile="${entry%%|*}"
+    durl="${entry#*|}"
+    if [[ -s "${dbip_bin}/${dfile}" ]]; then
+      continue
+    fi
+    # панель также принимает GeoLite2-*.mmdb и берёт их в приоритете — уже есть? тогда ок
+    case "$dfile" in
+      dbip-asn-lite.mmdb)  [[ -s "${dbip_bin}/GeoLite2-ASN.mmdb" ]] && continue ;;
+      dbip-city-lite.mmdb) [[ -s "${dbip_bin}/GeoLite2-City.mmdb" ]] && continue ;;
+    esac
+    # city ~62 МБ (аудит Ж-2): таймаут выше + докачка -C - между попытками
+    dto=600
+    [[ "$dfile" == "dbip-city-lite.mmdb" ]] && dto=1800
+    echo "  DBIP-страж: ${dfile} отсутствует — качаю с зеркала (GitHub sapics/ip-location-db, 3 попытки с докачкой)..."
+    dok=0
+    for _ in 1 2 3; do
+      if curl -fL -C - --max-time "$dto" -o "${dbip_bin}/${dfile}.part" "$durl" 2>/dev/null; then
+        dok=1
+        break
+      fi
+      sleep 5
+    done
+    if [[ "$dok" == "1" ]] && mv -f "${dbip_bin}/${dfile}.part" "${dbip_bin}/${dfile}" 2>/dev/null; then
+      echo "  DBIP-страж: ${dfile} на месте (зеркало)"
+    else
+      rm -f "${dbip_bin}/${dfile}.part"
+      echo "  ВНИМАНИЕ: ${dfile} не скачался (гео-инфо IP в панели будет пустовать; на VPN не влияет). Вручную:"
+      echo "    curl -fL -o ${dbip_bin}/${dfile} '${durl}'"
+    fi
+  done
+  return 0
+}
+
 # ================== HY2: общая функция создания инбаунда ==================
 # v0.3.1: используется и полным install ([10a]), и режимом retrofit add-hy2.
 # Схема stream_settings/settings снята дампом с рабочей БД lucx-ui .246
@@ -1498,6 +1560,7 @@ cmd_add_hy2() {
     exit 1
   fi
   ensure_geodata
+  ensure_dbip
   for f in "/etc/letsencrypt/live/${REALITY_DOMAIN}/fullchain.pem" "/etc/letsencrypt/live/${REALITY_DOMAIN}/privkey.pem"; do
     if [[ ! -f "$f" ]]; then
       echo "ОШИБКА: сертификат ${f} не найден."
@@ -2682,6 +2745,7 @@ cmd_switch_mode() {
     exit 1
   fi
   ensure_geodata
+  ensure_dbip
 
   local cur_sec uuid
   cur_sec=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.security') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
@@ -3875,6 +3939,8 @@ cmd_install() {
   # v0.4.2: гео-страж — lucx_fetch_geofiles может недополучить файлы (404 на
   # geoip_RU.dat замечен дважды), а без geoip_RU.dat xray не стартует
   ensure_geodata
+  # v0.7.1: dbip-страж — mmdb-базы панели с зеркала (db-ip.com лежит — случай 18.11)
+  ensure_dbip
 
   # CLAUDE-FIX: install.sh запускает x-ui через systemd, но не ждёт
   # создания SQLite-файла. Если в момент проверки [[ -f "$XUIDB" ]]
@@ -6681,6 +6747,17 @@ cmd_healthcheck() {
     fi
   else
     check "Пропущено: IP не определён" warn
+  fi
+  # v0.7.1: dbip-страж — mmdb-базы панели (гео-инфо IP: провайдер/город). VPN от них
+  # не зависит; при живом db-ip.com панель качает их сама. Нет (а db-ip.com лежит) —
+  # зеркалим (install/add-* уже кладут через ensure_dbip; вручную — строки ниже).
+  if [[ -s /usr/local/x-ui/bin/dbip-asn-lite.mmdb || -s /usr/local/x-ui/bin/GeoLite2-ASN.mmdb ]] \
+     && [[ -s /usr/local/x-ui/bin/dbip-city-lite.mmdb || -s /usr/local/x-ui/bin/GeoLite2-City.mmdb ]]; then
+    check "Панель: гео-базы IP (mmdb: asn+city) на месте" ok
+  elif [[ -s /usr/local/x-ui/bin/dbip-asn-lite.mmdb || -s /usr/local/x-ui/bin/GeoLite2-ASN.mmdb ]]; then
+    check "Панель: mmdb только asn, city отсутствует — город по IP не покажет (VPN не зависит). Доставить: sudo bash $0 add-hy2 (dbip-страж доложит) или зеркало sapics/ip-location-db" warn
+  else
+    check "Панель: нет dbip-*-lite.mmdb — гео-инфо IP в панели пустует (VPN не зависит). Доставить: sudo bash $0 add-hy2 (dbip-страж доложит) или зеркало sapics/ip-location-db" warn
   fi
   echo
 

@@ -1017,7 +1017,12 @@
 #   healthcheck [6]: новая проверка наличия mmdb (ok/warn — на итог не влияет; warn
 #   подсказывает зеркальные ссылки). Прямых правок панели нет: при живом db-ip.com
 #   панель обновит файлы сама, наши копии просто перезапишутся свежими.
-VERSION="0.7.1"
+# v0.7.2 (2026-11-19): ХОТФИКС подсказки healthcheck [6] (по замечанию владельца).
+#   WARN «нет dbip-*-lite.mmdb» советовал доставить базы командой add-hy2 — ОШИБКА:
+#   add-hy2 — retrofit-команда (добавить hy2 на серверы, поставленные до v0.3.1),
+#   на живой ноде она трогает hy2-инбаунд, а не качает файлы. Правильная подсказка —
+#   зеркальные curl-строки (те же, что печатает ensure_dbip) — теперь в тексте WARN.
+VERSION="0.7.2"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -6755,9 +6760,9 @@ cmd_healthcheck() {
      && [[ -s /usr/local/x-ui/bin/dbip-city-lite.mmdb || -s /usr/local/x-ui/bin/GeoLite2-City.mmdb ]]; then
     check "Панель: гео-базы IP (mmdb: asn+city) на месте" ok
   elif [[ -s /usr/local/x-ui/bin/dbip-asn-lite.mmdb || -s /usr/local/x-ui/bin/GeoLite2-ASN.mmdb ]]; then
-    check "Панель: mmdb только asn, city отсутствует — город по IP не покажет (VPN не зависит). Доставить: sudo bash $0 add-hy2 (dbip-страж доложит) или зеркало sapics/ip-location-db" warn
+    check "Панель: mmdb только asn, city отсутствует — город по IP не покажет (VPN не зависит). Доставить с зеркала (не трогая ноду): curl -fL -o /usr/local/x-ui/bin/dbip-city-lite.mmdb https://github.com/sapics/ip-location-db/releases/download/latest/dbip-city-ipv4.mmdb" warn
   else
-    check "Панель: нет dbip-*-lite.mmdb — гео-инфо IP в панели пустует (VPN не зависит). Доставить: sudo bash $0 add-hy2 (dbip-страж доложит) или зеркало sapics/ip-location-db" warn
+    check "Панель: нет dbip-*-lite.mmdb — гео-инфо IP в панели пустует (VPN не зависит). Доставить с зеркала (не трогая ноду; см. docs/troubleshooting.md: dbip download failed)" warn
   fi
   echo
 

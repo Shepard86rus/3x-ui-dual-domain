@@ -9,8 +9,16 @@ ENV_FILE="/etc/tgbot/env"                 # TOKEN=..., CHAT_ID=... (пусто =
 [ -f "$ENV_FILE" ] && . "$ENV_FILE"
 NODES_FILE="${TGBOT_NODES:-/etc/tgbot/nodes.conf}"
 KEY="${TGBOT_KEY:-/opt/tgbot/.ssh/id_ed25519}"
+[[ "${1:-}" = "selftest" ]] || { exec 9>/run/tgbot-hub.lock; flock -n 9 || exit 0; }
 API="https://api.telegram.org/bot${TOKEN:-}"
+BOT_ID="${TOKEN%%:*}"
+OFF_FILE="/var/lib/tgbot/offset"
 OFFSET=0
+mkdir -p /var/lib/tgbot
+if [ -f "$OFF_FILE" ]; then
+  read -r oid oval < "$OFF_FILE" || true
+  if [ "${oid:-}" = "$BOT_ID" ] && [[ "${oval:-}" =~ ^[0-9]+$ ]]; then OFFSET="$oval"; fi
+fi
 ASK_CMD=''; ASK_NODE=''; ASK_TS=0
 HUB_CL=''; [ -f /opt/tgbot/hub-clients.sh ] && . /opt/tgbot/hub-clients.sh && HUB_CL=1
 TMP=$(mktemp -d)
@@ -18,9 +26,15 @@ trap 'rm -rf "$TMP"' EXIT
 
 esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' <<<"$1"; }
 
-api_post() { # $1 метод, $2.. пары key=value (--data-urlencode)
+api_post() { # $1 метод, $2.. пары key=value (--data-urlencode); сбои -> journal
   local m="$1"; shift
-  curl -s --max-time 30 -X POST "$API/$m" "$@"
+  local r rc
+  r=$(printf 'url = "%s/%s"\n' "$API" "$m" | curl -s --max-time 30 -X POST -K - "$@")
+  rc=$?
+  if [ $rc -ne 0 ] || ! jq -e '.ok==true' <<<"$r" >/dev/null 2>&1; then
+    logger -t tgbot-hub "api_post $m ОШИБКА rc=$rc: $(head -c 200 <<<"$r" | tr '\n' ' ')"
+  fi
+  printf '%s' "$r"
 }
 send_txt() { # $1 chat, $2 text — БЕЗ parse_mode (живой вывод сервера)
   api_post sendMessage -d chat_id="$1" --data-urlencode "text=$2" >/dev/null
@@ -222,7 +236,7 @@ on_callback() { # $1 = callback_query json
   fid=$(jq -r '.from.id // empty' <<<"$1")
   mid=$(jq -r '.message.message_id // empty' <<<"$1")
   data=$(jq -r '.data // empty' <<<"$1")
-  if [ -z "$cid" ] || [ "$cid" != "${CHAT_ID:-}" ] || [ "$fid" != "${CHAT_ID:-}" ]; then answer "$cbid" 'нет доступа'; return; fi
+  if [ -z "$cid" ] || [ "$cid" != "${CHAT_ID:-}" ] || [ "$fid" != "${CHAT_ID:-}" ]; then logger -t tgbot-hub "DENY callback fid=${fid:-?} data=${data:-?}"; answer "$cbid" 'нет доступа'; return; fi
   case "$data" in
     menu)
       answer "$cbid" ''
@@ -238,14 +252,14 @@ on_callback() { # $1 = callback_query json
       ;;
     node:*)
       a=${data#node:}
-      case "$a" in no[0-9]) ;; *) answer "$cbid" 'нет такой ноды'; return ;; esac
+      case "$a" in no[0-9]|no[0-9][0-9]) ;; *) answer "$cbid" 'нет такой ноды'; return ;; esac
       node_exists "$a" || { answer "$cbid" 'нет такой ноды'; return; }
       answer "$cbid" ''
       edit_card "$cid" "$mid" "🖥 <b>$(esc "$(node_name "$a")")</b> ($a) — выбери действие:" "$(kb_node "$a")"
       ;;
     cmd:*)
       a=$(cut -d: -f2 <<<"$data"); c=$(cut -d: -f3 <<<"$data")
-      case "$a" in no[0-9]) ;; *) answer "$cbid" 'нет такой ноды'; return ;; esac
+      case "$a" in no[0-9]|no[0-9][0-9]) ;; *) answer "$cbid" 'нет такой ноды'; return ;; esac
       case "$c" in status|versions|disk|log|backup|hc) ;; *) answer "$cbid" 'неизвестная команда'; return ;; esac
       node_exists "$a" || { answer "$cbid" 'нет такой ноды'; return; }
       if [ "$c" = 'hc' ]; then answer "$cbid" 'гоняю healthcheck, ~1-2 мин…'; else answer "$cbid" 'выполняю…'; fi
@@ -257,7 +271,7 @@ $out"
       ;;
     ask:*)
       a=$(cut -d: -f2 <<<"$data"); c=$(cut -d: -f3 <<<"$data")
-      case "$a" in no[0-9]) ;; *) answer "$cbid" 'нет такой ноды'; return ;; esac
+      case "$a" in no[0-9]|no[0-9][0-9]) ;; *) answer "$cbid" 'нет такой ноды'; return ;; esac
       case "$c" in restart_panel|restart_xray|upgrade) ;; *) answer "$cbid" 'неизвестная команда'; return ;; esac
       node_exists "$a" || { answer "$cbid" 'нет такой ноды'; return; }
       ASK_CMD="$c"; ASK_NODE="$a"; ASK_TS=$(date +%s)
@@ -272,6 +286,7 @@ $out"
     yes:*)
       a=$(cut -d: -f2 <<<"$data"); c=$(cut -d: -f3 <<<"$data")
       if [ "$a" = "$ASK_NODE" ] && [ "$c" = "$ASK_CMD" ] && [ $(( $(date +%s) - ASK_TS )) -le 120 ]; then
+        logger -t tgbot-hub "EXEC $a $c — подтверждено владельцем"
         answer "$cbid" 'выполняю…'
         out=$(rrun "$a" "$(remote_snippet "$c")")
         [ -z "$out" ] && out='пустой ответ'
@@ -349,12 +364,22 @@ fi
 
 # ---- главный цикл ----------------------------------------------------------
 while true; do
-  resp=$(curl -s --max-time 40 "$API/getUpdates?timeout=30&offset=$OFFSET") || { sleep 5; continue; }
+  resp=$(printf 'url = "%s/getUpdates?timeout=30&offset=%s"\n' "$API" "$OFFSET" | curl -s --max-time 40 -K -) || { logger -t tgbot-hub "getUpdates: сбой curl rc=$?"; sleep 5; continue; }
+  if ! jq -e '.ok==true' <<<"$resp" >/dev/null 2>&1; then
+    logger -t tgbot-hub "getUpdates: API ok=false: $(head -c 200 <<<"$resp" | tr '\n' ' ')"
+    sleep 5; continue
+  fi
   n=$(jq '.result | length' <<<"$resp" 2>/dev/null) || n=0
   i=0
   while [ "$i" -lt "$n" ]; do
     upd=$(jq -c ".result[$i]" <<<"$resp" 2>/dev/null)
     OFFSET=$(jq -r '.update_id + 1' <<<"$upd" 2>/dev/null)
+    printf '%s %s\n' "$BOT_ID" "$OFFSET" > "$OFF_FILE" 2>/dev/null
+    udate=$(jq -r 'if .callback_query then 0 else (.message.date // 0) end' <<<"$upd" 2>/dev/null)
+    if [[ "$udate" =~ ^[0-9]+$ ]] && [ "$udate" -gt 0 ] && [ $(( $(date +%s) - udate )) -gt 120 ]; then
+      logger -t tgbot-hub "пропущен устаревший апдейт (возраст $(( $(date +%s) - udate ))с)"
+      i=$((i + 1)); continue
+    fi
     if jq -e '.callback_query != null' <<<"$upd" >/dev/null 2>&1; then
       on_callback "$(jq -c '.callback_query' <<<"$upd")"
     else

@@ -58,7 +58,7 @@ cl_fmt_exp() { # $1 мс
   TZ="$CLIENT_TZ" date -d "@$(( $1 / 1000 ))" '+%d.%m.%Y %H:%M'
 }
 cl_reset() { CL_STATE=''; CL_NODE=''; CL_NAME=''; CL_LIMIT=0; CL_EXP=0; CL_DEL=''; CL_IDS=''; }
-cl_valid_node() { case "$1" in no[0-9]) node_exists "$1" ;; *) return 1 ;; esac; }
+cl_valid_node() { case "$1" in no[0-9]|no[0-9][0-9]) node_exists "$1" ;; *) return 1 ;; esac; }
 
 kb_cl_limit() { jq -nc '{inline_keyboard:[[{text:"1",callback_data:"cl:lim:1"},{text:"2",callback_data:"cl:lim:2"},{text:"3",callback_data:"cl:lim:3"},{text:"5",callback_data:"cl:lim:5"},{text:"без лимита",callback_data:"cl:lim:0"}],[{text:"❌ Отмена",callback_data:"cl:cancel"}]]}'; }
 kb_cl_exp() { jq -nc '{inline_keyboard:[[{text:"+30 дн",callback_data:"cl:exp:30"},{text:"+90 дн",callback_data:"cl:exp:90"},{text:"+365 дн",callback_data:"cl:exp:365"}],[{text:"без срока",callback_data:"cl:exp:0"},{text:"✍ ввести дату",callback_data:"cl:exp:man"}],[{text:"❌ Отмена",callback_data:"cl:cancel"}]]}'; }
@@ -96,6 +96,7 @@ cl_do_create() { # $1 chat
   r=$(cl_rrun "$CL_NODE" add "$b64")
   j=$(cl_json "$r")
   if [ -n "$j" ] && jq -e '.success==true' <<<"$j" >/dev/null 2>&1 && cl_exists "$CL_NODE" "$CL_NAME"; then
+    logger -t tgbot-hub "CLIENT ADD $CL_NODE $CL_NAME lim=$CL_LIMIT exp=$CL_EXP"
     suburi=$(grep -m1 '^SUB=' <<<"$r" | cut -d= -f2-)
     send_txt "$1" "[$(node_name "$CL_NODE")] ✅ Клиент $CL_NAME создан (срок: $(cl_fmt_exp "$CL_EXP"), лимит IP: $CL_LIMIT).
 Подписка (одна ссылка — все протоколы):
@@ -110,6 +111,7 @@ cl_do_delete() { # $1 chat
   r=$(cl_rrun "$CL_NODE" del "$CL_DEL")
   j=$(cl_json "$r")
   if [ -n "$j" ] && jq -e '.success==true' <<<"$j" >/dev/null 2>&1 && ! cl_exists "$CL_NODE" "$CL_DEL"; then
+    logger -t tgbot-hub "CLIENT DEL $CL_NODE $CL_DEL"
     send_txt "$1" "[$(node_name "$CL_NODE")] 🗑 Клиент $CL_DEL удалён."
   else
     send_txt "$1" "[$(node_name "$CL_NODE")] ОШИБКА удаления $CL_DEL: $(cl_err "$r")"

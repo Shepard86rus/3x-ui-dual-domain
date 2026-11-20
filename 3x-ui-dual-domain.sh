@@ -1062,6 +1062,11 @@
 #   Отдельно (самопроверка): разбор вывода sqlite3 в bk_verify_xray_core ведётся
 #   через IFS='|' — sqlite3 разделяет колонки пайпом, без этого проверка портов
 #   молча пропускала все инбаунды и всегда «проходила».
+#   Третья итерация по повторному аудиту:
+#   В13 — покрытием ufw считаются только ВХОДЯЩИЕ правила: ALLOW/LIMIT без
+#   направления или с IN; «ALLOW OUT»/«ALLOW FWD» входящие не разрешают и
+#   больше не засчитываются (симметрично уточнена диагностика DENY/REJECT и
+#   проверка портов из .lucx-public-*-ports.txt).
 VERSION="0.7.4"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
@@ -9731,13 +9736,19 @@ cmd_restore() {
   command -v ufw >/dev/null 2>&1 && rst_ufw=$(ufw status 2>/dev/null || true)
   if grep -q '^Status: active' <<<"$rst_ufw"; then
     for p in $ports_ok; do
-      # v0.7.4 (В10): покрытием считаем ТОЛЬКО IPv4-разрешение (ALLOW/LIMIT): DENY/REJECT
-      # и правило «только v6» порт снаружи не открывают
-      if grep -qE "^${p}/udp[[:space:]]+(ALLOW|LIMIT)\b" <<<"$rst_ufw"; then
+      # v0.7.4 (В10/В13): покрытием считаем ТОЛЬКО входящее IPv4-разрешение — ALLOW/LIMIT
+      # без направления или с IN: правила «ALLOW OUT»/«ALLOW FWD» и «только v6» порт снаружи
+      # не открывают (возможна колонка «on <iface>» между портом и действием; ERE без
+      # lookahead, поэтому направление отсекаем вторым grep)
+      local uact="^${p}/udp([[:space:]]+on[[:space:]]+[^[:space:]]+)?[[:space:]]+"
+      if grep -qE "${uact}(ALLOW|LIMIT)\b" <<<"$rst_ufw" \
+         && ! grep -qE "${uact}(ALLOW|LIMIT)[[:space:]]+(OUT|FWD)\b" <<<"$rst_ufw"; then
         : # правило уже есть (install или прошлый restore) — не наше, откатом не снимаем
       else
-        grep -qE "^${p}/udp[[:space:]]+(DENY|REJECT)\b" <<<"$rst_ufw" && \
-          bk_say "  ВНИМАНИЕ: для ${p}/udp уже есть запрещающее правило ufw (DENY/REJECT) — оно старше, ALLOW его не перекроет: ufw delete deny ${p}/udp"
+        if grep -qE "${uact}(DENY|REJECT)\b" <<<"$rst_ufw" \
+           && ! grep -qE "${uact}(DENY|REJECT)[[:space:]]+(OUT|FWD)\b" <<<"$rst_ufw"; then
+          bk_say "  ВНИМАНИЕ: для ${p}/udp уже есть входящее запрещающее правило ufw (DENY/REJECT) — оно старше, ALLOW его не перекроет: ufw delete deny ${p}/udp"
+        fi
         if ufw allow "${p}/udp" >/dev/null 2>&1; then
           BK_ADDED_UFW+="${p}/udp "
           bk_say "ufw: ${p}/udp открыт (порт AWG из архива)"
@@ -9789,7 +9800,9 @@ cmd_restore() {
       while IFS= read -r pnum || [[ -n "$pnum" ]]; do
         pnum="${pnum%%#*}"; pnum="$(tr -d '[:space:]' <<<"$pnum")"
         [[ "$pnum" =~ ^[0-9]+$ ]] || continue
-        grep -qE "^${pnum}(/${pproto})?([[:space:]]+on[[:space:]]+[^[:space:]]+)?[[:space:]]+(ALLOW|LIMIT)" <<<"$pufw" || pmiss+="${pnum}/${pproto} "
+        grep -qE "^${pnum}(/${pproto})?([[:space:]]+on[[:space:]]+[^[:space:]]+)?[[:space:]]+(ALLOW|LIMIT)\b" <<<"$pufw" \
+          && ! grep -qE "^${pnum}(/${pproto})?([[:space:]]+on[[:space:]]+[^[:space:]]+)?[[:space:]]+(ALLOW|LIMIT)[[:space:]]+(OUT|FWD)\b" <<<"$pufw" \
+          || pmiss+="${pnum}/${pproto} "
       done < "$pf"
     done
     [[ -n "$pmiss" ]] && bk_say "  ВНИМАНИЕ: порты из ${pf%/*}/.lucx-public-*-ports.txt без правила ufw ALLOW: ${pmiss}— снаружи они закрыты; откройте: ufw allow <порт>/tcp (или /udp)."

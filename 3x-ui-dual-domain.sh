@@ -1069,7 +1069,44 @@
 #   не отменяют входящее правило из ДРУГОЙ строки того же порта; входящий
 #   DENY/REJECT не гасится запретами других направлений. Та же построчная
 #   классификация применена к проверке портов из .lucx-public-*-ports.txt.
-VERSION="0.7.4"
+# v0.7.5 (2026-11-21): харденинг мутаторов схемы по независимому аудиту
+#   (находки В2/В3/В4/В5/В9, L4):
+#   В2 — геоданные и dbip скачиваются с проверкой целостности: контрольная
+#   сумма релиза читается ПЕРЕД файлом (3 попытки), файл качается во временный
+#   .part на том же разделе и атомарно подменяется только при совпадении
+#   sha256 (3 попытки, resume для dbip). Сумма недоступна или не сошлась —
+#   файл НЕ устанавливается (rc различает «не скачался»/«нет суммы»). Раньше:
+#   прямая запись в финальный файл без проверок, `-s` не ловил обрыв/подмену.
+#   В3 — switch-mode (add-vls/add-reality и долечка fallback): общий armed
+#   rollback на всё окно после WAL-безопасного снимка — любой сбой (SQL,
+#   запуск x-ui, потерянный listener, сигнал, обрыв SSH) возвращает снимок,
+#   запускает x-ui и проверяет прежний listener 443 ДО завершения команды.
+#   Раньше: ошибки печатали путь бэкапа и выходили, схема оставалась разворочена.
+#   В4 — add-reality-front: armed rollback окна «бэкап stream-конфига ->
+#   самотест» — теперь покрыты и сбой `systemctl reload nginx` (раньше шёл
+#   без проверки), и сигналы/неожиданный выход. Reality-инбаунд в БД при
+#   откате не трогаем (loopback, безвреден — задокументировано).
+#   В5 — remove-xhttp: глобальный rollback (БД + stream-конфиг + вхосты) на
+#   всё окно; удаления из БД объединены в ОДНУ проверяемую транзакцию
+#   (.bail on + BEGIN IMMEDIATE … COMMIT), `|| true` на мутирующем SQL
+#   убраны. Раньше: nginx менялся до БД, DELETE'ы подавляли ошибки, общего
+#   отката не было — возможно смешанное состояние.
+#   В9 — единый замок всех мутаторов БД/схемы/nginx: /var/lock/lucx-scheme.lock
+#   (lucx_scheme_lock) для add-hy2, add-reality-front, reality-only, add-h2,
+#   add-vls/add-reality, rebind-ip, panel-path, add/remove-xhttp и как второй
+#   замок у backup/restore. ВАЖНО: отсутствие flock теперь жёсткий СТОП
+#   (прежняя проверка «command -v flock && exec» молча снимала защиту).
+#   L4 — rebind-ip: armed rollback на короткое окно «правка listen -> подтверждённый
+#   listener»: обрыв SSH/сигналы возвращают прежний stream-конфиг и перезапускают
+#   nginx (на диске не остаётся listen, расходящийся с работающим nginx).
+#   Общий приём откатов — как в reality_only_rollback (v0.6.x): снятие Armed
+#   первой строкой, set +e внутри, журнал хода отката при HUP
+#   (/root/.lucx-mode-backup/*-rollback.log).
+#   Отдельно (самопроверка эмуляцией, 126 проверок): поймано до коммита —
+#   опечатка в имени переменной Armed (SW_/SWITCH_) делала rollback switch-mode
+#   молча нерабочим; в remove-xhttp Armed взводился ПОСЛЕ правок stream —
+#   сбой фазы nginx не откатывался.
+VERSION="0.7.5"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -1354,6 +1391,32 @@ lucx_db_restore() { # src
   mv -f "$tmp" "$XUIDB"
 }
 
+# v0.7.5 (В9): единая блокировка всех мутаторов БД/схемы/nginx. ОДИН замок
+# /var/lock/lucx-scheme.lock на fd 7 (fd 8/9 заняты backup/upgrade): две команды,
+# меняющие схему, больше не могут работать одновременно в любой комбинации.
+# ВАЖНО: отсутствие flock или неудача открытия замка — СТОП (раньше проверка
+# «command -v flock && exec» молча снимала защиту при отсутствии flock).
+lucx_scheme_lock() { # $1=кто берёт (для сообщения)
+  # v0.7.5 (аудит В17): install держит замок на всю установку и вызывает add-xhttp
+  # отдельным процессом — потомок наследует флаг и повторный захват пропускает
+  # (иначе самоблокировка: замок уже принадлежит этому дереву процессов).
+  if [[ "${LUCX_SCHEME_LOCK_HELD:-0}" == "1" ]]; then
+    return 0
+  fi
+  if ! command -v flock >/dev/null 2>&1; then
+    echo "ОШИБКА: утилита flock не найдена — без неё защита от параллельного запуска невозможна."
+    echo "Установи пакет util-linux и повтори $1. Ничего не изменено."
+    exit 1
+  fi
+  if ! exec 7>/var/lock/lucx-scheme.lock; then
+    echo "ОШИБКА: не удалось открыть /var/lock/lucx-scheme.lock — блокировка невозможна. Ничего не изменено."
+    exit 1
+  fi
+  flock -n 7 || { echo "ОШИБКА: сейчас выполняется другая команда, меняющая схему/БД/nginx — дождись её завершения и повтори $1."; exit 1; }
+  LUCX_SCHEME_LOCK_HELD=1
+  export LUCX_SCHEME_LOCK_HELD
+}
+
 # v0.5.5 (С2): параметры Reality-пробы из БД — первый ВКЛЮЧЁННЫЙ неистёкший клиент инбаунда 8446.
 # Возврат 1 (и пустые FRONT_*) = проба невозможна (нет подходящих клиентов).
 lucx_load_front_params() {
@@ -1371,6 +1434,38 @@ lucx_load_front_params() {
 # 404 на geoip_RU.dat дефолтный конфиг панели делает xray нерабочим (см.
 # changelog v0.4.2). Эта функция проверяет 4 ключевых .dat и докачивает
 # недостающие; никогда не валит скрипт — в худшем случае печатает ВНИМАНИЕ.
+# v0.7.5 (В2): проверенная загрузка. Файл качается во временный .part на той же ФС,
+# сверяется с опубликованной sha256 из того же репозитория и только потом атомарно
+# mv в рабочее имя: обрыв/подмена не оставляют повреждённый рабочий файл, а следующий
+# запуск не примет его за готовый по «-s». Сумма = и проверка формата (у .dat/mmdb
+# нет магического заголовка). $1=url файла, $2=url суммы, $3=куда, $4=таймаут,
+# $5=1 — докачка -C - между попытками (большие файлы). Коды: 0 — на месте (сумма
+# сошлась), 1 — не скачался/сумма не сошлась, 2 — сумму получить не удалось.
+lucx_fetch_verified() {
+  local url="$1" sumurl="$2" dest="$3" tmo="${4:-300}" resume="${5:-0}"
+  local part="${dest}.part" want="" got try
+  local -a copt=()
+  rm -f "$part"
+  for try in 1 2 3; do
+    want=$(curl -fL --max-time 30 "$sumurl" 2>/dev/null | awk 'NF{print $1; exit}') && [[ "$want" =~ ^[0-9a-f]{64}$ ]] && break
+    want=""; sleep 3
+  done
+  [[ -z "$want" ]] && return 2
+  for try in 1 2 3; do
+    if [[ "$resume" == "1" && -s "$part" ]]; then copt=(-C -); else copt=(); fi
+    if curl -fL "${copt[@]}" --max-time "$tmo" -o "$part" "$url" 2>/dev/null; then
+      got=$(sha256sum "$part" | awk '{print $1}')
+      if [[ "$got" == "$want" ]]; then
+        mv -f "$part" "$dest" && return 0
+      fi
+      rm -f "$part"   # сумма не сошлась: докачка бессмысленна — следующая попытка с нуля
+    fi
+    sleep 5
+  done
+  rm -f "$part"
+  return 1
+}
+
 ensure_geodata() {
   local geo_bin="/usr/local/x-ui/bin"
   local -a glist=(
@@ -1379,32 +1474,29 @@ ensure_geodata() {
     "geoip_RU.dat|https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat"
     "geosite_RU.dat|https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat"
   )
-  local entry gfile gurl gok
+  local entry gfile gurl grc
   for entry in "${glist[@]}"; do
     gfile="${entry%%|*}"
     gurl="${entry#*|}"
     if [[ -s "${geo_bin}/${gfile}" ]]; then
       continue
     fi
-    echo "  Гео-страж: ${gfile} отсутствует — докачиваю (3 попытки)..."
-    gok=0
-    for _ in 1 2 3; do
-      if curl -fL --max-time 300 -o "${geo_bin}/${gfile}" "$gurl" 2>/dev/null; then
-        gok=1
-        break
-      fi
-      sleep 5
-    done
-    if [[ "$gok" == "0" && "$gfile" == "geoip_RU.dat" && -s "${geo_bin}/geoip.dat" ]]; then
+    echo "  Гео-страж: ${gfile} отсутствует — докачиваю с проверкой sha256 (3 попытки)..."
+    grc=0
+    lucx_fetch_verified "$gurl" "${gurl}.sha256sum" "${geo_bin}/${gfile}" 300 0 || grc=$?
+    if [[ $grc -ne 0 && "$gfile" == "geoip_RU.dat" && -s "${geo_bin}/geoip.dat" ]]; then
       if cp "${geo_bin}/geoip.dat" "${geo_bin}/${gfile}"; then
-        gok=1
+        grc=0
         echo "  Гео-страж: ${gfile} восстановлен копией geoip.dat (Loyalsoldier содержит geoip:ru)"
       fi
     fi
-    if [[ "$gok" == "1" ]]; then
-      echo "  Гео-страж: ${gfile} на месте"
+    if [[ $grc -eq 0 ]]; then
+      echo "  Гео-страж: ${gfile} на месте (sha256 сошлась)"
+    elif [[ $grc -eq 2 ]]; then
+      echo "  ВНИМАНИЕ: ${gfile}: контрольная сумма релиза недоступна — файл НЕ установлен (целостность не подтвердить). xray может не стартовать. Вручную:"
+      echo "    curl -fL -o ${geo_bin}/${gfile} '${gurl}'"
     else
-      echo "  ВНИМАНИЕ: ${gfile} не скачался — xray может не стартовать. Вручную:"
+      echo "  ВНИМАНИЕ: ${gfile} не скачался или сумма не сошлась — xray может не стартовать. Вручную:"
       echo "    curl -fL -o ${geo_bin}/${gfile} '${gurl}'"
     fi
   done
@@ -1419,13 +1511,15 @@ ensure_dbip() {
   local dbip_bin="/usr/local/x-ui/bin"
   [[ -d "$dbip_bin" ]] || return 0  # панель не установлена — лечить нечего
   local -a dlist=(
-    "dbip-asn-lite.mmdb|https://github.com/sapics/ip-location-db/releases/download/latest/dbip-asn.mmdb"
-    "dbip-city-lite.mmdb|https://github.com/sapics/ip-location-db/releases/download/latest/dbip-city-ipv4.mmdb"
+    "dbip-asn-lite.mmdb|https://github.com/sapics/ip-location-db/releases/download/latest/dbip-asn.mmdb|https://github.com/sapics/ip-location-db/releases/download/checksum/dbip-asn.mmdb.sha256"
+    "dbip-city-lite.mmdb|https://github.com/sapics/ip-location-db/releases/download/latest/dbip-city-ipv4.mmdb|https://github.com/sapics/ip-location-db/releases/download/checksum/dbip-city-ipv4.mmdb.sha256"
   )
-  local entry dfile durl dok dto
+  local entry dfile durl dsum dto drc
   for entry in "${dlist[@]}"; do
     dfile="${entry%%|*}"
-    durl="${entry#*|}"
+    dsum="${entry#*|}"
+    durl="${dsum%%|*}"
+    dsum="${dsum#*|}"
     if [[ -s "${dbip_bin}/${dfile}" ]]; then
       continue
     fi
@@ -1437,20 +1531,16 @@ ensure_dbip() {
     # city ~62 МБ (аудит Ж-2): таймаут выше + докачка -C - между попытками
     dto=600
     [[ "$dfile" == "dbip-city-lite.mmdb" ]] && dto=1800
-    echo "  DBIP-страж: ${dfile} отсутствует — качаю с зеркала (GitHub sapics/ip-location-db, 3 попытки с докачкой)..."
-    dok=0
-    for _ in 1 2 3; do
-      if curl -fL -C - --max-time "$dto" -o "${dbip_bin}/${dfile}.part" "$durl" 2>/dev/null; then
-        dok=1
-        break
-      fi
-      sleep 5
-    done
-    if [[ "$dok" == "1" ]] && mv -f "${dbip_bin}/${dfile}.part" "${dbip_bin}/${dfile}" 2>/dev/null; then
-      echo "  DBIP-страж: ${dfile} на месте (зеркало)"
+    echo "  DBIP-страж: ${dfile} отсутствует — качаю с зеркала с проверкой sha256 (GitHub sapics/ip-location-db, 3 попытки с докачкой)..."
+    drc=0
+    lucx_fetch_verified "$durl" "$dsum" "${dbip_bin}/${dfile}" "$dto" 1 || drc=$?
+    if [[ $drc -eq 0 ]]; then
+      echo "  DBIP-страж: ${dfile} на месте (зеркало, sha256 сошлась)"
+    elif [[ $drc -eq 2 ]]; then
+      echo "  ВНИМАНИЕ: ${dfile}: контрольная сумма недоступна — файл НЕ установлен (гео-инфо IP в панели будет пустовать; на VPN не влияет). Вручную:"
+      echo "    curl -fL -o ${dbip_bin}/${dfile} '${durl}'"
     else
-      rm -f "${dbip_bin}/${dfile}.part"
-      echo "  ВНИМАНИЕ: ${dfile} не скачался (гео-инфо IP в панели будет пустовать; на VPN не влияет). Вручную:"
+      echo "  ВНИМАНИЕ: ${dfile} не скачался или сумма не сошлась (гео-инфо IP в панели будет пустовать; на VPN не влияет). Вручную:"
       echo "    curl -fL -o ${dbip_bin}/${dfile} '${durl}'"
     fi
   done
@@ -1597,6 +1687,7 @@ cmd_add_hy2() {
     echo "Запусти от root: sudo bash $0 add-hy2"
     exit 1
   fi
+  lucx_scheme_lock "add-hy2"
   REALITY_XRAY_PORT=443
   read_domains
   if [[ -z "${DOMAIN:-}" || -z "${REALITY_DOMAIN:-}" ]]; then
@@ -1987,11 +2078,48 @@ selftest_443() {
 # v0.5.4: ретрофит схемы «Reality перед TLS». Бэкапы БД и nginx-конфига; при провале самотеста
 # nginx-конфиг возвращается автоматически (созданный инбаунд на 127.0.0.1:8446 остаётся, он
 # слушает только loopback и безвреден). Клиенты и подписки TLS-инбаунда не меняются.
+
+# v0.7.5 (В4): armed rollback окна «бэкап stream-конфига -> самотест». Сбой reload,
+# неожиданный выход (set -e) и сигналы INT/TERM/HUP возвращают прежний stream-конфиг
+# и перечитывают nginx. Reality-инбаунд в БД осознанно не трогаем (loopback, безвреден —
+# задокументировано выше; аудит В4 это принял). Приём повторяет reality_only_rollback.
+RF_ROLLBACK_ARMED=0
+RF_CONF_BAK=""; RF_STREAM_CONF=""; RF_HUP=0
+reality_front_rollback() { # причина
+  [[ "${RF_ROLLBACK_ARMED:-0}" == "1" ]] || return 0
+  RF_ROLLBACK_ARMED=0
+  trap '' HUP PIPE
+  trap - INT TERM
+  # откат не должен обрываться на первом сбое (даже если вызван из ловушки под set -e)
+  set +e
+  # при обрыве SSH (HUP) терминала уже нет — пишем ход отката в журнал
+  if [[ "${RF_HUP:-0}" == "1" ]]; then
+    mkdir -p /root/.lucx-mode-backup 2>/dev/null
+    exec >>/root/.lucx-mode-backup/reality-front-rollback.log 2>&1 </dev/null || true
+  fi
+  echo "ОТКАТ add-reality-front: $1"
+  if [[ -n "$RF_CONF_BAK" && -f "$RF_CONF_BAK" && -n "$RF_STREAM_CONF" ]]; then
+    if cp -a "$RF_CONF_BAK" "$RF_STREAM_CONF"; then
+      if nginx -t >/dev/null 2>&1; then
+        systemctl reload nginx \
+          && echo "ОТКАТ завершён: прежний stream-конфиг возвращён, nginx перечитал (схема как была)." \
+          || echo "ВНИМАНИЕ: конфиг возвращён, но reload не удался — вручную: systemctl reload nginx"
+      else
+        echo "ВНИМАНИЕ: прежний конфиг возвращён, но nginx -t не прошёл — проверь вручную: nginx -t"
+      fi
+    else
+      echo "ВНИМАНИЕ: не удалось вернуть конфиг — вручную: cp -a ${RF_CONF_BAK} ${RF_STREAM_CONF} && nginx -t && systemctl reload nginx"
+    fi
+  fi
+  return 0
+}
+
 cmd_add_reality_front() {
   if [[ $EUID -ne 0 ]]; then
     echo "Запусти от root: sudo bash $0 add-reality-front"
     exit 1
   fi
+  lucx_scheme_lock "add-reality-front"
   REALITY_XRAY_PORT=443
   read_domains
   if [[ -z "${DOMAIN:-}" || -z "${REALITY_DOMAIN:-}" ]]; then
@@ -2041,19 +2169,31 @@ cmd_add_reality_front() {
   fi
   echo "Ретрофит «Reality перед TLS» на ${REALITY_DOMAIN}. x-ui будет перезапущен на несколько секунд."
   stamp=$(date +%Y%m%d-%H%M%S)
-  cp -a "$stream_conf" "/root/stream-sni-router.conf.pre-reality-front-${stamp}"
-  echo "Бэкап nginx-конфига: /root/stream-sni-router.conf.pre-reality-front-${stamp}"
-  create_reality_front_inbound || exit 1
+  RF_CONF_BAK="/root/stream-sni-router.conf.pre-reality-front-${stamp}"
+  RF_STREAM_CONF="$stream_conf"
+  cp -a "$stream_conf" "$RF_CONF_BAK"
+  echo "Бэкап nginx-конфига: ${RF_CONF_BAK}"
+  # v0.7.5 (В4): взводим rollback сразу после бэкапа, снимаем после самотеста
+  trap 'reality_front_rollback "прерван сигналом"; exit 130' INT TERM
+  trap 'RF_HUP=1; reality_front_rollback "обрыв терминала (HUP)"; exit 129' HUP
+  trap 'reality_front_rollback "неожиданное завершение (set -e)"; lucx_xui_guard_fire' EXIT
+  RF_ROLLBACK_ARMED=1
+  create_reality_front_inbound || { reality_front_rollback "не создан Reality-инбаунд"; exit 1; }
   sed -i "s#upstream reality_backend { server 127.0.0.1:443; }#upstream reality_backend { server 127.0.0.1:${REALITY_FRONT_PORT}; }#" "$stream_conf"
   if ! nginx -t >/dev/null 2>&1; then
-    cp -a "/root/stream-sni-router.conf.pre-reality-front-${stamp}" "$stream_conf"
-    echo "ОШИБКА: nginx -t не прошёл — nginx-конфиг возвращён."
+    reality_front_rollback "nginx -t не прошёл после правки upstream"
     exit 1
   fi
-  systemctl reload nginx
+  if ! systemctl reload nginx; then
+    reality_front_rollback "systemctl reload nginx не удался"
+    exit 1
+  fi
   sleep 1
   echo "Самотест через публичный IP ${SERVER_IP}:"
   if selftest_443 0 "${FRONT_UUID:-}" "${FRONT_PBK:-}" "${FRONT_SID:-}"; then
+    RF_ROLLBACK_ARMED=0
+    trap - INT TERM HUP
+    trap lucx_xui_guard_fire EXIT
     echo "$VERSION" > /root/.lucx-script-version
     if [[ -n "${FRONT_UUID:-}" && "${FRONT_EXISTS:-0}" != "1" && -f "$CREDS_FILE" ]]; then
       {
@@ -2073,9 +2213,7 @@ cmd_add_reality_front() {
     [[ -z "${FRONT_UUID:-}" ]] && echo "ВНИМАНИЕ: Reality-проба НЕ выполнялась (нет подходящего клиента) — проверь вход клиентом вручную."
     echo "=========================================="
   else
-    cp -a "/root/stream-sni-router.conf.pre-reality-front-${stamp}" "$stream_conf"
-    nginx -t >/dev/null 2>&1 && systemctl reload nginx
-    echo "ОШИБКА: самотест не прошёл — nginx-конфиг возвращён из бэкапа (схема как была)."
+    reality_front_rollback "самотест не прошёл"
     echo "Созданный Reality-инбаунд на 127.0.0.1:${REALITY_FRONT_PORT} оставлен (loopback, безвреден); смотри: journalctl -u x-ui -n 50"
     exit 1
   fi
@@ -2397,6 +2535,7 @@ cmd_reality_only() {
     reality_only_status
     return $?
   fi
+  lucx_scheme_lock "reality-only"
   read_domains
   if [[ -z "${DOMAIN:-}" || -z "${REALITY_DOMAIN:-}" ]]; then
     echo "ОШИБКА: не удалось определить домены из ${CREDS_FILE}."
@@ -2671,6 +2810,7 @@ cmd_add_h2() {
     echo "Запусти от root: sudo bash $0 add-h2"
     exit 1
   fi
+  lucx_scheme_lock "add-h2"
   REALITY_XRAY_PORT=443
   read_domains
   if [[ -z "${DOMAIN:-}" || -z "${REALITY_DOMAIN:-}" ]]; then
@@ -2781,12 +2921,55 @@ cmd_add_h2() {
 # и add-reality восстанавливает ИМЕННО их (те же ключи/shortIds — клиентские
 # ссылки с pbk оживают без перевыпуска). Если бэкапа нет — Reality
 # генерируется заново с НОВЫМИ ключами (владельцу печатается новый pbk).
+
+# v0.7.5 (В3): armed rollback для обеих веток switch-mode (переключение и
+# долечка fallback'а). До остановки x-ui взводим ловушки INT/TERM/HUP/EXIT;
+# любой сбой после WAL-безопасного снимка — возврат снимка, запуск x-ui и
+# проверка прежнего listener'а 443 ДО завершения команды. Приём повторяет
+# reality_only_rollback (v0.6.x).
+SW_ROLLBACK_ARMED=0
+SW_DB_BAK=""; SW_HUP=0
+switch_mode_rollback() { # причина
+  [[ "${SW_ROLLBACK_ARMED:-0}" == "1" ]] || return 0
+  SW_ROLLBACK_ARMED=0
+  trap '' HUP PIPE
+  trap - INT TERM
+  # откат не должен обрываться на первом сбое (даже если вызван из ловушки под set -e)
+  set +e
+  # при обрыве SSH (HUP) терминала уже нет — пишем ход отката в журнал
+  if [[ "${SW_HUP:-0}" == "1" ]]; then
+    mkdir -p /root/.lucx-mode-backup 2>/dev/null
+    exec >>/root/.lucx-mode-backup/switch-rollback.log 2>&1 </dev/null || true
+  fi
+  echo "ОТКАТ switch-mode: $1"
+  # L7: итог «схема как была» объявляем, только если КАЖДАЯ операция восстановления успешна
+  local rb_ok=1
+  lucx_xui_stop || true
+  sleep 1
+  if [[ -n "$SW_DB_BAK" && -f "$SW_DB_BAK" ]]; then
+    if ! lucx_db_restore "$SW_DB_BAK"; then
+      rb_ok=0
+      echo "ВНИМАНИЕ: БД не возвращена из ${SW_DB_BAK} — верни вручную (x-ui остановлен): rm -f ${XUIDB}-wal ${XUIDB}-shm; cp -a ${SW_DB_BAK} ${XUIDB}; systemctl start x-ui"
+    fi
+  fi
+  lucx_xui_start || { rb_ok=0; echo "ВНИМАНИЕ: x-ui не запустился: journalctl -u x-ui -n 50"; }
+  sleep 2
+  systemctl is-active --quiet x-ui && wait_xray_listener 443 || rb_ok=0
+  if [[ "$rb_ok" == "1" ]]; then
+    echo "ОТКАТ завершён: БД восстановлена, xray слушает 443 (схема как до команды)."
+  else
+    echo "ВНИМАНИЕ: откат switch-mode выполнен НЕ полностью — схема может отличаться от исходной. Вручную: journalctl -u x-ui -n 50; бэкап БД: ${SW_DB_BAK:-<нет>}"
+  fi
+  return 0
+}
+
 cmd_switch_mode() {
   local target="$1"
   if [[ $EUID -ne 0 ]]; then
     echo "Запусти от root: sudo bash $0 add-vls | add-reality"
     exit 1
   fi
+  lucx_scheme_lock "add-vls/add-reality"
   read_domains
   if [[ -z "${DOMAIN:-}" || -z "${REALITY_DOMAIN:-}" ]]; then
     echo "ОШИБКА: домены не определены из ${CREDS_FILE}."
@@ -2822,35 +3005,41 @@ cmd_switch_mode() {
         exit 0
       fi
       echo "Уже в TLS-режиме; перенаправляю fallback на :8080 (фасад decoy, v0.4.0)..."
-      systemctl stop x-ui
+      # v0.7.5 (В3): взводим armed rollback ДО остановки x-ui
+      SW_DB_BAK="${XUIDB}.backup.$(date +%s)"
+      trap 'switch_mode_rollback "прерван сигналом"; exit 130' INT TERM
+      trap 'SW_HUP=1; switch_mode_rollback "обрыв терминала (HUP)"; exit 129' HUP
+      trap 'switch_mode_rollback "неожиданное завершение (set -e)"; lucx_xui_guard_fire' EXIT
+      lucx_xui_stop
       sleep 1
-      lucx_db_snapshot "${XUIDB}.backup.$(date +%s)" || { echo "ОШИБКА: бэкап БД не создан (нет места?) — ничего не меняю."; lucx_xui_start || true; exit 1; }
-      ensure_decoy2_http_vhost || { systemctl start x-ui; echo "ОШИБКА: не создать decoy2-http vhost."; exit 1; }
-      if ! sqlite3 "$XUIDB" "UPDATE inbounds SET settings = json_set(settings, '\$.fallbacks', json('[{\"dest\":\"127.0.0.1:8080\",\"xver\":0}]')) WHERE protocol='vless' AND port=443 AND listen='127.0.0.1';"; then
-        echo "ОШИБКА: не удалось добавить fallback. Бэкап: ${XUIDB}.backup.*"
-        systemctl start x-ui
+      if ! lucx_db_snapshot "$SW_DB_BAK"; then
+        rm -f "$SW_DB_BAK"
+        lucx_xui_start || true
+        trap - INT TERM HUP
+        trap lucx_xui_guard_fire EXIT
+        echo "ОШИБКА: бэкап БД не создан (нет места?) — ничего не меняю."
         exit 1
       fi
-      systemctl start x-ui
+      SW_ROLLBACK_ARMED=1
+      ensure_decoy2_http_vhost || { switch_mode_rollback "не создать decoy2-http vhost"; exit 1; }
+      if ! sqlite3 "$XUIDB" "UPDATE inbounds SET settings = json_set(settings, '\$.fallbacks', json('[{\"dest\":\"127.0.0.1:8080\",\"xver\":0}]')) WHERE protocol='vless' AND port=443 AND listen='127.0.0.1';"; then
+        switch_mode_rollback "не удалось добавить fallback"
+        exit 1
+      fi
+      lucx_xui_start || true
       sleep 2
       if ! systemctl is-active --quiet x-ui; then
-        echo "ОШИБКА: x-ui не запустился после добавления fallback."
+        switch_mode_rollback "x-ui не запустился после добавления fallback"
         exit 1
       fi
       # v0.3.7-приём: is-active не ловит краш-луп ядра — верифицируем листенер
-      local fb_pid="" i
-      for i in 1 2 3 4 5; do
-        fb_pid=$(ss -tlnp 2>/dev/null | grep -E '127\.0\.0\.1:443\b' | grep -oP 'pid=\K[0-9]+' | head -n1 || true)
-        if [[ -n "$fb_pid" ]] && tr '\0' ' ' < "/proc/${fb_pid}/cmdline" 2>/dev/null | grep -qi xray; then
-          break
-        fi
-        fb_pid=""
-        sleep 2
-      done
-      if [[ -z "$fb_pid" ]]; then
-        echo "ОШИБКА: xray не слушает 127.0.0.1:443 после добавления fallback (краш-луп?). Бэкап БД: ${XUIDB}.backup.*"
+      if ! wait_xray_listener 443; then
+        switch_mode_rollback "xray не слушает 127.0.0.1:443 после добавления fallback (краш-луп?)"
         exit 1
       fi
+      SW_ROLLBACK_ARMED=0
+      trap - INT TERM HUP
+      trap lucx_xui_guard_fire EXIT
       echo "Готово: fallback на :8080, xray подтверждён на 127.0.0.1:443. Пробы на https://${REALITY_DOMAIN} получают decoy-сайт (200)."
       echo "$VERSION" > /root/.lucx-script-version
       exit 0
@@ -2866,25 +3055,36 @@ cmd_switch_mode() {
   fi
 
   echo "Переключаю 443: ${cur_sec} -> ${target}. x-ui будет перезапущен (сессии оборвутся)."
-  systemctl stop x-ui
+  # v0.7.5 (В3): взводим armed rollback ДО остановки x-ui
+  SW_DB_BAK="${XUIDB}.backup.$(date +%s)"
+  trap 'switch_mode_rollback "прерван сигналом"; exit 130' INT TERM
+  trap 'SW_HUP=1; switch_mode_rollback "обрыв терминала (HUP)"; exit 129' HUP
+  trap 'switch_mode_rollback "неожиданное завершение (set -e)"; lucx_xui_guard_fire' EXIT
+  lucx_xui_stop
   sleep 1
   mkdir -p /root/.lucx-mode-backup
-  lucx_db_snapshot "${XUIDB}.backup.$(date +%s)" || { echo "ОШИБКА: бэкап БД не создан (нет места?) — ничего не меняю."; lucx_xui_start || true; exit 1; }
+  if ! lucx_db_snapshot "$SW_DB_BAK"; then
+    rm -f "$SW_DB_BAK"
+    lucx_xui_start || true
+    trap - INT TERM HUP
+    trap lucx_xui_guard_fire EXIT
+    echo "ОШИБКА: бэкап БД не создан (нет места?) — ничего не меняю."
+    exit 1
+  fi
+  SW_ROLLBACK_ARMED=1
   local stream_backup="" stamp2
   stamp2=$(date +%Y%m%d-%H%M%S)
 
   if [[ "$target" == "tls" ]]; then
     if [[ ! -f "/etc/letsencrypt/live/${REALITY_DOMAIN}/fullchain.pem" || ! -f "/etc/letsencrypt/live/${REALITY_DOMAIN}/privkey.pem" ]]; then
-      echo "ОШИБКА: серт ${REALITY_DOMAIN} не найден в /etc/letsencrypt/live/ — TLS невозможен. Отменено."
-      systemctl start x-ui
+      switch_mode_rollback "серт ${REALITY_DOMAIN} не найден в /etc/letsencrypt/live/ — TLS невозможен"
       exit 1
     fi
-    ensure_decoy2_http_vhost || { systemctl start x-ui; echo "ОШИБКА: не создать decoy2-http vhost."; exit 1; }
+    ensure_decoy2_http_vhost || { switch_mode_rollback "не создать decoy2-http vhost"; exit 1; }
     stream_backup="/root/.lucx-mode-backup/stream-reality-${stamp2}.json"
     sqlite3 "$XUIDB" "SELECT stream_settings FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" > "$stream_backup"
     if ! sqlite3 "$XUIDB" "UPDATE inbounds SET settings = json_set(settings, '\$.clients[0].flow', 'xtls-rprx-vision', '\$.fallbacks', json('[{\"dest\":\"127.0.0.1:8080\",\"xver\":0}]')), stream_settings = json('{\"network\":\"tcp\",\"security\":\"tls\",\"tlsSettings\":{\"serverName\":\"${REALITY_DOMAIN}\",\"minVersion\":\"1.2\",\"maxVersion\":\"1.3\",\"cipherSuites\":\"\",\"rejectUnknownSni\":false,\"disableSystemRoot\":false,\"enableSessionResumption\":false,\"certificates\":[{\"ocspStapling\":0,\"oneTimeLoading\":false,\"usage\":\"encipherment\",\"buildChain\":false,\"certificateFile\":\"/etc/letsencrypt/live/${REALITY_DOMAIN}/fullchain.pem\",\"keyFile\":\"/etc/letsencrypt/live/${REALITY_DOMAIN}/privkey.pem\"}],\"alpn\":[\"http/1.1\"],\"echServerKeys\":\"\",\"settings\":{\"echConfigList\":\"\",\"pinnedPeerCertSha256\":[],\"verifyPeerCertByName\":\"\"}},\"tcpSettings\":{\"acceptProxyProtocol\":true,\"header\":{\"type\":\"none\"}}}') WHERE protocol='vless' AND port=443 AND listen='127.0.0.1';"; then
-      echo "ОШИБКА: UPDATE не удался. Бэкап БД: ${XUIDB}.backup.*, stream: ${stream_backup}"
-      systemctl start x-ui
+      switch_mode_rollback "UPDATE stream_settings на TLS не удался (stream-бэкап: ${stream_backup})"
       exit 1
     fi
     echo "stream_settings переключены на TLS (серт ${REALITY_DOMAIN}, ALPN http/1.1)."
@@ -2895,16 +3095,14 @@ cmd_switch_mode() {
       stream_backup="$latest"
       json1=$(tr -d '\n\r' < "$latest" | sed "s/'/''/g")
       if ! sqlite3 "$XUIDB" "UPDATE inbounds SET stream_settings = json('${json1}') WHERE protocol='vless' AND port=443 AND listen='127.0.0.1';"; then
-        echo "ОШИБКА: не удалось восстановить Reality-stream из ${latest}."
-        systemctl start x-ui
+        switch_mode_rollback "не удалось восстановить Reality-stream из ${latest}"
         exit 1
       fi
       echo "Восстановлен сохранённый Reality-stream из ${latest} (те же ключи/shortIds)."
     else
       xray_bin=$(find /usr/local/x-ui -maxdepth 3 -name "xray-linux-*" -type f 2>/dev/null | head -n1 || true)
       if [[ -z "$xray_bin" ]]; then
-        echo "ОШИБКА: xray не найден — генерация Reality-ключей невозможна."
-        systemctl start x-ui
+        switch_mode_rollback "xray не найден — генерация Reality-ключей невозможна"
         exit 1
       fi
       keys_out=$("$xray_bin" x25519 2>/dev/null || true)
@@ -2912,48 +3110,38 @@ cmd_switch_mode() {
       priv=$(echo "$keys_out" | awk -F': *' 'tolower($1) ~ /^private ?key$/ {print $2; exit}')
       pub=$(echo "$keys_out" | awk -F': *' 'tolower($1) ~ /public ?key|^password/ {print $2; exit}')
       if [[ -z "$priv" || -z "$pub" ]]; then
-        echo "ОШИБКА: не сгенерировать Reality-ключи."
-        systemctl start x-ui
+        switch_mode_rollback "не сгенерировать Reality-ключи"
         exit 1
       fi
       s1=$(openssl rand -hex 8)
       s2=$(openssl rand -hex 8)
       if ! sqlite3 "$XUIDB" "UPDATE inbounds SET stream_settings = json('{\"network\":\"tcp\",\"security\":\"reality\",\"realitySettings\":{\"show\":false,\"dest\":\"127.0.0.1:8444\",\"xver\":0,\"serverNames\":[\"${REALITY_DOMAIN}\"],\"privateKey\":\"${priv}\",\"minClient\":\"\",\"maxClient\":\"\",\"maxTimediff\":0,\"shortIds\":[\"${s1}\",\"${s2}\"],\"settings\":{\"publicKey\":\"${pub}\",\"fingerprint\":\"chrome\",\"serverName\":\"\",\"spiderX\":\"/\"}},\"tcpSettings\":{\"acceptProxyProtocol\":true,\"header\":{\"type\":\"none\"}}}') WHERE protocol='vless' AND port=443 AND listen='127.0.0.1';"; then
-        echo "ОШИБКА: UPDATE не удался."
-        systemctl start x-ui
+        switch_mode_rollback "UPDATE stream_settings на Reality не удался"
         exit 1
       fi
       echo "ВНИМАНИЕ: Reality-бэкапа не было — сгенерированы НОВЫЕ ключи."
       echo "Новый Public key для клиентских ссылок: ${pub}"
     fi
     if ! sqlite3 "$XUIDB" "UPDATE inbounds SET settings = json_set(settings, '\$.clients[0].flow', 'xtls-rprx-vision', '\$.fallbacks', json('[]')) WHERE protocol='vless' AND port=443 AND listen='127.0.0.1';"; then
-      echo "ОШИБКА: не вернуть flow/fallbacks."
-      systemctl start x-ui
+      switch_mode_rollback "не вернуть flow/fallbacks"
       exit 1
     fi
   fi
 
-  systemctl start x-ui
+  lucx_xui_start || true
   sleep 2
   if ! systemctl is-active --quiet x-ui; then
-    echo "ОШИБКА: x-ui не запустился. Откат stream_settings: ${stream_backup:-<нет>}; бэкап БД: ${XUIDB}.backup.*"
+    switch_mode_rollback "x-ui не запустился после переключения (stream-бэкап: ${stream_backup:-<нет>})"
     exit 1
   fi
   # фактический листенер — тот же приём, что в install [10/10] (v0.3.7)
-  local ok_pid="" i
-  for i in 1 2 3 4 5; do
-    ok_pid=$(ss -tlnp 2>/dev/null | grep -E '127\.0\.0\.1:443\b' | grep -oP 'pid=\K[0-9]+' | head -n1 || true)
-    if [[ -n "$ok_pid" ]] && tr '\0' ' ' < "/proc/${ok_pid}/cmdline" 2>/dev/null | grep -qi xray; then
-      break
-    fi
-    ok_pid=""
-    sleep 2
-  done
-  if [[ -z "$ok_pid" ]]; then
-    echo "ОШИБКА: xray не слушает 127.0.0.1:443 после переключения."
-    echo "Откат: stream из ${stream_backup:-/root/.lucx-mode-backup/} и/или БД ${XUIDB}.backup.*"
+  if ! wait_xray_listener 443; then
+    switch_mode_rollback "xray не слушает 127.0.0.1:443 после переключения (stream-бэкап: ${stream_backup:-/root/.lucx-mode-backup/})"
     exit 1
   fi
+  SW_ROLLBACK_ARMED=0
+  trap - INT TERM HUP
+  trap lucx_xui_guard_fire EXIT
 
   echo "$VERSION" > /root/.lucx-script-version
   echo
@@ -3478,6 +3666,10 @@ cmd_install() {
     echo "Запусти от root: sudo bash $0 install"
     exit 1
   fi
+  # v0.7.5 (аудит В17): install меняет ту же БД/x-ui/nginx, что и прочие мутаторы, —
+  # берёт тот же единый замок на всю установку. Внутренний add-xhttp (отдельный
+  # процесс ниже) наследует LUCX_SCHEME_LOCK_HELD и замок повторно не запрашивает.
+  lucx_scheme_lock "install"
 
   INSTALL_SELF=$(readlink -f "$0" 2>/dev/null || true)   # для запуска add-xhttp отдельным процессом ([10c])
   # при запуске через пайп (curl | bash) $0 = bash: берём путь только если это наш скрипт
@@ -7573,11 +7765,51 @@ cmd_conntrack_guard() {
   echo "Готово. Проверка: sudo bash $0 healthcheck"
 }
 
+# v0.7.5 (L4): armed rollback для rebind-ip на короткое окно «бэкап -> подтверждённый
+# listener»: обрыв SSH (HUP) и сигналы возвращают прежний stream-конфиг и перезапускают
+# nginx — на диске не остаётся listen, расходящийся с работающим nginx.
+RB_ROLLBACK_ARMED=0
+RB_CONF=""; RB_BAK=""; RB_HUP=0
+rebind_ip_rollback() { # причина
+  [[ "${RB_ROLLBACK_ARMED:-0}" == "1" ]] || return 0
+  RB_ROLLBACK_ARMED=0
+  trap '' HUP PIPE
+  trap - INT TERM
+  set +e
+  if [[ "${RB_HUP:-0}" == "1" ]]; then
+    mkdir -p /root/.lucx-mode-backup 2>/dev/null
+    exec >>/root/.lucx-mode-backup/rebind-ip-rollback.log 2>&1 </dev/null || true
+  fi
+  echo "ОТКАТ rebind-ip: $1"
+  # L7: «конфиг возвращён» объявляем, только если КАЖДЫЙ шаг восстановления успешен
+  local rb_ok=1
+  if [[ -n "$RB_BAK" && -f "$RB_BAK" && -n "$RB_CONF" ]]; then
+    if ! cp -p "$RB_BAK" "$RB_CONF"; then
+      rb_ok=0
+      echo "ВНИМАНИЕ: конфиг не возвращён — вручную: cp -p ${RB_BAK} ${RB_CONF}; systemctl restart nginx"
+    fi
+    if ! nginx -t >/dev/null 2>&1; then
+      rb_ok=0
+      echo "ВНИМАНИЕ: после возврата конфига nginx -t не прошёл — проверь вручную: nginx -t"
+    elif ! systemctl restart nginx; then
+      rb_ok=0
+      echo "ВНИМАНИЕ: конфиг возвращён, но nginx не перезапустился: systemctl restart nginx"
+    fi
+  fi
+  if [[ "$rb_ok" == "1" ]]; then
+    echo "ОТКАТ завершён: прежний stream-конфиг возвращён, nginx перезапущен."
+  else
+    echo "ВНИМАНИЕ: откат rebind-ip выполнен НЕ полностью — прежний конфиг может быть не применён. Бэкап: ${RB_BAK:-<нет>}"
+  fi
+  return 0
+}
+
 cmd_rebind_ip() {
   if [[ $EUID -ne 0 ]]; then
     echo "Запусти от root: sudo bash $0 rebind-ip"
     exit 1
   fi
+  lucx_scheme_lock "rebind-ip"
   read_domains
   if [[ -z "${DOMAIN:-}" ]]; then
     echo "ОШИБКА: домен панели не определён из ${CREDS_FILE}."
@@ -7628,31 +7860,36 @@ cmd_rebind_ip() {
 
   local rb_bak; rb_bak="${STREAM_CONF}.backup.$(date +%s)"
   cp -p "$STREAM_CONF" "$rb_bak"
+  # v0.7.5 (L4): взводим rollback на окно «правка -> подтверждённый listener»
+  RB_CONF="$STREAM_CONF"; RB_BAK="$rb_bak"
+  trap 'rebind_ip_rollback "прерван сигналом"; exit 130' INT TERM
+  trap 'RB_HUP=1; rebind_ip_rollback "обрыв терминала (HUP)"; exit 129' HUP
+  trap 'rebind_ip_rollback "неожиданное завершение (set -e)"; lucx_xui_guard_fire' EXIT
+  RB_ROLLBACK_ARMED=1
   # меняется только строка `listen [IP:]443;` (explicit IP или wildcard); других строк sed не касается
   if ! stream_set_listen_ip "$SERVER_IP" "$STREAM_CONF"; then
-    cp -p "$rb_bak" "$STREAM_CONF"
-    echo "ОШИБКА: в ${STREAM_CONF} нет строки listen [IP:]443; — ничего не изменено."
+    rebind_ip_rollback "в ${STREAM_CONF} нет строки listen [IP:]443"
     exit 1
   fi
   echo "listen-строка обновлена -> ${SERVER_IP}:443"
 
   if ! nginx -t; then
-    cp -p "$rb_bak" "$STREAM_CONF"
-    echo "ОШИБКА: nginx -t не прошёл — прежний stream-конфиг возвращён."
+    rebind_ip_rollback "nginx -t не прошёл"
     exit 1
   fi
   if ! systemctl restart nginx; then
-    cp -p "$rb_bak" "$STREAM_CONF"; systemctl restart nginx || true
-    echo "ОШИБКА: nginx не перезапустился — прежний stream-конфиг возвращён."
+    rebind_ip_rollback "nginx не перезапустился"
     exit 1
   fi
   sleep 1
   if command -v ss >/dev/null 2>&1 && ! grep -qE "${SERVER_IP//./\.}:443\b.*nginx" <<<"$(ss -tlnp 2>/dev/null)"; then
-    cp -p "$rb_bak" "$STREAM_CONF"; systemctl restart nginx || true
-    echo "ОШИБКА: nginx не подтверждён на ${SERVER_IP}:443 после restart — прежний stream-конфиг возвращён:"
+    rebind_ip_rollback "nginx не подтверждён на ${SERVER_IP}:443 после restart"
     ss -tlnp | grep ':443 ' || true
     exit 1
   fi
+  RB_ROLLBACK_ARMED=0
+  trap - INT TERM HUP
+  trap lucx_xui_guard_fire EXIT
   echo "OK: nginx подтверждён на ${SERVER_IP}:443."
   echo ""
   echo "========== ПАНЕЛЬ: можно / нельзя =========="
@@ -7797,9 +8034,8 @@ cmd_panel_path() {
     echo "Запусти от root: sudo bash $0 panel-path"
     exit 1
   fi
-  if command -v flock >/dev/null 2>&1 && exec 9>/var/lock/lucx-panel-path.lock; then
-    flock -n 9 || { echo "ОШИБКА: сейчас выполняется panel-path, add-xhttp или remove-xhttp (другой процесс) — дождись и повтори."; exit 1; }
-  fi
+  # v0.7.5 (В9): единый замок всех мутаторов схемы (раньше — свой lucx-panel-path.lock)
+  lucx_scheme_lock "panel-path"
   if [[ ! -f "$CREDS_FILE" ]]; then
     echo "ОШИБКА: ${CREDS_FILE} не найден — не откуда взять домен панели (установка не выполнялась?)."
     exit 1
@@ -8780,13 +9016,29 @@ xhttp_domain_cfg() {
   grep -oP '^\s*\K[A-Za-z0-9.-]+(?=\s+xhttp_backend;)' /etc/nginx/stream-sni-router.conf 2>/dev/null | head -n1 || true
 }
 
-# убирает nginx-файлы add-xhttp (вхост :80 для ACME и вхост-мишень) и перечитывает nginx
+# убирает nginx-файлы add-xhttp (вхост :80 для ACME и вхост-мишень) и перечитывает nginx.
+# v0.7.5 (аудит В16): nginx -t и reload больше не подавляются — ошибка применения
+# конфигурации возвращается вызывающему (rc 1), чтобы remove-xhttp ушёл в armed
+# rollback, а не отрапортовал успех при nginx на старом running-config.
 xhttp_remove_vhosts() {
-  rm -f /etc/nginx/sites-enabled/xhttp-80.conf /etc/nginx/sites-available/xhttp-80.conf \
-        /etc/nginx/sites-enabled/xhttp-decoy-tls.conf /etc/nginx/sites-available/xhttp-decoy-tls.conf
-  if nginx -t >/dev/null 2>&1; then
-    systemctl reload nginx 2>/dev/null || true
+  # v0.7.5 (аудит В18): ошибка rm проверяется явно — функция вызывается из условного
+  # контекста (`if ! xhttp_remove_vhosts`), где set -e внутри неё не действует, и
+  # необработанный сбой rm давал бы ложный успех при оставшихся вхостах
+  if ! rm -f /etc/nginx/sites-enabled/xhttp-80.conf /etc/nginx/sites-available/xhttp-80.conf \
+             /etc/nginx/sites-enabled/xhttp-decoy-tls.conf /etc/nginx/sites-available/xhttp-decoy-tls.conf; then
+    echo "ОШИБКА: не удалось удалить часть xhttp-вхостов (rm) — проверь вручную: ls -l /etc/nginx/sites-*/xhttp-*"
+    return 1
   fi
+  if ! nginx -t >/dev/null 2>&1; then
+    echo "ОШИБКА: nginx -t не прошёл после удаления xhttp-вхостов:"
+    nginx -t 2>&1 | tail -3 | sed 's/^/    /' || true
+    return 1
+  fi
+  if ! systemctl reload nginx; then
+    echo "ОШИБКА: reload nginx не прошёл после удаления xhttp-вхостов."
+    return 1
+  fi
+  return 0
 }
 
 # Страховка для панелей, где `x-ui migrate` не перенёс клиента в таблицы clients/client_inbounds
@@ -8895,7 +9147,7 @@ xhttp_rollback_all() { # stream_backup db_backup
   local sbak="$1" dbak="${2:-}"
   [[ -n "$sbak" && -f "$sbak" ]] && cp -a "$sbak" /etc/nginx/stream-sni-router.conf
   rm -f /etc/nginx/stream-sni-router.conf.new
-  xhttp_remove_vhosts
+  xhttp_remove_vhosts || echo "  ВНИМАНИЕ: nginx не применил удаление вхостов — вручную: nginx -t; systemctl reload nginx"
   # возвращаем только целую копию БД: недописанная (диск полон) не должна затереть рабочую
   if [[ -n "$dbak" && -f "$dbak" && "$(sqlite3 "$dbak" 'PRAGMA integrity_check;' 2>/dev/null)" != "ok" ]]; then
     echo "  ВНИМАНИЕ: бэкап БД ${dbak} повреждён — БД не трогаю"
@@ -8933,10 +9185,8 @@ cmd_add_xhttp() {
     exit 1
   fi
   # v0.6.5: общая блокировка с panel-path, backup и restore: две команды, меняющие одну БД и конфиги nginx, одновременно
-  # не запускаются (раньше add/remove-xhttp не имели блокировки)
-  if command -v flock >/dev/null 2>&1 && exec 9>/var/lock/lucx-panel-path.lock; then
-    flock -n 9 || { echo "ОШИБКА: сейчас выполняется другая команда, меняющая схему (panel-path, add-xhttp или remove-xhttp) — дождись и повтори."; exit 1; }
-  fi
+  # не запускаются (раньше add/remove-xhttp не имели блокировки). v0.7.5 (В9): единый замок всех мутаторов схемы
+  lucx_scheme_lock "add-xhttp"
   trap lucx_xui_guard_fire EXIT   # в подоболочке install ловушки не наследуются
   REALITY_XRAY_PORT=443
   read_domains
@@ -9170,16 +9420,80 @@ EOF
   echo "=========================================="
 }
 
+# v0.7.5 (В5): глобальный armed rollback remove-xhttp на всё окно операции.
+# Возвращает: БД из WAL-безопасного снимка (если снимок был), вхосты xhttp (из бэкапа),
+# stream-конфиг nginx; затем start x-ui, nginx -t + reload и проверка сервисов.
+# Приём повторяет reality_only_rollback.
+RX_ROLLBACK_ARMED=0
+RX_STREAM_CONF=""; RX_STREAM_BAK=""; RX_DB_BAK=""; RX_VHOST_BAK=""; RX_HUP=0
+remove_xhttp_rollback() { # причина
+  [[ "${RX_ROLLBACK_ARMED:-0}" == "1" ]] || return 0
+  RX_ROLLBACK_ARMED=0
+  trap '' HUP PIPE
+  trap - INT TERM
+  # откат не должен обрываться на первом сбое (даже если вызван из ловушки под set -e)
+  set +e
+  # при обрыве SSH (HUP) терминала уже нет — пишем ход отката в журнал
+  if [[ "${RX_HUP:-0}" == "1" ]]; then
+    mkdir -p /root/.lucx-mode-backup 2>/dev/null
+    exec >>/root/.lucx-mode-backup/remove-xhttp-rollback.log 2>&1 </dev/null || true
+  fi
+  echo "ОТКАТ remove-xhttp: $1"
+  # L7: итог «схема как была» объявляем, только если КАЖДАЯ операция восстановления успешна
+  local rb_ok=1
+  # БД (только если снимок успели сделать — до него БД не трогали)
+  if [[ -n "$RX_DB_BAK" && -f "$RX_DB_BAK" ]]; then
+    lucx_xui_stop || true
+    sleep 1
+    if ! lucx_db_restore "$RX_DB_BAK"; then
+      rb_ok=0
+      echo "ВНИМАНИЕ: БД не возвращена из ${RX_DB_BAK} — верни вручную (x-ui остановлен): rm -f ${XUIDB}-wal ${XUIDB}-shm; cp -a ${RX_DB_BAK} ${XUIDB}; systemctl start x-ui"
+    fi
+  fi
+  # вхосты xhttp (бэкап имён кодирует полный путь: / -> _)
+  if [[ -n "$RX_VHOST_BAK" && -d "$RX_VHOST_BAK" ]]; then
+    local vf vdst
+    for vf in "$RX_VHOST_BAK"/*; do
+      [[ -e "$vf" || -L "$vf" ]] || continue
+      vdst=$(basename "$vf" | sed 's#_#/#g')
+      if ! cp -a "$vf" "$vdst" 2>/dev/null; then
+        rb_ok=0
+        echo "ВНИМАНИЕ: вхост не возвращён — вручную: cp -a ${vf} ${vdst}"
+      fi
+    done
+  fi
+  # stream-конфиг
+  if [[ -n "$RX_STREAM_BAK" && -f "$RX_STREAM_BAK" && -n "$RX_STREAM_CONF" ]]; then
+    if ! cp -a "$RX_STREAM_BAK" "$RX_STREAM_CONF"; then
+      rb_ok=0
+      echo "ВНИМАНИЕ: stream-конфиг не возвращён — вручную: cp -a ${RX_STREAM_BAK} ${RX_STREAM_CONF}"
+    fi
+  fi
+  lucx_xui_start || { rb_ok=0; echo "ВНИМАНИЕ: x-ui не запустился: journalctl -u x-ui -n 50"; }
+  sleep 2
+  if nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx || { rb_ok=0; echo "ВНИМАНИЕ: nginx не перечитал конфиг: systemctl reload nginx"; }
+  else
+    rb_ok=0
+    echo "ВНИМАНИЕ: nginx -t не прошёл после отката — проверь конфиги вручную: nginx -t"
+  fi
+  systemctl is-active --quiet x-ui && systemctl is-active --quiet nginx && wait_xray_listener 443 || rb_ok=0
+  if [[ "$rb_ok" == "1" ]]; then
+    echo "ОТКАТ завершён: БД, вхосты и stream-конфиг возвращены, x-ui и nginx работают (схема как была)."
+  else
+    echo "ВНИМАНИЕ: откат remove-xhttp выполнен НЕ полностью — схема может отличаться от исходной. Вручную: journalctl -u x-ui -n 50; nginx -t; бэкапы: БД ${RX_DB_BAK:-<нет>}, stream ${RX_STREAM_BAK:-<нет>}, вхосты ${RX_VHOST_BAK:-<нет>}"
+  fi
+  return 0
+}
+
 cmd_remove_xhttp() {
   if [[ $EUID -ne 0 ]]; then
     echo "Запусти от root: sudo bash $0 remove-xhttp [--yes] [--purge-cert]"
     exit 1
   fi
   # v0.6.5: общая блокировка с panel-path, backup и restore: две команды, меняющие одну БД и конфиги nginx, одновременно
-  # не запускаются (раньше add/remove-xhttp не имели блокировки)
-  if command -v flock >/dev/null 2>&1 && exec 9>/var/lock/lucx-panel-path.lock; then
-    flock -n 9 || { echo "ОШИБКА: сейчас выполняется другая команда, меняющая схему (panel-path, add-xhttp или remove-xhttp) — дождись и повтори."; exit 1; }
-  fi
+  # не запускаются (раньше add/remove-xhttp не имели блокировки). v0.7.5 (В9): единый замок всех мутаторов схемы
+  lucx_scheme_lock "remove-xhttp"
   local stream_conf="/etc/nginx/stream-sni-router.conf" xdom stamp sbak dbak yes=0 purge=0 a ids iid
   for a in "$@"; do
     case "$a" in
@@ -9189,7 +9503,13 @@ cmd_remove_xhttp() {
     esac
   done
   xdom=$(xhttp_domain_cfg)
-  iid=$(sqlite3 "$XUIDB" "SELECT id FROM inbounds WHERE port=${XHTTP_PORT} AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  # v0.7.5 (аудит В15): «SELECT успешен, строк нет» — не то же, что «ошибка SELECT».
+  # Раньше ошибка чтения (БД заблокирована/повреждена) принималась за отсутствие
+  # инбаунда, и DB-фаза молча пропускалась — частичное удаление под видом успеха.
+  if ! iid=$(sqlite3 "$XUIDB" "SELECT id FROM inbounds WHERE port=${XHTTP_PORT} AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null); then
+    echo "ОШИБКА: не удалось прочитать БД панели (SELECT inbound по порту ${XHTTP_PORT}) — БД заблокирована или повреждена. Ничего не изменено."
+    exit 1
+  fi
   if [[ -z "$xdom" && -z "$iid" ]] && ! xhttp_active; then
     echo "XHTTP не включён — нечего убирать."
     exit 0
@@ -9206,66 +9526,99 @@ cmd_remove_xhttp() {
   fi
   stamp=$(date +%Y%m%d-%H%M%S)
   sbak="/root/stream-sni-router.conf.pre-remove-xhttp-${stamp}"
+  # v0.7.5 (В5): взводим глобальный rollback ДО первого изменения (БД + stream + вхосты)
+  RX_STREAM_CONF="$stream_conf"; RX_STREAM_BAK=""; RX_DB_BAK=""; RX_VHOST_BAK=""
+  trap 'remove_xhttp_rollback "прерван сигналом"; exit 130' INT TERM
+  trap 'RX_HUP=1; remove_xhttp_rollback "обрыв терминала (HUP)"; exit 129' HUP
+  trap 'remove_xhttp_rollback "неожиданное завершение (set -e)"; lucx_xui_guard_fire' EXIT
+  RX_ROLLBACK_ARMED=1
   if [[ -f "$stream_conf" ]]; then
     cp -a "$stream_conf" "$sbak"
+    RX_STREAM_BAK="$sbak"
     echo "Бэкап nginx-конфига: ${sbak}"
     # 1) stream: обе строки (map и upstream) содержат xhttp_backend
     sed -i '/xhttp_backend/d' "$stream_conf"
     if ! nginx -t >/dev/null 2>&1; then
-      cp -a "$sbak" "$stream_conf"
-      echo "ОШИБКА: nginx -t не прошёл после правки stream-конфига — конфиг возвращён."
+      remove_xhttp_rollback "nginx -t не прошёл после правки stream-конфига"
       exit 1
     fi
     if ! systemctl reload nginx; then
-      cp -a "$sbak" "$stream_conf"
-      echo "ОШИБКА: reload nginx не прошёл после правки stream-конфига — конфиг возвращён."
+      remove_xhttp_rollback "reload nginx не прошёл после правки stream-конфига"
       exit 1
     fi
   else
     echo "ВНИМАНИЕ: ${stream_conf} не найден — шаг nginx stream пропускаю, убираю остальное."
   fi
-  # 2) БД: инбаунд, его клиенты и связи
+  # 2) БД: инбаунд, его клиенты и связи — одной проверяемой транзакцией (аудит В5:
+  # ошибки изменяющих SQL больше не подавляются; .bail обрывает скрипт на первой
+  # ошибке, незакоммиченная транзакция откатывается при закрытии соединения)
   if [[ -n "$iid" ]]; then
     dbak="${XUIDB}.backup.$(date +%s)"
-    ids=$(sqlite3 "$XUIDB" "SELECT group_concat(client_id) FROM client_inbounds WHERE inbound_id=${iid};" 2>/dev/null || true)
+    # В15: ошибка чтения списка клиентов — это не «пустой список». Здесь stream-конфиг
+    # уже изменён (окно взведено), поэтому ошибка ведёт в общий откат.
+    if ! ids=$(sqlite3 "$XUIDB" "SELECT group_concat(client_id) FROM client_inbounds WHERE inbound_id=${iid};" 2>/dev/null); then
+      remove_xhttp_rollback "ошибка чтения списка клиентов инбаунда (БД заблокирована или повреждена)"
+      exit 1
+    fi
     lucx_xui_stop
     sleep 1
     if ! lucx_db_snapshot "$dbak"; then
       rm -f "$dbak"
-      lucx_xui_start || true
-      echo "ОШИБКА: бэкап БД не создан — инбаунд не удалён."
+      remove_xhttp_rollback "бэкап БД не создан (нет места?)"
       exit 1
     fi
+    RX_DB_BAK="$dbak"
     echo "Бэкап БД: ${dbak}"
-    sqlite3 "$XUIDB" "DELETE FROM client_traffics WHERE inbound_id=${iid};" 2>/dev/null || true
-    sqlite3 "$XUIDB" "DELETE FROM client_inbounds WHERE inbound_id=${iid};" 2>/dev/null || true
-    if [[ -n "${ids:-}" ]]; then
-      # клиенты этого инбаунда, не привязанные больше ни к одному инбаунду
-      sqlite3 "$XUIDB" "DELETE FROM clients WHERE id IN (${ids}) AND id NOT IN (SELECT client_id FROM client_inbounds);" 2>/dev/null || true
-    fi
-    if ! sqlite3 "$XUIDB" "DELETE FROM inbounds WHERE id=${iid};"; then
-      echo "ОШИБКА: не удалось удалить инбаунд — возвращаю БД из ${dbak}"
-      lucx_db_restore "$dbak" || echo "ВНИМАНИЕ: БД не возвращена из ${dbak} — верни вручную (x-ui остановить): rm -f ${XUIDB}-wal ${XUIDB}-shm; cp -a ${dbak} ${XUIDB}"
-      lucx_xui_start || echo "ВНИМАНИЕ: x-ui не запустился — journalctl -u x-ui -n 50"
+    local sql_orphans=""
+    # клиенты этого инбаунда, не привязанные больше ни к одному инбаунду
+    [[ -n "${ids:-}" ]] && sql_orphans="DELETE FROM clients WHERE id IN (${ids}) AND id NOT IN (SELECT client_id FROM client_inbounds);"
+    if ! sqlite3 "$XUIDB" <<SQL
+.bail on
+BEGIN IMMEDIATE;
+DELETE FROM client_traffics WHERE inbound_id=${iid};
+DELETE FROM client_inbounds WHERE inbound_id=${iid};
+${sql_orphans}
+DELETE FROM inbounds WHERE id=${iid};
+COMMIT;
+SQL
+    then
+      remove_xhttp_rollback "транзакция удаления инбаунда ${XHTTP_TAG} (id ${iid}) не прошла"
       exit 1
     fi
-    lucx_xui_start || echo "ВНИМАНИЕ: x-ui не запустился — journalctl -u x-ui -n 50"
+    lucx_xui_start || { remove_xhttp_rollback "x-ui не запустился после удаления инбаунда"; exit 1; }
     sleep 2
   fi
-  # 3) вхосты nginx и креды XHTTP
-  xhttp_remove_vhosts
+  # 3) вхосты nginx (с бэкапом для отката)
+  RX_VHOST_BAK=$(mktemp -d)
+  local vf
+  for vf in /etc/nginx/sites-enabled/xhttp-80.conf /etc/nginx/sites-available/xhttp-80.conf /etc/nginx/sites-enabled/xhttp-decoy-tls.conf /etc/nginx/sites-available/xhttp-decoy-tls.conf; do
+    [[ -e "$vf" || -L "$vf" ]] && cp -a "$vf" "$RX_VHOST_BAK/$(echo "$vf" | sed 's#/#_#g')"
+  done
+  # В16: ошибка применения конфигурации внутри helper (nginx -t/reload) — в общий откат
+  if ! xhttp_remove_vhosts; then
+    remove_xhttp_rollback "не удалось применить удаление xhttp-вхостов (nginx -t/reload)"
+    exit 1
+  fi
+  # В16: успех определяем не одним is-active (nginx мог остаться active на старом
+  # running-config): reload выше уже проверен, здесь подтверждаем сервисы и listener
+  # xray на 443 (TLS-инбаунд остаётся после удаления XHTTP)
+  if systemctl is-active --quiet x-ui && systemctl is-active --quiet nginx && wait_xray_listener 443; then
+    RX_ROLLBACK_ARMED=0
+    trap - INT TERM HUP
+    trap lucx_xui_guard_fire EXIT
+    [[ -n "$RX_VHOST_BAK" && -d "$RX_VHOST_BAK" ]] && rm -rf "$RX_VHOST_BAK"
+  else
+    remove_xhttp_rollback "x-ui или nginx не active после удаления"
+    exit 1
+  fi
+  # креды и сертификат — уже вне окна отката (нефатальные операции)
   [[ -f "$CREDS_FILE" ]] && sed -i '/^XHTTP /d' "$CREDS_FILE" || true
   if [[ "$purge" == "1" && -n "$xdom" ]]; then
     certbot delete --cert-name "$xdom" --non-interactive 2>&1 | tail -n 3 || true
   elif [[ -n "$xdom" ]]; then
     echo "Сертификат ${xdom} оставлен (удалить: certbot delete --cert-name ${xdom} или флаг --purge-cert)."
   fi
-  if systemctl is-active --quiet x-ui && systemctl is-active --quiet nginx; then
-    echo "Готово: XHTTP убран, x-ui и nginx active. Проверка: bash $0 healthcheck"
-  else
-    echo "ВНИМАНИЕ: x-ui или nginx не active — смотри journalctl -u x-ui -n 50 / nginx -t"
-    exit 1
-  fi
+  echo "Готово: XHTTP убран, x-ui и nginx active. Проверка: bash $0 healthcheck"
 }
 
 # ================== BACKUP / RESTORE (v0.6.4): перенос сервера целиком ==================
@@ -9423,10 +9776,9 @@ cmd_backup() {
   if command -v flock >/dev/null 2>&1 && exec 9>/var/lock/lucx-backup.lock; then
     flock -n 9 || { echo "ОШИБКА: backup/restore уже выполняется."; exit 1; }
   fi
-  # panel-path меняет nginx, БД и creds по очереди: архив, снятый посередине, получится смешанным
-  if command -v flock >/dev/null 2>&1 && exec 8>/var/lock/lucx-panel-path.lock; then
-    flock -n 8 || { echo "ОШИБКА: сейчас выполняется panel-path, add-xhttp или remove-xhttp — дождись и повтори backup."; exit 1; }
-  fi
+  # мутаторы схемы меняют nginx, БД и creds по очереди: архив, снятый посередине, получится смешанным.
+  # v0.7.5 (В9): backup/restore делят единый замок со ВСЕМИ мутаторами схемы (раньше — только panel-path/add-xhttp/remove-xhttp)
+  lucx_scheme_lock "backup"
   local t
   for t in sqlite3 openssl tar sha256sum; do
     command -v "$t" >/dev/null 2>&1 || { echo "ОШИБКА: не найден ${t}."; exit 1; }
@@ -9542,9 +9894,8 @@ cmd_restore() {
   if command -v flock >/dev/null 2>&1 && exec 9>/var/lock/lucx-backup.lock; then
     flock -n 9 || { echo "ОШИБКА: backup/restore уже выполняется."; exit 1; }
   fi
-  if command -v flock >/dev/null 2>&1 && exec 8>/var/lock/lucx-panel-path.lock; then
-    flock -n 8 || { echo "ОШИБКА: сейчас выполняется panel-path, add-xhttp или remove-xhttp — дождись и повтори."; exit 1; }
-  fi
+  # v0.7.5 (В9): единый замок со всеми мутаторами схемы (см. backup выше)
+  lucx_scheme_lock "restore"
   local t
   for t in sqlite3 openssl tar sha256sum nginx awk; do   # awk: bk_ufw_in_flags (v0.7.4)
     command -v "$t" >/dev/null 2>&1 || { echo "ОШИБКА: не найден ${t}."; exit 1; }

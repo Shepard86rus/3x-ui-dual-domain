@@ -9543,7 +9543,7 @@ cmd_restore() {
     flock -n 8 || { echo "ОШИБКА: сейчас выполняется panel-path, add-xhttp или remove-xhttp — дождись и повтори."; exit 1; }
   fi
   local t
-  for t in sqlite3 openssl tar sha256sum nginx; do
+  for t in sqlite3 openssl tar sha256sum nginx awk; do   # awk: bk_ufw_in_flags (v0.7.4)
     command -v "$t" >/dev/null 2>&1 || { echo "ОШИБКА: не найден ${t}."; exit 1; }
   done
   [[ -f "$XUIDB" && -f "$CREDS_FILE" && -x /usr/local/x-ui/x-ui ]] \

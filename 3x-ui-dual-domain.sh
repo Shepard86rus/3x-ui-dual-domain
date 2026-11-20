@@ -9365,13 +9365,16 @@ bk_rollback() {
 # v0.7.4 (В6/В12/L5): ядро подтверждено = процесс xray жив и включённые не-AWG инбаунды
 # слушают свои порты. $1 — число попыток (пауза 3с, дефолт 5). Ошибка чтения БД — ретрай
 # (не путаем с валидным пустым списком инбаундов). Детали: BK_XR_MISS, BK_XR_READ.
+# json_valid в запросе — живой тест на no5: у AWG-инбаунда stream_settings не-JSON,
+# json_extract давал «malformed JSON», sqlite3 завершался с rc=1 и проверка уходила
+# в ложный откат (sqlite3 печатает успешные строки, но статус ставит по ошибке).
 bk_verify_xray_core() {
   local tries=${1:-5} xr_try mp mproto mnet maddr qrc qout
   BK_XR_MISS=""; BK_XR_READ=0
   for ((xr_try=0; xr_try<tries; xr_try++)); do
     pgrep -f 'xray-linux' >/dev/null 2>&1 || { sleep 3; continue; }
     BK_XR_MISS=""; qrc=0
-    qout=$(sqlite3 -readonly "$XUIDB" "SELECT port, protocol, COALESCE(json_extract(stream_settings,'$.network'),'') FROM inbounds WHERE enable=1;" 2>/dev/null) || qrc=$?
+    qout=$(sqlite3 -readonly "$XUIDB" "SELECT port, protocol, CASE WHEN json_valid(stream_settings) THEN COALESCE(json_extract(stream_settings,'$.network'),'') ELSE '' END FROM inbounds WHERE enable=1;" 2>/dev/null) || qrc=$?
     [[ $qrc -ne 0 ]] && { sleep 3; continue; }
     BK_XR_READ=1
     while IFS='|' read -r mp mproto mnet; do   # sqlite3 разделяет колонки пайпом

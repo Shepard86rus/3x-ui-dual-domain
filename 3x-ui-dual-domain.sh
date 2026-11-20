@@ -1033,7 +1033,20 @@
 #   подсказкой про пакеты. Новый флаг --skip-awg — осознанный перенос без AWG.
 #   Блок идёт ПОСЛЕ успешного старта x-ui (BK_ARMED=0): сбой AWG-установки не вызывает
 #   откат уже восстановленных БД/nginx.
-VERSION="0.7.3"
+# v0.7.4 (2026-11-20): харденинг restore по независимому аудиту (находки В6/В7/В8):
+#   В6 — BK_ARMED теперь снимается только после подтверждения ядра: процесс xray жив
+#   и включённые не-AWG инбаунды реально слушают свои порты (ретраи ~15с; AWG-порты
+#   проверяет отдельный AWG-блок — на новом сервере их стек доустанавливается позже).
+#   Раньше: is-active x-ui + pgrep ПОСЛЕ разблокировки отката → restore говорил «OK»
+#   при мёртвом xray.
+#   В7 — ufw-правила для AWG-портов добавляются транзакционно: уже существующие не
+#   трогаем, добавленные нами запоминаем (BK_ADDED_UFW) и удаляем при откате; неуспех
+#   ufw allow — явный WARNING вместо тишины.
+#   В8 — AWG-блок: полный стек = awg + awg-quick + модуль ядра; после доустановки
+#   (и в fast path, если интерфейсы молчат) x-ui перезапускается, и слушатели
+#   AWG-портов проверяются по «awg show». Раньше: стек ставился, но восстановленные
+#   интерфейсы могли остаться выключенными до ручного рестарта (живой кейс миграции).
+VERSION="0.7.4"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -9267,6 +9280,7 @@ bk_man_get() { grep -m1 "^$2=" "$1" 2>/dev/null | cut -d= -f2- || true; }
 
 # Состояние restore в глобальных переменных: ловушка EXIT должна видеть их после exit внутри функции
 BK_STAGE=""; BK_PART=""; BK_SAFE=""; BK_ARMED=0
+BK_ADDED_UFW=""   # v0.7.4 (В7): правила ufw, добавленные этим restore (удаляются откатом)
 
 # вывод, который не падает при закрытом терминале (обрыв SSH) и дублируется в журнал
 bk_say() {
@@ -9288,6 +9302,13 @@ bk_rollback() {
   local rb_bad=0
   bk_say "Откат из ${BK_SAFE} ... (последняя ошибка команды: ${BK_ERR:-нет})"
   lucx_xui_stop 2>/dev/null
+  # v0.7.4 (В7): снимаем ufw-правила, которые добавил именно этот restore (чужие не трогаем)
+  if [[ -n "$BK_ADDED_UFW" ]] && command -v ufw >/dev/null 2>&1; then
+    local ru
+    for ru in $BK_ADDED_UFW; do ufw delete allow "$ru" >/dev/null 2>&1; done
+    bk_say "ufw: правила, добавленные restore (${BK_ADDED_UFW}), удалены откатом."
+    BK_ADDED_UFW=""
+  fi
   cp -p "$BK_SAFE/x-ui.db" "${XUIDB}.rb" && mv -f "${XUIDB}.rb" "$XUIDB" || { rb_bad=1; bk_say "ВНИМАНИЕ: не удалось вернуть БД — возьми вручную ${BK_SAFE}/x-ui.db"; }
   rm -f "${XUIDB}-wal" "${XUIDB}-shm"
   cp -p "$BK_SAFE/lucx-credentials" "${CREDS_FILE}.rb" && mv -f "${CREDS_FILE}.rb" "$CREDS_FILE" || { rb_bad=1; bk_say "ВНИМАНИЕ: не удалось вернуть creds — возьми вручную ${BK_SAFE}/lucx-credentials"; }
@@ -9656,12 +9677,21 @@ cmd_restore() {
     exit 1
   fi
 
-  # порты: install уже открыл 22/80/443 и свой AWG-порт; добавляем порты AWG из архива (повтор безопасен)
+  # порты: install уже открыл 22/80/443 и свой AWG-порт; добавляем порты AWG из архива.
+  # v0.7.4 (В7): транзакционно — существующие правила не трогаем, добавленные нами
+  # запоминаем в BK_ADDED_UFW (откат их снимет), неуспех — явный WARNING.
   local rst_ufw=""
   command -v ufw >/dev/null 2>&1 && rst_ufw=$(ufw status 2>/dev/null || true)
   if grep -q '^Status: active' <<<"$rst_ufw"; then
     for p in $ports_ok; do
-      ufw allow "${p}/udp" >/dev/null 2>&1 && bk_say "ufw: ${p}/udp открыт (порт AWG из архива)"
+      if grep -qE "^${p}/udp([[:space:]]|\$)" <<<"$rst_ufw"; then
+        : # правило уже есть (install или прошлый restore) — не наше, откатом не снимаем
+      elif ufw allow "${p}/udp" >/dev/null 2>&1; then
+        BK_ADDED_UFW+="${p}/udp "
+        bk_say "ufw: ${p}/udp открыт (порт AWG из архива)"
+      else
+        bk_say "  ВНИМАНИЕ: ufw allow ${p}/udp НЕ применился — снаружи порт закрыт, AWG-клиенты не достучатся. Открой вручную: ufw allow ${p}/udp"
+      fi
     done
   fi
 
@@ -9674,6 +9704,33 @@ cmd_restore() {
   lucx_xui_start || { bk_say "ОШИБКА: x-ui не стартовал после восстановления."; exit 1; }
   sleep 3
   systemctl is-active --quiet x-ui || { bk_say "ОШИБКА: x-ui не работает после восстановления."; exit 1; }
+  # v0.7.4 (В6): откат снимаем только с подтверждённым ядром: процесс xray жив и включённые
+  # не-AWG инбаунды реально слушают свои порты (до ~15с ретраев). AWG-порты здесь сознательно
+  # не проверяем: на новом сервере их стек доустанавливает AWG-блок ниже (после BK_ARMED=0).
+  local xr_ready=0 xr_try xmiss mp mproto mnet maddr qrows=0
+  for xr_try in 1 2 3 4 5; do
+    pgrep -f 'xray-linux' >/dev/null 2>&1 || { sleep 3; continue; }
+    xmiss=""; qrows=0
+    while read -r mp mproto mnet; do
+      qrows=$((qrows+1))
+      [[ "$mp" =~ ^[0-9]+$ ]] || continue
+      [[ "$mproto" == "awg" ]] && continue
+      if [[ "$mproto" == hysteria* || "$mproto" == "tuic" || "$mproto" == "wireguard" || "$mnet" == *udp* || "$mnet" == *kcp* || "$mnet" == *quic* ]]; then
+        maddr=$(ss -H -uln 2>/dev/null | awk '{print $4}' | grep -E ":${mp}\$" | head -1 || true)
+      else
+        maddr=$(ss -H -tln 2>/dev/null | awk '{print $4}' | grep -E ":${mp}\$" | head -1 || true)
+      fi
+      [[ -z "$maddr" ]] && xmiss+="${mp}/${mproto} "
+    done < <(sqlite3 -readonly "$XUIDB" "SELECT port, protocol, COALESCE(json_extract(stream_settings,'\$.network'),'') FROM inbounds WHERE enable=1;" 2>/dev/null)
+    [[ $qrows -eq 0 ]] && { sleep 3; continue; }   # БД не прочиталась (lock при старте) — не засчитываем как «слушателей нет», ретрай
+    [[ -z "$xmiss" ]] && { xr_ready=1; break; }
+    sleep 3
+  done
+  if [[ $xr_ready -ne 1 ]]; then
+    if [[ $qrows -eq 0 ]]; then bk_say "ОШИБКА: xray запущен, но инбаунды из восстановленной БД не читаются — откат."
+    else bk_say "ОШИБКА: x-ui активен, но xray не подтвердил работу (не слушаются: ${xmiss:-процесс xray не найден}) — откат."; fi
+    exit 1
+  fi
   BK_ARMED=0
   trap - HUP PIPE        # сброс игнорирования: дальше обычное поведение
   trap bk_cleanup EXIT
@@ -9699,21 +9756,61 @@ cmd_restore() {
     done
     [[ -n "$pmiss" ]] && bk_say "  ВНИМАНИЕ: порты из ${pf%/*}/.lucx-public-*-ports.txt без правила ufw ALLOW: ${pmiss}— снаружи они закрыты; откройте: ufw allow <порт>/tcp (или /udp)."
   fi
-  # v0.7.3: AWG-стек. Конфиги из архива уже на месте, но сами пакеты (модуль ядра + утилита awg)
-  # backup не переносит — это системные пакеты, а не данные; на свежем install их могло не быть (шаг опционален).
+  # v0.7.3 + v0.7.4 (В8): AWG-стек. Конфиги из архива уже на месте, но сами пакеты (модуль
+  # ядра + утилиты) backup не переносит — это системные пакеты, а не данные. Полный стек =
+  # awg + awg-quick + модуль; готовность интерфейсов — слушатели портов в «awg show».
+  bk_awg_stack_ok() { command -v awg >/dev/null 2>&1 && command -v awg-quick >/dev/null 2>&1 && lsmod 2>/dev/null | grep -q '^amneziawg'; }
+  bk_awg_listening() {
+    local ap all_ok=1
+    while read -r ap; do
+      [[ "$ap" =~ ^[0-9]+$ ]] || continue
+      grep -qE "^  listening port: ${ap}\$" <<<"$(awg show 2>/dev/null)" || { all_ok=0; break; }
+    done < <(sqlite3 -readonly "$XUIDB" "SELECT port FROM inbounds WHERE protocol='awg' AND enable=1;" 2>/dev/null)
+    [[ $all_ok -eq 1 ]]
+  }
+  bk_awg_restart_and_verify() {
+    systemctl restart x-ui >/dev/null 2>&1 || return 1
+    local t
+    for t in 1 2 3 4 5 6; do
+      sleep 3
+      systemctl is-active --quiet x-ui || return 1
+      bk_awg_listening && return 0
+    done
+    return 0  # x-ui жив, но слушателей нет — ветка-вызывающая решит по is-active
+  }
   if compgen -G "/etc/amnezia/amneziawg/*.conf" >/dev/null 2>&1; then
     if [[ $skip_awg -eq 1 ]]; then
       bk_say "  AWG: конфиги восстановлены, стек пропущен (--skip-awg). Доустановка: sudo bash /usr/local/x-ui/bin/install-awg-module.sh"
-    elif command -v awg >/dev/null 2>&1 && lsmod 2>/dev/null | grep -q '^amneziawg'; then
-      bk_say "  AWG: стек уже на месте (утилита + модуль ядра) — подменены только конфиги."
+    elif bk_awg_stack_ok && bk_awg_listening; then
+      bk_say "  AWG: стек на месте (awg + awg-quick + модуль), интерфейсы слушают свои порты — подменены только конфиги."
+    elif bk_awg_stack_ok; then
+      bk_say "  AWG: стек на месте, но интерфейсы молчат (конфиги подменены) — перезапускаю x-ui..."
+      if bk_awg_restart_and_verify && bk_awg_listening; then
+        bk_say "  AWG: интерфейсы подняты и слушают UDP-порты."
+      elif systemctl is-active --quiet x-ui; then
+        bk_say "  AWG: ВНИМАНИЕ: после перезапуска интерфейсы молчат — включи AWG-инбаунд в панели (или: sudo awg-quick up <iface>; статус: sudo awg show)"
+      else
+        bk_say "  AWG: ВНИМАНИЕ: x-ui не поднялся после перезапуска! Проверь: systemctl status x-ui; journalctl -u x-ui -n 50"
+      fi
     elif [[ -x /usr/local/x-ui/bin/install-awg-module.sh ]]; then
       bk_say "  AWG: конфиги из архива есть, а стек не установлен — ставлю (install-awg-module.sh, нужен доступ к GitHub)..."
       if bash /usr/local/x-ui/bin/install-awg-module.sh; then
         modprobe amneziawg 2>/dev/null || true
         if lsmod 2>/dev/null | grep -q '^amneziawg'; then
-          bk_say "  AWG: стек установлен, модуль загружен — конфиги поднимутся при запуске AWG-инбаунда."
+          if bk_awg_stack_ok; then
+            bk_say "  AWG: стек доустановлен; перезапускаю x-ui, чтобы поднять восстановленные интерфейсы..."
+            if bk_awg_restart_and_verify && bk_awg_listening; then
+              bk_say "  AWG: интерфейсы подняты и слушают UDP-порты — миграция AWG завершена."
+            elif systemctl is-active --quiet x-ui; then
+              bk_say "  AWG: ВНИМАНИЕ: стек установлен, x-ui перезапущен, но интерфейсы молчат — включи AWG-инбаунд в панели (или: sudo awg-quick up <iface>)."
+            else
+              bk_say "  AWG: ВНИМАНИЕ: x-ui не поднялся после перезапуска! Проверь: systemctl status x-ui; journalctl -u x-ui -n 50"
+            fi
+          else
+            bk_say "  AWG: ВНИМАНИЕ: установщик отработал, но полного стека не видно (awg/awg-quick/модуль) — проверь: command -v awg awg-quick; sudo modprobe amneziawg"
+          fi
         else
-          bk_say "  AWG: ВНИМАНИЕ: стек поставлен, но модуль не загрузился (обычно нужна перезагрузка после свежего ядра): sudo modprobe amneziawg или sudo reboot"
+          bk_say "  AWG: ВНИМАНИЕ: стек поставлен, но модуль не загрузился (обычно нужна перезагрузка после свежего ядра): sudo reboot — после неё x-ui поднимет интерфейсы сам"
         fi
       else
         bk_say "  AWG: ВНИМАНИЕ: автоустановка не удалась (нет доступа к GitHub?) — доустанови вручную: sudo bash /usr/local/x-ui/bin/install-awg-module.sh"

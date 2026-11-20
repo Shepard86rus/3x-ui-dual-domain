@@ -1022,7 +1022,18 @@
 #   add-hy2 — retrofit-команда (добавить hy2 на серверы, поставленные до v0.3.1),
 #   на живой ноде она трогает hy2-инбаунд, а не качает файлы. Правильная подсказка —
 #   зеркальные curl-строки (те же, что печатает ensure_dbip) — теперь в тексте WARN.
-VERSION="0.7.2"
+# v0.7.3 (2026-11-20): restore доустанавливает AWG-стек (по живому случаю миграции клиента:
+#   backup/restore перенёс конфиги /etc/amnezia/amneziawg, но модуль ядра и утилита awg —
+#   системные пакеты, в архив не входят; на новом сервере install был без шага AWG →
+#   healthcheck [9]: FAIL «awg НЕ установлен»). Теперь после восстановления конфигов:
+#   конфиги есть, а стека нет → запускается /usr/local/x-ui/bin/install-awg-module.sh
+#   (тот же установщик, что у install/hc, код не дублируется) + modprobe amneziawg с
+#   проверкой lsmod; стек уже есть → только отметка; установка упала (нет GitHub) →
+#   WARN с ручной командой, restore не прерывается; установщик не найден → WARN с
+#   подсказкой про пакеты. Новый флаг --skip-awg — осознанный перенос без AWG.
+#   Блок идёт ПОСЛЕ успешного старта x-ui (BK_ARMED=0): сбой AWG-установки не вызывает
+#   откат уже восстановленных БД/nginx.
+VERSION="0.7.3"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -9420,18 +9431,19 @@ cmd_backup() {
 }
 
 cmd_restore() {
-  local in="" assume_yes=0 force=0 use_certs=0 a ans
+  local in="" assume_yes=0 force=0 use_certs=0 skip_awg=0 a ans
   for a in "$@"; do
     case "$a" in
       -y|--yes) assume_yes=1 ;;
       --force) force=1 ;;
       --certs) use_certs=1 ;;
-      -*) echo "Неизвестный флаг: $a"; echo "Использование: sudo bash $0 restore <файл.lucxbak> [--yes] [--certs] [--force]"; exit 1 ;;
+      --skip-awg) skip_awg=1 ;;
+      -*) echo "Неизвестный флаг: $a"; echo "Использование: sudo bash $0 restore <файл.lucxbak> [--yes] [--certs] [--force] [--skip-awg]"; exit 1 ;;
       *) in="$a" ;;
     esac
   done
   if [[ $EUID -ne 0 ]]; then echo "Запусти от root: sudo bash $0 restore <файл>"; exit 1; fi
-  [[ -n "$in" && -f "$in" ]] || { echo "Использование: sudo bash $0 restore <файл.lucxbak> [--yes] [--certs] [--force]"; exit 1; }
+  [[ -n "$in" && -f "$in" ]] || { echo "Использование: sudo bash $0 restore <файл.lucxbak> [--yes] [--certs] [--force] [--skip-awg]"; exit 1; }
   if command -v flock >/dev/null 2>&1 && exec 9>/var/lock/lucx-backup.lock; then
     flock -n 9 || { echo "ОШИБКА: backup/restore уже выполняется."; exit 1; }
   fi
@@ -9686,6 +9698,29 @@ cmd_restore() {
       done < "$pf"
     done
     [[ -n "$pmiss" ]] && bk_say "  ВНИМАНИЕ: порты из ${pf%/*}/.lucx-public-*-ports.txt без правила ufw ALLOW: ${pmiss}— снаружи они закрыты; откройте: ufw allow <порт>/tcp (или /udp)."
+  fi
+  # v0.7.3: AWG-стек. Конфиги из архива уже на месте, но сами пакеты (модуль ядра + утилита awg)
+  # backup не переносит — это системные пакеты, а не данные; на свежем install их могло не быть (шаг опционален).
+  if compgen -G "/etc/amnezia/amneziawg/*.conf" >/dev/null 2>&1; then
+    if [[ $skip_awg -eq 1 ]]; then
+      bk_say "  AWG: конфиги восстановлены, стек пропущен (--skip-awg). Доустановка: sudo bash /usr/local/x-ui/bin/install-awg-module.sh"
+    elif command -v awg >/dev/null 2>&1 && lsmod 2>/dev/null | grep -q '^amneziawg'; then
+      bk_say "  AWG: стек уже на месте (утилита + модуль ядра) — подменены только конфиги."
+    elif [[ -x /usr/local/x-ui/bin/install-awg-module.sh ]]; then
+      bk_say "  AWG: конфиги из архива есть, а стек не установлен — ставлю (install-awg-module.sh, нужен доступ к GitHub)..."
+      if bash /usr/local/x-ui/bin/install-awg-module.sh; then
+        modprobe amneziawg 2>/dev/null || true
+        if lsmod 2>/dev/null | grep -q '^amneziawg'; then
+          bk_say "  AWG: стек установлен, модуль загружен — конфиги поднимутся при запуске AWG-инбаунда."
+        else
+          bk_say "  AWG: ВНИМАНИЕ: стек поставлен, но модуль не загрузился (обычно нужна перезагрузка после свежего ядра): sudo modprobe amneziawg или sudo reboot"
+        fi
+      else
+        bk_say "  AWG: ВНИМАНИЕ: автоустановка не удалась (нет доступа к GitHub?) — доустанови вручную: sudo bash /usr/local/x-ui/bin/install-awg-module.sh"
+      fi
+    else
+      bk_say "  AWG: ВНИМАНИЕ: конфиги восстановлены, но /usr/local/x-ui/bin/install-awg-module.sh не найден — доустанови стек вручную (пакеты amneziawg-tools + модуль ядра)."
+    fi
   fi
   bk_say "  Старый сервер выключи или останови там бота: один токен Telegram у двух серверов мешает; удали ${BK_SAFE} после проверки (там секреты)."
   bk_say "  Если у старого сервера был бот: sudo bash $0 add-bot. AWG: проверь подключение клиента; при необходимости перезагрузи сервер."

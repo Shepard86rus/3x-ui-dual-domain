@@ -1046,6 +1046,22 @@
 #   (и в fast path, если интерфейсы молчат) x-ui перезапускается, и слушатели
 #   AWG-портов проверяются по «awg show». Раньше: стек ставился, но восстановленные
 #   интерфейсы могли остаться выключенными до ручного рестарта (живой кейс миграции).
+#   Вторая итерация по повторному аудиту (В10–В12, L5–L6):
+#   В10 — покрытием ufw считается только IPv4-разрешение (ALLOW/LIMIT); явный
+#   DENY/REJECT на порт — WARNING, что ALLOW его не перекроет (раньше правило
+#   добавлялось молча, а порт оставался закрыт).
+#   В11 — bk_awg_listening при ошибке чтения БД возвращает «не готово», а не
+#   «готово» (раньше sqlite-лок делал вид, что слушателей проверять не надо).
+#   В12 — рестарт x-ui ради AWG получил собственный recovery-контур: вторая
+#   попытка поднять службу + повторная проверка ядра; если ядро не восстановилось —
+#   restore завершается ошибкой, а не «успехом» с мёртвой нодой.
+#   L5 — проверка ядра (bk_verify_xray_core) различает ошибку SQL (ретрай) и
+#   валидный пустой результат (пропуск), сообщение об отказе содержит детали.
+#   L6 — откат ufw сообщает по каждому правилу отдельно: какие сняты, какие
+#   остались (с командой ручного удаления).
+#   Отдельно (самопроверка): разбор вывода sqlite3 в bk_verify_xray_core ведётся
+#   через IFS='|' — sqlite3 разделяет колонки пайпом, без этого проверка портов
+#   молча пропускала все инбаунды и всегда «проходила».
 VERSION="0.7.4"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
@@ -9281,6 +9297,7 @@ bk_man_get() { grep -m1 "^$2=" "$1" 2>/dev/null | cut -d= -f2- || true; }
 # Состояние restore в глобальных переменных: ловушка EXIT должна видеть их после exit внутри функции
 BK_STAGE=""; BK_PART=""; BK_SAFE=""; BK_ARMED=0
 BK_ADDED_UFW=""   # v0.7.4 (В7): правила ufw, добавленные этим restore (удаляются откатом)
+BK_XR_MISS=""; BK_XR_READ=0   # v0.7.4 (В6/В12): детали последней проверки bk_verify_xray_core
 
 # вывод, который не падает при закрытом терминале (обрыв SSH) и дублируется в журнал
 bk_say() {
@@ -9302,11 +9319,13 @@ bk_rollback() {
   local rb_bad=0
   bk_say "Откат из ${BK_SAFE} ... (последняя ошибка команды: ${BK_ERR:-нет})"
   lucx_xui_stop 2>/dev/null
-  # v0.7.4 (В7): снимаем ufw-правила, которые добавил именно этот restore (чужие не трогаем)
+  # v0.7.4 (В7/L6): снимаем ufw-правила, которые добавил именно этот restore (чужие не трогаем);
+  # об удалении сообщаем по факту: что не удалилось — отдельный WARNING со списком
   if [[ -n "$BK_ADDED_UFW" ]] && command -v ufw >/dev/null 2>&1; then
-    local ru
-    for ru in $BK_ADDED_UFW; do ufw delete allow "$ru" >/dev/null 2>&1; done
-    bk_say "ufw: правила, добавленные restore (${BK_ADDED_UFW}), удалены откатом."
+    local ru ru_left=""
+    for ru in $BK_ADDED_UFW; do ufw delete allow "$ru" >/dev/null 2>&1 || ru_left+="$ru "; done
+    if [[ -n "$ru_left" ]]; then bk_say "ВНИМАНИЕ: ufw-правила ${ru_left}не удалены (удали вручную: ufw delete allow <порт>/udp); остальные из (${BK_ADDED_UFW}) сняты."
+    else bk_say "ufw: правила, добавленные restore (${BK_ADDED_UFW}), удалены откатом."; fi
     BK_ADDED_UFW=""
   fi
   cp -p "$BK_SAFE/x-ui.db" "${XUIDB}.rb" && mv -f "${XUIDB}.rb" "$XUIDB" || { rb_bad=1; bk_say "ВНИМАНИЕ: не удалось вернуть БД — возьми вручную ${BK_SAFE}/x-ui.db"; }
@@ -9334,6 +9353,34 @@ bk_rollback() {
   else
     bk_say "ВНИМАНИЕ: после отката nginx -t НЕ проходит — не перезагружай сервер, смотри ${BK_SAFE}"
   fi
+}
+
+# v0.7.4 (В6/В12/L5): ядро подтверждено = процесс xray жив и включённые не-AWG инбаунды
+# слушают свои порты. $1 — число попыток (пауза 3с, дефолт 5). Ошибка чтения БД — ретрай
+# (не путаем с валидным пустым списком инбаундов). Детали: BK_XR_MISS, BK_XR_READ.
+bk_verify_xray_core() {
+  local tries=${1:-5} xr_try mp mproto mnet maddr qrc qout
+  BK_XR_MISS=""; BK_XR_READ=0
+  for ((xr_try=0; xr_try<tries; xr_try++)); do
+    pgrep -f 'xray-linux' >/dev/null 2>&1 || { sleep 3; continue; }
+    BK_XR_MISS=""; qrc=0
+    qout=$(sqlite3 -readonly "$XUIDB" "SELECT port, protocol, COALESCE(json_extract(stream_settings,'$.network'),'') FROM inbounds WHERE enable=1;" 2>/dev/null) || qrc=$?
+    [[ $qrc -ne 0 ]] && { sleep 3; continue; }
+    BK_XR_READ=1
+    while IFS='|' read -r mp mproto mnet; do   # sqlite3 разделяет колонки пайпом
+      [[ "$mp" =~ ^[0-9]+$ ]] || continue
+      [[ "$mproto" == "awg" ]] && continue
+      if [[ "$mproto" == hysteria* || "$mproto" == "tuic" || "$mproto" == "wireguard" || "$mnet" == *udp* || "$mnet" == *kcp* || "$mnet" == *quic* ]]; then
+        maddr=$(ss -H -uln 2>/dev/null | awk '{print $4}' | grep -E ":${mp}\$" | head -1 || true)
+      else
+        maddr=$(ss -H -tln 2>/dev/null | awk '{print $4}' | grep -E ":${mp}\$" | head -1 || true)
+      fi
+      [[ -z "$maddr" ]] && BK_XR_MISS+="${mp}/${mproto} "
+    done <<<"$qout"
+    [[ -z "$BK_XR_MISS" ]] && return 0
+    sleep 3
+  done
+  return 1
 }
 
 cmd_backup() {
@@ -9684,13 +9731,19 @@ cmd_restore() {
   command -v ufw >/dev/null 2>&1 && rst_ufw=$(ufw status 2>/dev/null || true)
   if grep -q '^Status: active' <<<"$rst_ufw"; then
     for p in $ports_ok; do
-      if grep -qE "^${p}/udp([[:space:]]|\$)" <<<"$rst_ufw"; then
+      # v0.7.4 (В10): покрытием считаем ТОЛЬКО IPv4-разрешение (ALLOW/LIMIT): DENY/REJECT
+      # и правило «только v6» порт снаружи не открывают
+      if grep -qE "^${p}/udp[[:space:]]+(ALLOW|LIMIT)\b" <<<"$rst_ufw"; then
         : # правило уже есть (install или прошлый restore) — не наше, откатом не снимаем
-      elif ufw allow "${p}/udp" >/dev/null 2>&1; then
-        BK_ADDED_UFW+="${p}/udp "
-        bk_say "ufw: ${p}/udp открыт (порт AWG из архива)"
       else
-        bk_say "  ВНИМАНИЕ: ufw allow ${p}/udp НЕ применился — снаружи порт закрыт, AWG-клиенты не достучатся. Открой вручную: ufw allow ${p}/udp"
+        grep -qE "^${p}/udp[[:space:]]+(DENY|REJECT)\b" <<<"$rst_ufw" && \
+          bk_say "  ВНИМАНИЕ: для ${p}/udp уже есть запрещающее правило ufw (DENY/REJECT) — оно старше, ALLOW его не перекроет: ufw delete deny ${p}/udp"
+        if ufw allow "${p}/udp" >/dev/null 2>&1; then
+          BK_ADDED_UFW+="${p}/udp "
+          bk_say "ufw: ${p}/udp открыт (порт AWG из архива)"
+        else
+          bk_say "  ВНИМАНИЕ: ufw allow ${p}/udp НЕ применился — снаружи порт закрыт, AWG-клиенты не достучатся. Открой вручную: ufw allow ${p}/udp"
+        fi
       fi
     done
   fi
@@ -9707,28 +9760,13 @@ cmd_restore() {
   # v0.7.4 (В6): откат снимаем только с подтверждённым ядром: процесс xray жив и включённые
   # не-AWG инбаунды реально слушают свои порты (до ~15с ретраев). AWG-порты здесь сознательно
   # не проверяем: на новом сервере их стек доустанавливает AWG-блок ниже (после BK_ARMED=0).
-  local xr_ready=0 xr_try xmiss mp mproto mnet maddr qrows=0
-  for xr_try in 1 2 3 4 5; do
-    pgrep -f 'xray-linux' >/dev/null 2>&1 || { sleep 3; continue; }
-    xmiss=""; qrows=0
-    while read -r mp mproto mnet; do
-      qrows=$((qrows+1))
-      [[ "$mp" =~ ^[0-9]+$ ]] || continue
-      [[ "$mproto" == "awg" ]] && continue
-      if [[ "$mproto" == hysteria* || "$mproto" == "tuic" || "$mproto" == "wireguard" || "$mnet" == *udp* || "$mnet" == *kcp* || "$mnet" == *quic* ]]; then
-        maddr=$(ss -H -uln 2>/dev/null | awk '{print $4}' | grep -E ":${mp}\$" | head -1 || true)
-      else
-        maddr=$(ss -H -tln 2>/dev/null | awk '{print $4}' | grep -E ":${mp}\$" | head -1 || true)
-      fi
-      [[ -z "$maddr" ]] && xmiss+="${mp}/${mproto} "
-    done < <(sqlite3 -readonly "$XUIDB" "SELECT port, protocol, COALESCE(json_extract(stream_settings,'\$.network'),'') FROM inbounds WHERE enable=1;" 2>/dev/null)
-    [[ $qrows -eq 0 ]] && { sleep 3; continue; }   # БД не прочиталась (lock при старте) — не засчитываем как «слушателей нет», ретрай
-    [[ -z "$xmiss" ]] && { xr_ready=1; break; }
-    sleep 3
-  done
-  if [[ $xr_ready -ne 1 ]]; then
-    if [[ $qrows -eq 0 ]]; then bk_say "ОШИБКА: xray запущен, но инбаунды из восстановленной БД не читаются — откат."
-    else bk_say "ОШИБКА: x-ui активен, но xray не подтвердил работу (не слушаются: ${xmiss:-процесс xray не найден}) — откат."; fi
+  if bk_verify_xray_core 5; then
+    bk_say "  xray подтверждён: процесс жив, включённые инбаунды слушают порты."
+  elif [[ $BK_XR_READ -eq 0 ]]; then
+    bk_say "ОШИБКА: xray не подтвердил работу: процесс не появился или инбаунды из восстановленной БД не читаются — откат."
+    exit 1
+  else
+    bk_say "ОШИБКА: x-ui активен, но xray не подтвердил работу (не слушаются: ${BK_XR_MISS:-процесс xray не найден}) — откат."
     exit 1
   fi
   BK_ARMED=0
@@ -9760,23 +9798,34 @@ cmd_restore() {
   # ядра + утилиты) backup не переносит — это системные пакеты, а не данные. Полный стек =
   # awg + awg-quick + модуль; готовность интерфейсов — слушатели портов в «awg show».
   bk_awg_stack_ok() { command -v awg >/dev/null 2>&1 && command -v awg-quick >/dev/null 2>&1 && lsmod 2>/dev/null | grep -q '^amneziawg'; }
+  # v0.7.4 (В11): ошибка чтения БД = «готовность не подтверждена», а не «слушают»;
+  # валидный пустой список awg-инбаундов = проверять нечего → готово
   bk_awg_listening() {
-    local ap all_ok=1
+    local ap all_ok=1 qrc=0 qout
+    qout=$(sqlite3 -readonly "$XUIDB" "SELECT port FROM inbounds WHERE protocol='awg' AND enable=1;" 2>/dev/null) || qrc=$?
+    [[ $qrc -ne 0 ]] && return 1
     while read -r ap; do
       [[ "$ap" =~ ^[0-9]+$ ]] || continue
       grep -qE "^  listening port: ${ap}\$" <<<"$(awg show 2>/dev/null)" || { all_ok=0; break; }
-    done < <(sqlite3 -readonly "$XUIDB" "SELECT port FROM inbounds WHERE protocol='awg' AND enable=1;" 2>/dev/null)
+    done <<<"$qout"
     [[ $all_ok -eq 1 ]]
   }
-  bk_awg_restart_and_verify() {
-    systemctl restart x-ui >/dev/null 2>&1 || return 1
+  # v0.7.4 (В12): рестарт x-ui ради AWG идёт ПОСЛЕ снятия отката, поэтому у него свой
+  # recovery-контур: при сбое — вторая попытка поднять службу, затем повторная проверка
+  # ранее подтверждённого ядра (не-AWG). Возврат 0 = x-ui жив и ядро в порядке.
+  bk_awg_restart_xui() {
+    systemctl restart x-ui >/dev/null 2>&1 || { sleep 2; systemctl restart x-ui >/dev/null 2>&1; }
+    sleep 3
+    systemctl is-active --quiet x-ui || return 1
+    bk_verify_xray_core 3
+  }
+  bk_awg_wait_listeners() {
     local t
     for t in 1 2 3 4 5 6; do
-      sleep 3
-      systemctl is-active --quiet x-ui || return 1
       bk_awg_listening && return 0
+      sleep 3
     done
-    return 0  # x-ui жив, но слушателей нет — ветка-вызывающая решит по is-active
+    bk_awg_listening
   }
   if compgen -G "/etc/amnezia/amneziawg/*.conf" >/dev/null 2>&1; then
     if [[ $skip_awg -eq 1 ]]; then
@@ -9785,12 +9834,14 @@ cmd_restore() {
       bk_say "  AWG: стек на месте (awg + awg-quick + модуль), интерфейсы слушают свои порты — подменены только конфиги."
     elif bk_awg_stack_ok; then
       bk_say "  AWG: стек на месте, но интерфейсы молчат (конфиги подменены) — перезапускаю x-ui..."
-      if bk_awg_restart_and_verify && bk_awg_listening; then
+      if ! bk_awg_restart_xui; then
+        bk_say "ОШИБКА: после перезапуска ради AWG ядро x-ui/xray не восстановилось (${BK_XR_MISS:+не слушаются: $BK_XR_MISS}). Прерываю restore с ошибкой — проверь: systemctl status x-ui; journalctl -u x-ui -n 50"
+        exit 1
+      fi
+      if bk_awg_wait_listeners; then
         bk_say "  AWG: интерфейсы подняты и слушают UDP-порты."
-      elif systemctl is-active --quiet x-ui; then
-        bk_say "  AWG: ВНИМАНИЕ: после перезапуска интерфейсы молчат — включи AWG-инбаунд в панели (или: sudo awg-quick up <iface>; статус: sudo awg show)"
       else
-        bk_say "  AWG: ВНИМАНИЕ: x-ui не поднялся после перезапуска! Проверь: systemctl status x-ui; journalctl -u x-ui -n 50"
+        bk_say "  AWG: ВНИМАНИЕ: ядро в порядке, но AWG-интерфейсы молчат — включи AWG-инбаунд в панели (или: sudo awg-quick up <iface>; статус: sudo awg show)"
       fi
     elif [[ -x /usr/local/x-ui/bin/install-awg-module.sh ]]; then
       bk_say "  AWG: конфиги из архива есть, а стек не установлен — ставлю (install-awg-module.sh, нужен доступ к GitHub)..."
@@ -9799,12 +9850,14 @@ cmd_restore() {
         if lsmod 2>/dev/null | grep -q '^amneziawg'; then
           if bk_awg_stack_ok; then
             bk_say "  AWG: стек доустановлен; перезапускаю x-ui, чтобы поднять восстановленные интерфейсы..."
-            if bk_awg_restart_and_verify && bk_awg_listening; then
+            if ! bk_awg_restart_xui; then
+              bk_say "ОШИБКА: стек AWG установлен, но после перезапуска ядро x-ui/xray не восстановилось (${BK_XR_MISS:+не слушаются: $BK_XR_MISS}). Прерываю restore с ошибкой — проверь: systemctl status x-ui; journalctl -u x-ui -n 50"
+              exit 1
+            fi
+            if bk_awg_wait_listeners; then
               bk_say "  AWG: интерфейсы подняты и слушают UDP-порты — миграция AWG завершена."
-            elif systemctl is-active --quiet x-ui; then
-              bk_say "  AWG: ВНИМАНИЕ: стек установлен, x-ui перезапущен, но интерфейсы молчат — включи AWG-инбаунд в панели (или: sudo awg-quick up <iface>)."
             else
-              bk_say "  AWG: ВНИМАНИЕ: x-ui не поднялся после перезапуска! Проверь: systemctl status x-ui; journalctl -u x-ui -n 50"
+              bk_say "  AWG: ВНИМАНИЕ: стек установлен, ядро в порядке, но интерфейсы молчат — включи AWG-инбаунд в панели (или: sudo awg-quick up <iface>)."
             fi
           else
             bk_say "  AWG: ВНИМАНИЕ: установщик отработал, но полного стека не видно (awg/awg-quick/модуль) — проверь: command -v awg awg-quick; sudo modprobe amneziawg"

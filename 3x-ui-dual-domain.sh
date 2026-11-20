@@ -1063,10 +1063,12 @@
 #   через IFS='|' — sqlite3 разделяет колонки пайпом, без этого проверка портов
 #   молча пропускала все инбаунды и всегда «проходила».
 #   Третья итерация по повторному аудиту:
-#   В13 — покрытием ufw считаются только ВХОДЯЩИЕ правила: ALLOW/LIMIT без
-#   направления или с IN; «ALLOW OUT»/«ALLOW FWD» входящие не разрешают и
-#   больше не засчитываются (симметрично уточнена диагностика DENY/REJECT и
-#   проверка портов из .lucx-public-*-ports.txt).
+#   В13+В14 — покрытием ufw считаются только ВХОДЯЩИЕ правила (ALLOW/LIMIT без
+#   направления или с IN), а классификация ведётся ПОСТРОЧНО общим хелпером
+#   bk_ufw_in_flags: «ALLOW OUT»/«ALLOW FWD» не засчитываются за покрытие, но и
+#   не отменяют входящее правило из ДРУГОЙ строки того же порта; входящий
+#   DENY/REJECT не гасится запретами других направлений. Та же построчная
+#   классификация применена к проверке портов из .lucx-public-*-ports.txt.
 VERSION="0.7.4"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
@@ -9388,6 +9390,23 @@ bk_verify_xray_core() {
   return 1
 }
 
+# v0.7.4 (В10/В13/В14): классификация правил ufw по порту ПОСТРОЧНО (каждая строка
+# независимо, иначе OUT/FWD-правило одного порта гасит чужое входящее). $1=порт,
+# $2=proto; на stdin — вывод «ufw status». Печатает два флага: «CD» — C=1 есть
+# входящее ALLOW/LIMIT (без направления или IN; голый номер порта без proto = оба
+# протокола), D=1 есть входящий DENY/REJECT. Строки «(v6)» не совпадают по action.
+bk_ufw_in_flags() {
+  awk -v pn="$1" -v pp="$2" '
+    $1 == pn || $1 == pn "/" pp {
+      i = ($2 == "on") ? 4 : 2          # возможна колонка «on <iface>»
+      a = $i; d = $(i+1)                # action; дальше либо направление, либо From
+      if ((a == "ALLOW" || a == "LIMIT") && d != "OUT" && d != "FWD") c = 1
+      if ((a == "DENY"  || a == "REJECT") && d != "OUT" && d != "FWD") n = 1
+    }
+    END { print (c ? "1" : "0") (n ? "1" : "0") }
+  '
+}
+
 cmd_backup() {
   local out="" with_certs=0 a
   for a in "$@"; do
@@ -9736,17 +9755,15 @@ cmd_restore() {
   command -v ufw >/dev/null 2>&1 && rst_ufw=$(ufw status 2>/dev/null || true)
   if grep -q '^Status: active' <<<"$rst_ufw"; then
     for p in $ports_ok; do
-      # v0.7.4 (В10/В13): покрытием считаем ТОЛЬКО входящее IPv4-разрешение — ALLOW/LIMIT
-      # без направления или с IN: правила «ALLOW OUT»/«ALLOW FWD» и «только v6» порт снаружи
-      # не открывают (возможна колонка «on <iface>» между портом и действием; ERE без
-      # lookahead, поэтому направление отсекаем вторым grep)
-      local uact="^${p}/udp([[:space:]]+on[[:space:]]+[^[:space:]]+)?[[:space:]]+"
-      if grep -qE "${uact}(ALLOW|LIMIT)\b" <<<"$rst_ufw" \
-         && ! grep -qE "${uact}(ALLOW|LIMIT)[[:space:]]+(OUT|FWD)\b" <<<"$rst_ufw"; then
-        : # правило уже есть (install или прошлый restore) — не наше, откатом не снимаем
+      # v0.7.4 (В10/В13/В14): покрытием считаем ТОЛЬКО входящее IPv4-разрешение — ALLOW/LIMIT
+      # без направления или с IN; классификация построчная (bk_ufw_in_flags): OUT/FWD-правило
+      # того же порта в ДРУГОЙ строке ни покрытие, ни запрет не отменяет
+      local ucls
+      ucls=$(bk_ufw_in_flags "$p" udp <<<"$rst_ufw")
+      if [[ "${ucls:0:1}" == "1" ]]; then
+        : # входящее правило уже есть (install или прошлый restore) — не наше, откатом не снимаем
       else
-        if grep -qE "${uact}(DENY|REJECT)\b" <<<"$rst_ufw" \
-           && ! grep -qE "${uact}(DENY|REJECT)[[:space:]]+(OUT|FWD)\b" <<<"$rst_ufw"; then
+        if [[ "${ucls:1:1}" == "1" ]]; then
           bk_say "  ВНИМАНИЕ: для ${p}/udp уже есть входящее запрещающее правило ufw (DENY/REJECT) — оно старше, ALLOW его не перекроет: ufw delete deny ${p}/udp"
         fi
         if ufw allow "${p}/udp" >/dev/null 2>&1; then
@@ -9793,16 +9810,15 @@ cmd_restore() {
   # архива, а правил ufw они не создают; healthcheck такие порты считает разрешёнными и о закрытом ufw молчит
   [[ -n "$rst_ufw" ]] && rst_ufw=$(ufw status 2>/dev/null || true)   # снимок после ufw allow для портов AWG: иначе они попадут в «без правила»
   if grep -q '^Status: active' <<<"$rst_ufw"; then
-    local pf pproto pnum pmiss="" pufw="$rst_ufw"
+    local pf pproto pnum pmiss="" pufw="$rst_ufw" ucls
     for pproto in tcp udp; do
       pf="/root/.lucx-public-${pproto}-ports.txt"
       [[ -f "$pf" ]] || continue
       while IFS= read -r pnum || [[ -n "$pnum" ]]; do
         pnum="${pnum%%#*}"; pnum="$(tr -d '[:space:]' <<<"$pnum")"
         [[ "$pnum" =~ ^[0-9]+$ ]] || continue
-        grep -qE "^${pnum}(/${pproto})?([[:space:]]+on[[:space:]]+[^[:space:]]+)?[[:space:]]+(ALLOW|LIMIT)\b" <<<"$pufw" \
-          && ! grep -qE "^${pnum}(/${pproto})?([[:space:]]+on[[:space:]]+[^[:space:]]+)?[[:space:]]+(ALLOW|LIMIT)[[:space:]]+(OUT|FWD)\b" <<<"$pufw" \
-          || pmiss+="${pnum}/${pproto} "
+        ucls=$(bk_ufw_in_flags "$pnum" "$pproto" <<<"$pufw")
+        [[ "${ucls:0:1}" == "1" ]] || pmiss+="${pnum}/${pproto} "
       done < "$pf"
     done
     [[ -n "$pmiss" ]] && bk_say "  ВНИМАНИЕ: порты из ${pf%/*}/.lucx-public-*-ports.txt без правила ufw ALLOW: ${pmiss}— снаружи они закрыты; откройте: ufw allow <порт>/tcp (или /udp)."

@@ -185,7 +185,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Shepard86rus/3x-ui-dual-doma
 | [docs/scheme.md](docs/scheme.md) | как устроена схема, зачем два домена, Reality-only на 443 (с 0.7.0), h2 на nginx, прежняя схема TLS + h2 + Reality |
 | [docs/install.md](docs/install.md) | установка по этапам, ручная настройка панели |
 | [docs/menu.md](docs/menu.md) | интерактивное меню скрипта: пункты, `?номер`, подтверждение опасных команд |
-| [docs/service-commands.md](docs/service-commands.md) | служебные команды для старых серверов и сбоев установки (`panel-path`, `add-h2`, `add-reality-front`, `add-hy2`, `add-vls` / `add-reality`) |
+| [docs/service-commands.md](docs/service-commands.md) | служебные команды для старых серверов и сбоев установки (`panel-path`, `add-h2`, `add-reality-front`, `add-hy2`, `add-vls` / `add-reality`, `dbip-retry`) |
 | [docs/clients.md](docs/clients.md) | приложение-клиент (Happ; INCY и Clash Verge Rev временно не рекомендуются), ссылка подписки, как подключиться |
 | [docs/xhttp.md](docs/xhttp.md) | необязательный третий вход XHTTP+Reality (`add-xhttp`) |
 | [docs/panel-rules.md](docs/panel-rules.md) | что можно и нельзя в панели, как добавлять новые протоколы |

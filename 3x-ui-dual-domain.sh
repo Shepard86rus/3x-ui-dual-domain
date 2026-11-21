@@ -3811,12 +3811,18 @@ lucx_panel_rotate_creds() {
   # итог ротации для финального вывода установки: api | cli | kept-old | failed
   LUCX_CREDS_STATE="failed"
   _lucx_creds_writeres() { # переписать result.env на финальные креды (права 600); rc: 0 = записан
-    # iter3 (Н10): rc больше не маскируется — сбой записи/mv возвращает 1,
-    # вызывающий код печатает WARN (креды в панели при этом уже стоят)
-    if { printf 'XUI_USERNAME=%s\n' "$XUI_USERNAME"
-         printf 'XUI_PASSWORD=%s\n' "$XUI_PASSWORD"
-         grep -E '^(XUI_PANEL_PORT|XUI_WEB_BASE_PATH|XUI_ACCESS_URL|XUI_API_TOKEN|XUI_DB_TYPE)=' "$res" || true
-       } > "${res}.new" && chmod 600 "${res}.new" && mv -f "${res}.new" "$res"; then
+    # iter3 (Н10): rc не маскируется. iter4 (Н10 дочистка): && -цепочка —
+    # сбой ЛЮБОГО printf обрывает запись, .new удаляется, оригинал не
+    # подменяется частичным файлом (grep с || true идёт последним и итог
+    # группы не определяет; отсутствие ключей — не ошибка)
+    if ! { printf 'XUI_USERNAME=%s\n' "$XUI_USERNAME" && \
+           printf 'XUI_PASSWORD=%s\n' "$XUI_PASSWORD" && \
+           { grep -E '^(XUI_PANEL_PORT|XUI_WEB_BASE_PATH|XUI_ACCESS_URL|XUI_API_TOKEN|XUI_DB_TYPE)=' "$res" || true; }
+         } > "${res}.new"; then
+      rm -f "${res}.new"
+      return 1
+    fi
+    if chmod 600 "${res}.new" && mv -f "${res}.new" "$res"; then
       return 0
     fi
     rm -f "${res}.new"
@@ -8640,8 +8646,11 @@ send_txt() { # $1 chat, $2 текст
 }
 # iter3 (К1): как и send_txt — текст/разметка файлами в stdin-конфиге, в argv ноль полей формы
 send_card() { # $1 chat, $2 html-текст, $3 json-разметка
+  # iter4 (Н11): mktemp — последовательно; cleanup трогает только созданное
+  # (при сбое второго mktemp под set -u не было unbound variable)
   local tf mf rc
-  tf=$(mktemp "$TMP/tg_ct.XXXXXX") && mf=$(mktemp "$TMP/tg_cm.XXXXXX") || { rm -f "$tf" "$mf" 2>/dev/null; return 1; }
+  tf=$(mktemp "$TMP/tg_ct.XXXXXX") || return 1
+  mf=$(mktemp "$TMP/tg_cm.XXXXXX") || { rm -f "$tf"; return 1; }
   printf '%s' "$2" > "$tf"; printf '%s' "$3" > "$mf"
   printf 'url = "%s/bot%s/sendMessage"\ndata = "chat_id=%s"\ndata = "parse_mode=HTML"\ndata-urlencode = "text@%s"\ndata-urlencode = "reply_markup@%s"\n' \
     "$TG_API" "${TOKEN:-}" "$1" "$tf" "$mf" | curl -s --max-time 30 -X POST -K - >/dev/null
@@ -8663,7 +8672,9 @@ home_text() { printf '🖥 <b>%s</b> — пульт ноды:' "$(esc "$NODE_NAM
 show_home() { send_card "$1" "$(home_text)" "$(kb_home)"; }
 edit_card() { # $1 chat, $2 message_id, $3 html, $4 markup; карточку старше 48ч не отредактировать — шлём новую
   local tf mf r rc
-  tf=$(mktemp "$TMP/tg_et.XXXXXX") && mf=$(mktemp "$TMP/tg_em.XXXXXX") || { rm -f "$tf" "$mf" 2>/dev/null; return 1; }
+  # iter4 (Н11): mktemp — последовательно, cleanup только созданного
+  tf=$(mktemp "$TMP/tg_et.XXXXXX") || return 1
+  mf=$(mktemp "$TMP/tg_em.XXXXXX") || { rm -f "$tf"; return 1; }
   printf '%s' "$3" > "$tf"; printf '%s' "$4" > "$mf"
   r=$(printf 'url = "%s/bot%s/editMessageText"\ndata = "chat_id=%s"\ndata = "message_id=%s"\ndata = "parse_mode=HTML"\ndata-urlencode = "text@%s"\ndata-urlencode = "reply_markup@%s"\n' \
     "$TG_API" "${TOKEN:-}" "$1" "$2" "$tf" "$mf" | curl -s --max-time 30 -X POST -K -)

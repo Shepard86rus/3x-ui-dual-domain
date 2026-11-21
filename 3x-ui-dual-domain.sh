@@ -1106,7 +1106,42 @@
 #   опечатка в имени переменной Armed (SW_/SWITCH_) делала rollback switch-mode
 #   молча нерабочим; в remove-xhttp Armed взводился ПОСЛЕ правок stream —
 #   сбой фазы nginx не откатывался.
-VERSION="0.7.5"
+#
+# v0.7.6: secrets-pack (К1, В1) + отложенный авторетрай DBIP-стража.
+#   К1 — секреты в argv (/proc/<pid>/cmdline читается любым локальным
+#   пользователем):
+#   • логин/пароль панели больше НЕ передаются через `x-ui setting
+#     -username/-password` и НЕ экспортируются апстриму (install.sh lucx-ui
+#     вызывал бы тот же CLI со значениями из env). Новый канал
+#     (lucx_panel_rotate_creds): install.sh без env-кредов создаёт ВРЕМЕННЫЕ
+#     случайные креды + admin API-токен и пишет их в
+#     /etc/x-ui/install-result.env (600 root); скрипт после рестарта x-ui
+#     меняет креды на свои через API панели — POST
+#     /panel/api/setting/updateUser, Bearer-токен и тело формы идут через
+#     stdin-конфиг curl (-K -), в argv не попадает ничего. Фолбэк при любом
+#     сбое (нет result.env, панель не ответила, updateUser отклонён) — прежний
+#     вызов CLI с WARN: поведение не хуже v0.7.5. Известный остаток: у самого
+#     install.sh апстрима временные креды по-прежнему проходят через argv его
+#     CLI-вызова (вне нашего репозитория; значение недолговечно — заменяется
+#     нашей ротацией).
+#   • SQL с reality privateKey/UUID/shortIds — переведён с аргумента sqlite3
+#     на stdin (heredoc) в четырёх местах: INSERT reality-front (install),
+#     INSERT основного VLESS (install, TLS/Reality), UPDATE switch-mode
+#     TLS→Reality, INSERT xhttp-reality (add-xhttp). Раньше приватный ключ
+#     Reality кратко светился в ps во время установки/мутаций.
+#   В1 — токен TG-бота в argv curl: URL вида api.telegram.org/bot<TOKEN>/...
+#   собирался в переменной API и попадал в argv каждого запроса бота (в т.ч.
+#   вечного getUpdates-поллинга). Теперь URL с токеном собирается в
+#   stdin-конфиге curl (-K -) в api_post и в цикле getUpdates; в argv —
+#   только несекретные флаги.
+#   DBIP-страж: отложенный авторетрай при недокачке (апстрим
+#   sapics/ip-location-db рассинхронизирует latest/checksum на часы-дни —
+#   затяжной случай 20–21.11). Одноразовый transient-таймер systemd
+#   (systemd-run --on-active): попытки через ~6ч, ~12ч, ~24ч, ~24ч (до 4,
+#   счётчик в /etc/x-ui/.lucx-dbip-retry, служебная команда dbip-retry).
+#   Проверка sha256 НЕ ослаблена. Ограничение: transient-таймер не
+#   переживает reboot.
+VERSION="0.7.6"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -1507,7 +1542,43 @@ ensure_geodata() {
 # download.db-ip.com лежит (случай 18.11: свежая нода, «download failed» при
 # установке). Идемпотентен и ничего не ломает: панель при живом db-ip.com
 # обновит файлы сама — наши копии просто перезапишутся свежими.
+# v0.7.6: DBIP-страж — отложенный авторетрай. Апстрим sapics/ip-location-db
+# периодически рассинхронизирует релизы latest/checksum на часы-дни
+# (затяжной случай 20–21.11: sha256 dbip-city-ipv4.mmdb не совпадал с файлом
+# двое суток, каждая новая установка оставалась без city-базы до ручной
+# докачки). Теперь при недокачке ставится одноразовый transient-таймер
+# systemd (systemd-run --on-active): повтор через ~6ч, затем ~12ч, ~24ч,
+# ~24ч (всего до 4 попыток, счётчик в $DBIP_RETRY_STAMP). Проверка sha256
+# НЕ ослабляется: файл ставится только при совпадении суммы. Ограничение:
+# transient-таймер не переживает reboot — тогда базу докачает либо вручную
+# (команда из WARN ниже), либо сама панель при следующем обновлении.
+DBIP_RETRY_STAMP="/etc/x-ui/.lucx-dbip-retry"
+DBIP_RETRY_MAX=4
+
+dbip_missing() { # rc 0 = какой-то базы не хватает
+  local dbip_bin="/usr/local/x-ui/bin"
+  [[ -d "$dbip_bin" ]] || return 1
+  local miss=1
+  [[ -s "${dbip_bin}/dbip-asn-lite.mmdb" || -s "${dbip_bin}/GeoLite2-ASN.mmdb" ]] && \
+  [[ -s "${dbip_bin}/dbip-city-lite.mmdb" || -s "${dbip_bin}/GeoLite2-City.mmdb" ]] && miss=0
+  [[ $miss -ne 0 ]]
+}
+
+dbip_schedule_retry() { # $1 = номер следующей попытки
+  local n="$1" self delay
+  command -v systemd-run >/dev/null 2>&1 || return 0
+  self=$(readlink -f "$0" 2>/dev/null || true)
+  [[ -n "$self" && -f "$self" ]] || return 0
+  case "$n" in 1) delay="6h" ;; 2) delay="12h" ;; *) delay="24h" ;; esac
+  printf '%s\n' "$n" > "$DBIP_RETRY_STAMP" 2>/dev/null || return 0
+  systemd-run --quiet --unit=lucx-dbip-retry --on-active="$delay" \
+    --description="lucx DBIP-страж: отложенная попытка #${n}" \
+    /bin/bash "$self" dbip-retry >/dev/null 2>&1 \
+    && echo "  DBIP-страж: запланирована автопопытка #${n} через ${delay} (transient-таймер; проверка sha256 прежняя)" || true
+}
+
 ensure_dbip() {
+  local dbip_noretry="${1:-}"   # "noretry" — из cmd_dbip_retry, чтобы не сбросить счётчик
   local dbip_bin="/usr/local/x-ui/bin"
   [[ -d "$dbip_bin" ]] || return 0  # панель не установлена — лечить нечего
   local -a dlist=(
@@ -1544,6 +1615,32 @@ ensure_dbip() {
       echo "    curl -fL -o ${dbip_bin}/${dfile} '${durl}'"
     fi
   done
+  # v0.7.6: апстрим-рассинхрон лечится временем — отложенный авторетрай
+  if dbip_missing; then
+    [[ "$dbip_noretry" == "noretry" ]] || dbip_schedule_retry 1
+  else
+    rm -f "$DBIP_RETRY_STAMP" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# v0.7.6: тело отложенной попытки (вызывает transient-таймер systemd)
+cmd_dbip_retry() {
+  ensure_dbip noretry
+  if ! dbip_missing; then
+    rm -f "$DBIP_RETRY_STAMP" 2>/dev/null || true
+    echo "DBIP-страж: базы на месте — авторетрай завершён."
+    return 0
+  fi
+  local n=0
+  [[ -f "$DBIP_RETRY_STAMP" ]] && n=$(tr -dc '0-9' < "$DBIP_RETRY_STAMP" 2>/dev/null | head -c 2)
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  if [[ "$n" -lt "$DBIP_RETRY_MAX" ]]; then
+    dbip_schedule_retry $((n + 1))
+  else
+    echo "DBIP-страж: ${DBIP_RETRY_MAX} автопопыток исчерпано, базы всё ещё нет — дальше вручную (команда выше) или ждать штатного обновления панели."
+    rm -f "$DBIP_RETRY_STAMP" 2>/dev/null || true
+  fi
   return 0
 }
 
@@ -1961,7 +2058,12 @@ create_reality_front_inbound() {
     lucx_xui_start || true
     return 1
   fi
-  if ! sqlite3 "$XUIDB" "INSERT INTO inbounds (\"user_id\",\"up\",\"down\",\"total\",\"remark\",\"enable\",\"expiry_time\",\"listen\",\"port\",\"protocol\",\"settings\",\"stream_settings\",\"tag\",\"sniffing\") VALUES ('1','0','0','0','reality-front','1','0','127.0.0.1','${REALITY_FRONT_PORT}','vless','${set_json}','${str_json}','${REALITY_FRONT_TAG}','{\"enabled\":false,\"destOverride\":[\"http\",\"tls\",\"quic\",\"fakedns\"],\"metadataOnly\":false,\"routeOnly\":false}');"; then
+  # v0.7.6 (К1): SQL — через stdin (heredoc), чтобы privateKey/UUID/shortIds
+  # из set_json/str_json не светились в argv sqlite3 (/proc/<pid>/cmdline)
+  if ! sqlite3 "$XUIDB" <<SQL
+INSERT INTO inbounds ("user_id","up","down","total","remark","enable","expiry_time","listen","port","protocol","settings","stream_settings","tag","sniffing") VALUES ('1','0','0','0','reality-front','1','0','127.0.0.1','${REALITY_FRONT_PORT}','vless','${set_json}','${str_json}','${REALITY_FRONT_TAG}','{"enabled":false,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}');
+SQL
+  then
     echo "  ОШИБКА: SQLite INSERT Reality-инбаунда не удался. Бэкап: ${bak}"
     lucx_xui_start
     return 1
@@ -3115,7 +3217,11 @@ cmd_switch_mode() {
       fi
       s1=$(openssl rand -hex 8)
       s2=$(openssl rand -hex 8)
-      if ! sqlite3 "$XUIDB" "UPDATE inbounds SET stream_settings = json('{\"network\":\"tcp\",\"security\":\"reality\",\"realitySettings\":{\"show\":false,\"dest\":\"127.0.0.1:8444\",\"xver\":0,\"serverNames\":[\"${REALITY_DOMAIN}\"],\"privateKey\":\"${priv}\",\"minClient\":\"\",\"maxClient\":\"\",\"maxTimediff\":0,\"shortIds\":[\"${s1}\",\"${s2}\"],\"settings\":{\"publicKey\":\"${pub}\",\"fingerprint\":\"chrome\",\"serverName\":\"\",\"spiderX\":\"/\"}},\"tcpSettings\":{\"acceptProxyProtocol\":true,\"header\":{\"type\":\"none\"}}}') WHERE protocol='vless' AND port=443 AND listen='127.0.0.1';"; then
+      # v0.7.6 (К1): SQL — через stdin (heredoc), privateKey не в argv sqlite3
+      if ! sqlite3 "$XUIDB" <<SQL
+UPDATE inbounds SET stream_settings = json('{"network":"tcp","security":"reality","realitySettings":{"show":false,"dest":"127.0.0.1:8444","xver":0,"serverNames":["${REALITY_DOMAIN}"],"privateKey":"${priv}","minClient":"","maxClient":"","maxTimediff":0,"shortIds":["${s1}","${s2}"],"settings":{"publicKey":"${pub}","fingerprint":"chrome","serverName":"","spiderX":"/"}},"tcpSettings":{"acceptProxyProtocol":true,"header":{"type":"none"}}}') WHERE protocol='vless' AND port=443 AND listen='127.0.0.1';
+SQL
+      then
         switch_mode_rollback "UPDATE stream_settings на Reality не удался"
         exit 1
       fi
@@ -3661,6 +3767,64 @@ install_preflight_kernel() {
   return 0
 }
 
+# v0.7.6 (К1): финальные логин/пароль панели — БЕЗ секретов в argv.
+# Канал: install.sh lucx-ui (ему XUI_USERNAME/XUI_PASSWORD больше не даём)
+# создаёт ВРЕМЕННЫЕ случайные креды + admin API-токен и пишет их в
+# /etc/x-ui/install-result.env (600 root — write_install_result в install.sh).
+# Мы меняем креды на свои через API панели:
+# POST /panel/api/setting/updateUser с Bearer admin-токеном; и заголовок с
+# токеном, и тело формы со старым/новым паролем идут через stdin-конфиг
+# curl (-K -) — в argv не попадает ни токен, ни пароли. Панель к этому
+# моменту уже слушает 127.0.0.1:PANEL_PORT (настройки выше + рестарт).
+# Значения кредов — строго alnum-подобные (проверка ниже): install.sh
+# генерирует их gen_random_string, наши — openssl rand -hex, поэтому тело
+# формы не требует urlencode. Фолбэк при любом сбое — прежний вызов CLI
+# (поведение v0.7.5): хуже не станет, а штатный путь чистый.
+lucx_panel_rotate_creds() {
+  local res="/etc/x-ui/install-result.env"
+  local old_u old_p tok base code resp i
+  _lucx_creds_fallback() { # $1 — причина
+    echo "  ВНИМАНИЕ (К1): ротация кредов через API не сработала ($1) — ставлю логин/пароль через CLI (как v0.7.5, пароль кратко виден в argv)."
+    "$XUI_CLI" setting -username "$XUI_USERNAME" -password "$XUI_PASSWORD" >/dev/null 2>&1 || true
+  }
+  if [[ ! -x "${XUI_CLI:-}" ]]; then
+    echo "  ВНИМАНИЕ (К1): x-ui CLI не найден — креды не ротирую (действуют временные из install.sh, см. $res)."
+    return 0
+  fi
+  if [[ ! -r "$res" ]]; then _lucx_creds_fallback "нет ${res} (старый релиз lucx-ui?)"; return 0; fi
+  old_u=$(grep '^XUI_USERNAME=' "$res" | head -1 | cut -d= -f2-)
+  old_p=$(grep '^XUI_PASSWORD=' "$res" | head -1 | cut -d= -f2-)
+  tok=$(grep '^XUI_API_TOKEN=' "$res" | head -1 | cut -d= -f2-)
+  if [[ ! "$old_u" =~ ^[A-Za-z0-9._-]+$ || ! "$old_p" =~ ^[A-Za-z0-9._-]+$ || ! "$tok" =~ ^[A-Za-z0-9._~+/=-]{8,200}$ ]]; then
+    _lucx_creds_fallback "не смог разобрать ${res}"
+    return 0
+  fi
+  base="http://127.0.0.1:${PANEL_PORT}/${PANEL_BASEPATH_NOSLASH}"
+  # ждём HTTP панели (только что перезапущена); токен — тоже через stdin-конфиг
+  code="000"
+  for i in {1..30}; do
+    code=$(printf 'header = "Authorization: Bearer %s"\n' "$tok" | curl -s -o /dev/null -w '%{http_code}' --max-time 3 -K - "${base}/panel/api/inbounds/list" 2>/dev/null || true)
+    [[ -n "$code" && "$code" != "000" ]] && break
+    sleep 1
+  done
+  if [[ -z "$code" || "$code" == "000" ]]; then _lucx_creds_fallback "панель не отвечает HTTP на ${base}"; return 0; fi
+  if [[ "$code" == "401" || "$code" == "403" ]]; then _lucx_creds_fallback "API-токен не принят (HTTP ${code})"; return 0; fi
+  resp=$(printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/x-www-form-urlencoded"\ndata = "oldUsername=%s&oldPassword=%s&newUsername=%s&newPassword=%s"\nurl = "%s/panel/api/setting/updateUser"\n' \
+        "$tok" "$old_u" "$old_p" "$XUI_USERNAME" "$XUI_PASSWORD" "$base" | curl -s --max-time 15 -X POST -K - 2>/dev/null || true)
+  if jq -e '.success==true' <<<"$resp" >/dev/null 2>&1; then
+    echo "  К1: логин/пароль панели установлены через API (без argv; временные креды install.sh заменены)."
+    # приводим install-result.env к финальным кредам (иначе MOTD/cloud-init
+    # покажет уже недействительные временные); права 600 сохраняем
+    { printf 'XUI_USERNAME=%s\n' "$XUI_USERNAME"
+      printf 'XUI_PASSWORD=%s\n' "$XUI_PASSWORD"
+      grep -E '^(XUI_PANEL_PORT|XUI_WEB_BASE_PATH|XUI_ACCESS_URL|XUI_API_TOKEN|XUI_DB_TYPE)=' "$res"
+    } > "${res}.new" && chmod 600 "${res}.new" && mv -f "${res}.new" "$res" || rm -f "${res}.new"
+  else
+    _lucx_creds_fallback "updateUser отклонён ($(jq -r '.msg // empty' <<<"$resp" 2>/dev/null | head -c 120))"
+  fi
+  return 0
+}
+
 cmd_install() {
   if [[ $EUID -ne 0 ]]; then
     echo "Запусти от root: sudo bash $0 install"
@@ -4130,8 +4294,13 @@ cmd_install() {
   XUI_PASSWORD=$(openssl rand -hex 8)
 
   export XUI_NONINTERACTIVE=1
-  export XUI_USERNAME
-  export XUI_PASSWORD
+  # v0.7.6 (К1): XUI_USERNAME/XUI_PASSWORD апстриму (install.sh lucx-ui) НЕ
+  # экспортируем: install.sh задавал бы их через `x-ui setting -username
+  # -password`, и ФИНАЛЬНЫЙ пароль светился бы в argv его процесса
+  # (/proc/<pid>/cmdline читается любым локальным пользователем). Пусть
+  # install.sh сгенерирует свои ВРЕМЕННЫЕ случайные креды (их запись в
+  # /etc/x-ui/install-result.env, 600 root), а финальные мы поставим позже
+  # без argv — через API панели (lucx_panel_rotate_creds, после рестарта x-ui).
   export XUI_WEB_BASE_PATH="$PANEL_BASEPATH_NOSLASH"
   export XUI_PANEL_PORT="$PANEL_PORT"
   export XUI_SSL_MODE="none"
@@ -4206,8 +4375,11 @@ cmd_install() {
 
   if [[ -x "$XUI_CLI" ]]; then
     echo "  CLI: $XUI_CLI"
-    "$XUI_CLI" setting -username "$XUI_USERNAME" -password "$XUI_PASSWORD" \
-         -port "$PANEL_PORT" -webBasePath "$PANEL_BASEPATH_NOSLASH" >/dev/null 2>&1 || true
+    # v0.7.6 (К1): -username/-password через CLI НЕ задаём — argv процесса
+    # виден любому локальному пользователю. Креды ставит
+    # lucx_panel_rotate_creds (API панели, ниже после рестарта);
+    # здесь только несекретные настройки.
+    "$XUI_CLI" setting -port "$PANEL_PORT" -webBasePath "$PANEL_BASEPATH_NOSLASH" >/dev/null 2>&1 || true
     "$XUI_CLI" setting -listenIP "127.0.0.1" >/dev/null 2>&1 || true
   else
     echo "WARN: x-ui CLI не найден — настройка только через БД"
@@ -4242,6 +4414,9 @@ SQL
       echo "  WARN: не удалось определить listen-адрес x-ui для порта ${PANEL_PORT}"
     fi
   fi
+
+  # v0.7.6 (К1): финальные креды панели — через API, без пароля в argv
+  lucx_panel_rotate_creds
 
   # --- [5a] Настройка подписок (подтверждённые ключи БД из реального дампа) ---
   echo "=== [5a] Настройка подписок (subURI, subPort, subPath, AWG) ==="
@@ -6212,7 +6387,10 @@ EOF
       # ошибку явно через `||`. v0.3.9: JSON обоих режимов собран выше в
       # SETTINGS_JSON/STREAM_JSON (внутри — только двойные кавычки, для
       # SQL-строки в одинарных это безопасно).
-      sqlite3 "$XUIDB" "INSERT INTO inbounds (\"user_id\",\"up\",\"down\",\"total\",\"remark\",\"enable\",\"expiry_time\",\"listen\",\"port\",\"protocol\",\"settings\",\"stream_settings\",\"tag\",\"sniffing\") VALUES ('1','0','0','0','${REALITY_REMARK}','1','0','127.0.0.1','${REALITY_XRAY_PORT}','vless','${SETTINGS_JSON}','${STREAM_JSON}','${REALITY_TAG}','{\"enabled\":false,\"destOverride\":[\"http\",\"tls\",\"quic\",\"fakedns\"],\"metadataOnly\":false,\"routeOnly\":false}');" || {
+      # v0.7.6 (К1): SQL — через stdin (heredoc), privateKey/UUID не в argv sqlite3
+      sqlite3 "$XUIDB" <<SQL || {
+INSERT INTO inbounds ("user_id","up","down","total","remark","enable","expiry_time","listen","port","protocol","settings","stream_settings","tag","sniffing") VALUES ('1','0','0','0','${REALITY_REMARK}','1','0','127.0.0.1','${REALITY_XRAY_PORT}','vless','${SETTINGS_JSON}','${STREAM_JSON}','${REALITY_TAG}','{"enabled":false,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}');
+SQL
         echo "ОШИБКА: SQLite INSERT не удался. Бэкап: ${XUIDB}.backup.*"
         systemctl start x-ui
         exit 1
@@ -8313,7 +8491,7 @@ cmd_upgrade() {
 # (add-bot перезаписывает тело, env не трогает).
 TGBOT_DIR="/opt/tgbot"
 TGBOT_ENV="/etc/tgbot/env"
-TGBOT_BODY_VERSION="0.5.5"   # v0.5.5: убрана кнопка «Панель (update)»; проверка from.id
+TGBOT_BODY_VERSION="0.5.6"   # v0.5.6 (В1): токен бота — через curl -K - (stdin-конфиг), не в argv
 
 tgbot_write_body() { # тело бота (правки — только через новую версию скрипта)
   mkdir -p "$TGBOT_DIR"
@@ -8327,7 +8505,10 @@ set -u
 ENV_FILE="/etc/tgbot/env"
 [ -f "$ENV_FILE" ] && . "$ENV_FILE"
 NODE_NAME="${NODE_NAME:-$(hostname)}"
-API="https://api.telegram.org/bot${TOKEN:-}"
+# v0.7.6 (В1): токен бота больше НЕ светится в argv curl (/proc/<pid>/cmdline
+# читается любым локальным пользователем) — URL с токеном собирается в
+# stdin-конфиге curl (-K -), в аргументах остаются только флаги без секретов.
+TG_API="https://api.telegram.org"
 OFFSET=0
 ASK_CMD=''; ASK_TS=0
 TMP=$(mktemp -d)
@@ -8335,7 +8516,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' <<<"$1"; }
 
-api_post() { local m="$1"; shift; curl -s --max-time 30 -X POST "$API/$m" "$@"; }
+api_post() { local m="$1"; shift; printf 'url = "%s/bot%s/%s"\n' "$TG_API" "${TOKEN:-}" "$m" | curl -s --max-time 30 -X POST -K - "$@"; }
 send_txt() { api_post sendMessage -d chat_id="$1" --data-urlencode "text=$2" >/dev/null; }
 send_card() { api_post sendMessage -d chat_id="$1" --data-urlencode "text=$2" -d parse_mode="HTML" --data-urlencode "reply_markup=$3" >/dev/null; }
 answer() {
@@ -8700,7 +8881,7 @@ if [ "${1:-}" = selftest ]; then
 fi
 
 while true; do
-  resp=$(curl -s --max-time 40 "$API/getUpdates?timeout=30&offset=$OFFSET") || { sleep 5; continue; }
+  resp=$(printf 'url = "%s/bot%s/getUpdates?timeout=30&offset=%s"\n' "$TG_API" "${TOKEN:-}" "$OFFSET" | curl -s --max-time 40 -K -) || { sleep 5; continue; }
   n=$(jq '.result | length' <<<"$resp" 2>/dev/null) || n=0
   i=0
   while [ "$i" -lt "$n" ]; do
@@ -9106,7 +9287,11 @@ create_xhttp_inbound() {
     lucx_xui_start || true
     return 1
   fi
-  if ! sqlite3 "$XUIDB" "INSERT INTO inbounds (\"user_id\",\"up\",\"down\",\"total\",\"remark\",\"enable\",\"expiry_time\",\"listen\",\"port\",\"protocol\",\"settings\",\"stream_settings\",\"tag\",\"sniffing\") VALUES ('1','0','0','0','xhttp-reality','1','0','127.0.0.1','${XHTTP_PORT}','vless','${set_json}','${str_json}','${XHTTP_TAG}','{\"enabled\":false,\"destOverride\":[\"http\",\"tls\",\"quic\",\"fakedns\"],\"metadataOnly\":false,\"routeOnly\":false}');"; then
+  # v0.7.6 (К1): SQL — через stdin (heredoc), privateKey/UUID/xpath не в argv sqlite3
+  if ! sqlite3 "$XUIDB" <<SQL
+INSERT INTO inbounds ("user_id","up","down","total","remark","enable","expiry_time","listen","port","protocol","settings","stream_settings","tag","sniffing") VALUES ('1','0','0','0','xhttp-reality','1','0','127.0.0.1','${XHTTP_PORT}','vless','${set_json}','${str_json}','${XHTTP_TAG}','{"enabled":false,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}');
+SQL
+  then
     echo "  ОШИБКА: SQLite INSERT XHTTP-инбаунда не удался. Бэкап: ${XH_BAK}"
     lucx_xui_start
     return 1
@@ -10592,6 +10777,11 @@ case "${1:-install}" in
     ;;
   remove-bot|unbot)
     cmd_remove_bot
+    ;;
+  dbip-retry)
+    # v0.7.6: служебная команда отложенного авторетрая DBIP-стража
+    # (запускается transient-таймером systemd, вручную не нужна)
+    cmd_dbip_retry
     ;;
   rebind-ip|rebind|newip)
     cmd_rebind_ip

@@ -1149,7 +1149,31 @@
 #   счётчик в /etc/x-ui/.lucx-dbip-retry, служебная команда dbip-retry).
 #   Проверка sha256 НЕ ослаблена. Ограничение: transient-таймер не
 #   переживает reboot.
-VERSION="0.7.6"
+#
+# v0.7.7: multi-IP (bind-ip) + приветственный баннер.
+#   • Multi-IP: раньше install требовал, чтобы домены резолвились в адрес
+#     исходящего маршрута (get_server_ip), и на сервере с двумя публичными
+#     IP, где домен указывает на вторичный адрес, установка останавливалась
+#     («домен резолвится на X, а не на Y»). Теперь домен принимается, если
+#     его A-запись совпадает с ЛЮБЫМ локальным IPv4 (lucx_local_ips); если
+#     оба домена смотрят на один вторичный адрес — SERVER_IP переключается
+#     на него (stream-роутер и так слушает явный адрес). Новый флаг
+#     install --bind-ip A.B.C.D (env BIND_IP) задаёт адрес явно; значение
+#     обязано быть назначено интерфейсу (NAT не поддерживается — nginx
+#     слушает явный IP). При несовпадении — диалог: ввести IP вручную
+#     (с предупреждением о сертификате, если DNS ещё не обновлён) /
+#     перепроверить DNS / отмена. Домены, указывающие на РАЗНЫЕ адреса —
+#     отказ: схема слушает один IP. Резолв домена — через два независимых
+#     резолвера (1.1.1.1, 77.88.8.8) + системный (lucx_resolve_a), ложный
+#     отказ при резке 1.1.1.1 провайдером исключён. Поведение по умолчанию
+#     (один публичный IP) не изменилось.
+#   • Баннер приветствия (lucx_banner) в начале install: figlet-арт
+#     «Shepard86rus» + строка версии. Только при stdout=TTY; при пайпе/логе —
+#     одна plain-строка. Ярусы по ширине терминала (>=57 — арт, 46-56 —
+#     рамка при UTF-8, иначе — две строки); без UTF-8 локали кириллица
+#     заменяется латиницей. Функция целиком под || true — не может уронить
+#     установку (set -euo pipefail).
+VERSION="0.7.7"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -1338,6 +1362,77 @@ get_server_ip() {
   [[ "$ip" =~ $re ]] || ip=$(grep -oP '^\s*listen\s+\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(?=:443;)' /etc/nginx/stream-sni-router.conf 2>/dev/null | grep -v '^0\.0\.0\.0$' | head -n1 || true)
   [[ "$ip" =~ $re ]] || ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' | head -n1 || true)
   if [[ "$ip" =~ $re ]]; then echo "$ip"; fi
+  return 0
+}
+
+# v0.7.7: все локальные IPv4 интерфейсов (без loopback), по одному в строке.
+# Для проверки «домен указывает на ЭТОТ сервер» на мульти-IP машинах: домен
+# может смотреть на вторичный адрес, а не на адрес исходящего маршрута.
+lucx_local_ips() {
+  ip -4 -o addr show 2>/dev/null | awk '{split($4,a,"/"); print a[1]}' | grep -vE '^127\.' || true
+}
+
+# v0.7.7: A-запись домена через два независимых резолвера, затем системный
+# резолвер. Раньше спрашивали только 1.1.1.1 — у провайдеров, режущих его,
+# получался ложный «домен не туда». Печатает первый IPv4; rc=1 — не нашли.
+lucx_resolve_a() {
+  local d="$1" out="" r
+  local re='^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+  for r in 1.1.1.1 77.88.8.8; do
+    out=$(dig +short +time=3 +tries=1 A "$d" "@$r" 2>/dev/null | grep -E "$re" | head -n1 || true)
+    [[ -n "$out" ]] && { printf '%s\n' "$out"; return 0; }
+  done
+  out=$(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1; exit}' || true)
+  [[ "$out" =~ $re ]] && { printf '%s\n' "$out"; return 0; }
+  return 1
+}
+
+# v0.7.7: приветственный баннер install. Только при stdout=TTY; при пайпе/
+# редиректе/логе — одна plain-строка. Ярусы: >=57 колонок — figlet-арт
+# (чистый ASCII); 46-56 и UTF-8 — рамка; иначе — две строки. Кириллица
+# только при UTF-8 локали, иначе латиница. Вся функция в группе под || true:
+# любой сбой (нет tput, кривой терминал) не роняет установку.
+lucx_banner() {
+  {
+  if [[ ! -t 1 ]]; then
+    printf '3x-ui dual-domain installer v%s\n' "${VERSION:-?}"
+    return 0
+  fi
+  local cols lang utf8=0
+  cols="${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}"
+  [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+  cols=$((10#$cols))  # v0.7.7 (аудит): 10# — иначе '08'/'00057' читаются как восьмеричные
+  (( cols > 0 )) || cols=80
+  lang="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+  [[ "$lang" == *[Uu][Tt][Ff]*8* ]] && utf8=1
+  local R=$'\033[0m' C=$'\033[1;36m' B=$'\033[1m'
+  if (( cols >= 57 )); then
+    printf '%b' "$C"
+    cat <<'ART'
+ ___ _                          _ ___   __
+/ __| |_  ___ _ __  __ _ _ _ __| ( _ ) / / _ _ _  _ ___
+\__ \ ' \/ -_) '_ \/ _` | '_/ _` / _ \/ _ \ '_| || (_-<
+|___/_||_\___| .__/\__,_|_| \__,_\___/\___/_|  \_,_/__/
+             |_|
+ART
+    if (( utf8 )); then
+      printf '%b  приветствует вас · 3x-ui dual-domain · v%s%b\n\n' "$B" "${VERSION:-?}" "$R"
+    else
+      printf '%b  Shepard86rus welcomes you · 3x-ui dual-domain · v%s%b\n\n' "$B" "${VERSION:-?}" "$R"
+    fi
+  elif (( cols >= 46 )) && (( utf8 )); then
+    printf '%b┌──────────────────────────────────────────────┐%b\n' "$C" "$R"
+    printf '│  %bShepard86rus приветствует вас%b               │\n' "$B" "$R"
+    printf '│  3x-ui dual-domain · v%-23s│\n' "${VERSION:-?}"
+    printf '%b└──────────────────────────────────────────────┘%b\n\n' "$C" "$R"
+  else
+    if (( utf8 )); then
+      printf '%bShepard86rus приветствует вас%b\n3x-ui dual-domain · v%s\n\n' "$B" "$R" "${VERSION:-?}"
+    else
+      printf '%bShepard86rus welcomes you%b\n3x-ui dual-domain · v%s\n\n' "$B" "$R" "${VERSION:-?}"
+    fi
+  fi
+  } || true
   return 0
 }
 
@@ -3913,11 +4008,103 @@ lucx_panel_rotate_creds() {
   return 0
 }
 
+# v0.7.7: проверка «домены указывают на этот сервер» для мульти-IP.
+# Раньше домен обязан был совпасть с SERVER_IP (адрес исходящего маршрута) —
+# на сервере с двумя публичными IP, где домен указывает на вторичный адрес,
+# установка останавливалась. Теперь домен принимается, если A-запись совпадает
+# с ЛЮБЫМ локальным IPv4; если оба домена смотрят на один вторичный адрес —
+# SERVER_IP переключается на него (stream-роутер слушает явный адрес).
+# Разные адреса у доменов — отказ (схема слушает один IP). При несовпадении —
+# диалог: ввести IP вручную / перепроверить DNS / отмена. Обновляет SERVER_IP.
+# rc: 0 — пройдено (или явно подтверждено вручную), 1 — отказ/отмена.
+lucx_install_check_domains() {
+  local d resolved="" manual_ip dns_ch dns_force local_ips
+  local r_ips=()
+  local_ips="$(lucx_local_ips)"
+  for d in "$DOMAIN" "$REALITY_DOMAIN"; do
+    while :; do
+      resolved=$(lucx_resolve_a "$d" 2>/dev/null || true)
+      if [[ -n "$resolved" ]] && grep -qxF "$resolved" <<<"$local_ips"; then
+        echo "  DNS OK: $d -> $resolved"
+        r_ips+=("$resolved")
+        break
+      fi
+      echo "  ВНИМАНИЕ: $d резолвится на '${resolved:-не найден}' — это ни один из адресов сервера."
+      echo "      Адреса интерфейсов: $(ip -4 -o addr show 2>/dev/null | awk '{print $4}' | tr '\n' ' ')"
+      echo "      [1] указать публичный IP вручную   [2] перепроверить (исправил DNS)   [3] отмена"
+      read -rp "      Выбор [1/2/3]: " dns_ch
+      case "$dns_ch" in
+        1)
+          read -rp "      Публичный IPv4 сервера: " manual_ip
+          if ! [[ "$manual_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ОШИБКА: '${manual_ip}' — не IPv4-адрес. Установка не начата."
+            return 1
+          fi
+          if ! grep -qwF "$manual_ip" <<<"$(ip -4 -o addr show 2>/dev/null || true)"; then
+            echo "СТОП: ${manual_ip} не назначен ни одному интерфейсу — nginx слушает явный IP и не стартует."
+            echo "      За NAT установка не поддерживается: нужен публичный IPv4 на интерфейсе."
+            return 1
+          fi
+          if [[ "$resolved" != "$manual_ip" ]]; then
+            if [[ -n "$resolved" ]]; then
+              echo "      ВНИМАНИЕ: домен сейчас указывает на ${resolved}, а не на ${manual_ip}."
+            else
+              echo "      ВНИМАНИЕ: домен сейчас не резолвится (ни один резолвер не ответил)."
+            fi
+            echo "      Let's Encrypt не выпустит сертификат, пока A-запись не укажет на ${manual_ip}."
+            read -rp "      Всё равно продолжить с ${manual_ip}? [y/N]: " dns_force
+            [[ "$dns_force" =~ ^[Yy]$ ]] || { echo "Отменено."; return 1; }
+          fi
+          echo "  Принято вручную: $d -> $manual_ip"
+          r_ips+=("$manual_ip")
+          break
+          ;;
+        2) echo "      Перепроверяю $d…" ;;
+        *) echo "Отменено."; return 1 ;;
+      esac
+    done
+  done
+  if [[ "${#r_ips[@]}" -ge 2 && "${r_ips[0]}" != "${r_ips[1]}" ]]; then
+    echo "ОШИБКА: домены указывают на разные адреса (${r_ips[0]} и ${r_ips[1]}), а схема слушает один публичный IP."
+    echo "        Направь оба домена на один адрес и запусти заново (или задай его явно: --bind-ip)."
+    return 1
+  fi
+  if [[ "${#r_ips[@]}" -ge 1 && "${r_ips[0]}" != "$SERVER_IP" ]]; then
+    if [[ -n "${BIND_IP:-}" ]]; then
+      echo "ОШИБКА: домены указывают на ${r_ips[0]}, а --bind-ip задан как ${BIND_IP}."
+      echo "        Поправь A-записи доменов или значение --bind-ip. Установка не начата."
+      return 1
+    fi
+    echo "  Публичный IP по DNS доменов: ${r_ips[0]} (автоопределение дало ${SERVER_IP}) — использую адрес из DNS."
+    SERVER_IP="${r_ips[0]}"
+  fi
+  return 0
+}
+
 cmd_install() {
   if [[ $EUID -ne 0 ]]; then
     echo "Запусти от root: sudo bash $0 install"
     exit 1
   fi
+  # v0.7.7: приветствие — только в терминал (в лог уходит plain-заголовок ниже)
+  lucx_banner
+  # v0.7.7: install [--bind-ip A.B.C.D] — явный публичный IP для мульти-IP
+  # серверов (домен указывает не на адрес исходящего трафика). Флаг
+  # приоритетнее env BIND_IP.
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --bind-ip)
+        [[ -n "${2:-}" ]] || { echo "ОШИБКА: у --bind-ip нет значения (IPv4)"; exit 1; }
+        BIND_IP="$2"; shift 2 ;;
+      --bind-ip=*)
+        BIND_IP="${1#--bind-ip=}"
+        # v0.7.7 (аудит): пустая equals-форма — ошибка, а не молчаливый auto-detect
+        [[ -n "$BIND_IP" ]] || { echo "ОШИБКА: --bind-ip= с пустым значением (нужен IPv4)"; exit 1; }
+        shift ;;
+      *) echo "ОШИБКА: неизвестный аргумент install: $1 (допустимо: --bind-ip A.B.C.D)"; exit 1 ;;
+    esac
+  done
+  BIND_IP="${BIND_IP:-}"
   # v0.7.5 (аудит В17): install меняет ту же БД/x-ui/nginx, что и прочие мутаторы, —
   # берёт тот же единый замок на всю установку. Внутренний add-xhttp (отдельный
   # процесс ниже) наследует LUCX_SCHEME_LOCK_HELD и замок повторно не запрашивает.
@@ -4062,6 +4249,23 @@ cmd_install() {
     SUB_TITLE="${SUB_TITLE:0:60}"
   fi
 
+  # v0.7.7: явный --bind-ip/BIND_IP обходит автоопределение; проверки те же —
+  # формат и назначенность интерфейсу (stream-роутер слушает явный адрес,
+  # NAT не поддерживается)
+  if [[ -n "$BIND_IP" ]]; then
+    if ! [[ "$BIND_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      echo "ОШИБКА: --bind-ip '${BIND_IP}' — не IPv4-адрес. Установка не начата."
+      exit 1
+    fi
+    if command -v ip >/dev/null 2>&1 && ! grep -qwF "$BIND_IP" <<<"$(ip -4 -o addr show 2>/dev/null || true)"; then
+      echo "СТОП: --bind-ip ${BIND_IP} не назначен ни одному интерфейсу сервера: nginx не сможет его слушать."
+      echo "      Адреса интерфейсов: $(ip -4 -o addr show 2>/dev/null | awk '{print $4}' | tr '\n' ' ')"
+      echo "      За NAT (внешний адрес облака) установка не поддерживается: нужен публичный IPv4 на интерфейсе."
+      exit 1
+    fi
+    SERVER_IP="$BIND_IP"
+    echo "  Публичный IP задан явно (--bind-ip): ${SERVER_IP}"
+  else
   SERVER_IP=$(get_server_ip)
   if [[ -z "$SERVER_IP" ]]; then
     echo "Не удалось автоматически определить публичный IP сервера."
@@ -4085,6 +4289,7 @@ cmd_install() {
     echo "      Установка не начата: схема рассчитана на сервер, у которого публичный адрес назначен самому интерфейсу ('ip -4 addr')."
     echo "      За NAT (внешний адрес облака) такая установка не поддерживается: возьмите сервер с публичным IPv4 на интерфейсе."
     exit 1
+  fi
   fi
 
   echo
@@ -4125,17 +4330,10 @@ cmd_install() {
     exit 1
   fi
   echo "  SSH-порт(ы): ${SSH_PORTS}"
-  for d in "$DOMAIN" "$REALITY_DOMAIN"; do
-    resolved=$(dig +short A "$d" @1.1.1.1 | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
-    if [[ -z "$resolved" ]]; then
-      resolved=$(getent hosts "$d" | awk '{print $1}' | head -n1 || true)
-    fi
-    if [[ "$resolved" != "$SERVER_IP" ]]; then
-      echo "ОШИБКА: $d резолвится на '${resolved:-не найден}', а не на $SERVER_IP"
-      exit 1
-    fi
-    echo "  DNS OK: $d -> $resolved"
-  done
+  # v0.7.7: мульти-IP — домен принимается, если указывает на любой локальный
+  # адрес; при несовпадении — диалог (вручную/перепроверить/отмена). Может
+  # переключить SERVER_IP на адрес из DNS. Раньше: жёсткое «== SERVER_IP» и стоп.
+  lucx_install_check_domains || exit 1
 
   # v0.3.8: AAAA-префлайт. Схема IPv4-only: nginx и stream-роутер биндят
   # только IPv4, а Let's Encrypt при наличии AAAA-записи предпочитает её и
@@ -4184,8 +4382,8 @@ cmd_install() {
   # обрывать установку основной схемы: предупреждаем, выключаем XHTTP, ставим остальное.
   if [[ -n "$XHTTP_DOM_INST" ]]; then
     xh_bad=""
-    xh_res=$(dig +short A "$XHTTP_DOM_INST" @1.1.1.1 | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
-    [[ -n "$xh_res" ]] || xh_res=$(getent ahostsv4 "$XHTTP_DOM_INST" 2>/dev/null | awk '{print $1; exit}' || true)
+    # v0.7.7: два независимых резолвера + системный — как в основной DNS-проверке
+    xh_res=$(lucx_resolve_a "$XHTTP_DOM_INST" 2>/dev/null || true)
     xh_aaaa=$(lucx_aaaa_lookup "$XHTTP_DOM_INST")
     if [[ "$xh_res" != "$SERVER_IP" ]]; then
       xh_bad="A-запись '${xh_res:-не найдена}', а не ${SERVER_IP}"
@@ -10910,7 +11108,8 @@ case "${1:-install}" in
     cmd_menu
     ;;
   install|i|setup)
-    cmd_install
+    shift
+    cmd_install "$@"
     ;;
   healthcheck|check|status|hc)
     cmd_healthcheck
@@ -10998,6 +11197,8 @@ case "${1:-install}" in
     echo "  sudo bash $0 install       — установить всё с нуля (чистый сервер; по желанию спросит третье"
     echo "                               имя и сразу включит XHTTP+Reality; или env XHTTP_DOMAIN=...;"
     echo "                               ставит Reality-only (xray без TLS; прежняя схема TLS + h2 + Reality перед TLS: TLS_MODE=1))"
+    echo "                               мульти-IP сервер (домен на вторичном адресе): install --bind-ip A.B.C.D"
+    echo "                               (env BIND_IP); адрес обязан быть назначен интерфейсу, NAT не поддерживается)"
     echo "  sudo bash $0 upgrade       — обновить сам этот скрипт до новейшей версии"
     echo "                               с GitHub (патч без переустановки)"
     echo "  sudo bash $0 panel-path    — сменить путь панели /panel/ на случайный (или свой: panel-path /my-path/);"

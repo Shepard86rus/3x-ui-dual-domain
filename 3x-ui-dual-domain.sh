@@ -1196,6 +1196,12 @@
 #   пройдут все, кто словил баги выше и перезапускает установку) писал в финальной
 #   сводке ложное «Hysteria 2 не создан»: инбаунд переиспользуется из БД, а сводке
 #   нужен HY2_AUTH — теперь он подтягивается из существующего инбаунда.
+#   И третье (из того же живого прогона): повторный install сохраняет БД панели
+#   с XHTTP-инбаундом, но перегенерирует stream-конфиг без него — полураспад, в
+#   который add-xhttp раньше упирался («порт 8447 занят» / «дубль в БД»). Теперь
+#   add-xhttp в этой ситуации — починка: инбаунд переиспользуется (ключи и
+#   клиенты сохраняются), достраивается только nginx-маршрут (reuse_xhttp_inbound).
+#   Инбаунд на ДРУГОЕ имя — осознанная смена домена: по-прежнему remove-xhttp + add-xhttp.
 
 # v0.7.8: Zero-SNI Shield — домен ноды больше не светится сканерам.
 #   Проблема (подтверждена живым зондом на no5, 24.11.2026): fallback Reality
@@ -10096,6 +10102,27 @@ SQL
   return 0
 }
 
+# Режим починки (v0.7.9): инбаунд 127.0.0.1:XHTTP_PORT уже в БД (остался после
+# повторного install — тот перегенерирует stream-конфиг без XHTTP, а БД сохраняет).
+# Раньше add-xhttp упирался в «порт 8447 занят» и «дубль в БД» — тупик. Теперь
+# инбаунд переиспользуем (ключи и клиенты сохраняются), достраиваем только
+# nginx-маршрут. Выставляет XH_UUID/XH_PBK/XH_SID/XH_PATH из существующего
+# инбаунда; XH_BAK пуст — БД не трогаем, откат только nginx-части.
+reuse_xhttp_inbound() {
+  XH_BAK=""
+  local w="FROM inbounds WHERE port=${XHTTP_PORT} AND listen='127.0.0.1' LIMIT 1"
+  XH_UUID=$(sqlite3 "$XUIDB" "SELECT json_extract(settings,'$.clients[0].id') ${w};" 2>/dev/null || true)
+  XH_PBK=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'$.realitySettings.settings.publicKey') ${w};" 2>/dev/null || true)
+  XH_SID=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'$.realitySettings.shortIds[0]') ${w};" 2>/dev/null || true)
+  XH_PATH=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'$.xhttpSettings.path') ${w};" 2>/dev/null || true)
+  if [[ -z "$XH_UUID" || -z "$XH_PBK" || -z "$XH_SID" || -z "$XH_PATH" ]]; then
+    echo "  ОШИБКА: инбаунд 127.0.0.1:${XHTTP_PORT} в БД есть, но параметры не читаются (битый JSON?). Убери его: bash $0 remove-xhttp --yes — и повтори."
+    return 1
+  fi
+  echo "  Инбаунд 127.0.0.1:${XHTTP_PORT} уже в БД (остался после повторной установки) — переиспользую: ключи и клиенты сохранены, достраиваю маршрут nginx."
+  return 0
+}
+
 # откат целиком: stream-конфиг из бэкапа, БД из бэкапа (без XHTTP-инбаунда), вхосты nginx убраны.
 # Сертификат Let's Encrypt остаётся (безвреден, переиспользуется при повторе).
 xhttp_rollback_all() { # stream_backup db_backup
@@ -10201,8 +10228,29 @@ cmd_add_xhttp() {
     echo "ОШИБКА: не удалось определить публичный IP сервера."
     exit 1
   fi
+  # v0.7.9: повторный install сохраняет БД (и XHTTP-инбаунд в ней), но
+  # перегенерирует stream-конфиг без XHTTP — полураспад: инбаунд есть, маршрута
+  # нет. Детектим заранее: это режим починки (reuse_xhttp_inbound), а не конфликт.
+  # Инбаунд на ДРУГОЕ имя так не чиним — это осознанная смена домена: remove+add.
+  local xh_stale=0
+  if sqlite3 "$XUIDB" "SELECT 1 FROM inbounds WHERE port=${XHTTP_PORT} AND listen='127.0.0.1' AND protocol='vless' AND json_extract(stream_settings,'$.network')='xhttp' LIMIT 1;" 2>/dev/null | grep -q 1; then
+    local xh_domb
+    xh_domb=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'$.realitySettings.serverNames[0]') FROM inbounds WHERE port=${XHTTP_PORT} AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+    if [[ "$xh_domb" == "$xdom" ]]; then
+      xh_stale=1
+    else
+      echo "ОШИБКА: в БД уже есть XHTTP-инбаунд на имя '${xh_domb:-?}', а не '${xdom}'."
+      echo "  Смена имени — только через пересоздание: bash $0 remove-xhttp --yes && bash $0 add-xhttp ${xdom}"
+      exit 1
+    fi
+  fi
   local p
   for p in "$XHTTP_PORT" "$XHTTP_TARGET_PORT"; do
+    # v0.7.9: при починке 8447 держит наш же xray — пропускаем его проверку
+    if [[ "$p" == "$XHTTP_PORT" && "$xh_stale" == "1" ]]; then
+      echo "  порт ${p} держит наш xray (инбаунд сохранился в БД) — режим починки: переиспользую, маршрут дострою."
+      continue
+    fi
     # v0.7.9: порт, занятый нашим Zero-SNI Shield / прежним XHTTP-вхостом — не конфликт
     if ! lucx_port_free_or_shield "$p"; then
       echo "ОШИБКА: порт ${p} занят чужим процессом — нужен свободный loopback-порт."
@@ -10314,8 +10362,13 @@ EOF
     xhttp_remove_vhosts
     exit 1
   fi
-  # 4) инбаунд + клиент
-  create_xhttp_inbound || { xhttp_remove_vhosts; exit 1; }
+  # 4) инбаунд + клиент (v0.7.9: если инбаунд сохранился в БД после повторного
+  # install — режим починки: переиспользуем его, БД не трогаем)
+  if [[ "$xh_stale" == "1" ]]; then
+    reuse_xhttp_inbound || { xhttp_remove_vhosts; exit 1; }
+  else
+    create_xhttp_inbound || { xhttp_remove_vhosts; exit 1; }
+  fi
   # 5) stream: имя -> xhttp_backend
   # обе правки на копии, подмена одной операцией: сбой между ними не оставит полуготовый конфиг
   cp -a "$stream_conf" "${stream_conf}.new"

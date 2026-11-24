@@ -1174,6 +1174,35 @@
 #     заменяется латиницей. Функция целиком под || true — не может уронить
 #     установку (set -euo pipefail).
 #
+# v0.7.9: хотфикс install — стоп прежней панели до проверки портов.
+#   Проблема (по жалобам пользователей): на сервере со стоковым 3x-ui (или
+#   любой уже запущенной панелью) подписка по умолчанию слушает 127.0.0.1:2096,
+#   install валился с «ОШИБКА: порт 2096 уже занят» + «[cleanup] Восстанавливаю
+#   x-ui...» и отказывался ставиться. Теперь install до проверки портов глушит
+#   запущенный x-ui (всё равно ставит и настраивает панель заново); при срыве
+#   установки прежнюю панель возвращает сторож lucx_xui_guard_fire / cleanup.
+#   Проверка — systemctl is-active, установленной, но остановленной панели и
+#   серверу без панели ничего не меняет.
+#   Плюс вторая жалоба: на чистом сервере с третьим именем XHTTP не вставал —
+#   «ОШИБКА: порт 8445 занят». Это регрессия v0.7.8 (самострел щита): install
+#   применяет Zero-SNI Shield на 8444/8445 ДО вызова add-xhttp, а чек портов
+#   add-xhttp (и пред-проверка в install) считал занятый нашим же nginx-щитом
+#   порт конфликтом. Новый хелпер lucx_port_free_or_shield: порт, который держит
+#   наш nginx (reject-блок щита или прежний XHTTP-вхост), конфликтом не считается;
+#   чужой слушатель — по-прежнему отказ с диагностикой ss. На флоте не ловилось,
+#   потому что там XHTTP стоял до включения щита; били только чистые установки
+#   с третьим именем и add-xhttp на сервере с уже включённым щитом.
+#   Плюс мелочь, пойманная на живом прогоне: повторный install (а именно его
+#   пройдут все, кто словил баги выше и перезапускает установку) писал в финальной
+#   сводке ложное «Hysteria 2 не создан»: инбаунд переиспользуется из БД, а сводке
+#   нужен HY2_AUTH — теперь он подтягивается из существующего инбаунда.
+#   И третье (из того же живого прогона): повторный install сохраняет БД панели
+#   с XHTTP-инбаундом, но перегенерирует stream-конфиг без него — полураспад, в
+#   который add-xhttp раньше упирался («порт 8447 занят» / «дубль в БД»). Теперь
+#   add-xhttp в этой ситуации — починка: инбаунд переиспользуется (ключи и
+#   клиенты сохраняются), достраивается только nginx-маршрут (reuse_xhttp_inbound).
+#   Инбаунд на ДРУГОЕ имя — осознанная смена домена: по-прежнему remove-xhttp + add-xhttp.
+
 # v0.7.8: Zero-SNI Shield — домен ноды больше не светится сканерам.
 #   Проблема (подтверждена живым зондом на no5, 24.11.2026): fallback Reality
 #   ведёт на nginx-вхост-мишень 127.0.0.1:8444 (и 8445 у XHTTP), а тот отвечал
@@ -1225,7 +1254,7 @@
 #     пустой/чужой SNI). Каталог на месте enabled-ссылки отклоняется заранее
 #     (ln -sfn иначе молча кладёт ссылку внутрь каталога и возвращает 0),
 #     а после создания ссылка проверяется readlink'ом на наш файл.
-VERSION="0.7.8"
+VERSION="0.7.9"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -1859,6 +1888,12 @@ create_hy2_inbound() {
   if sqlite3 "$XUIDB" "SELECT 1 FROM inbounds WHERE protocol='hysteria' AND port='${REALITY_XRAY_PORT:-443}' LIMIT 1;" 2>/dev/null | grep -q 1; then
     echo "Hy2-инбаунд на порту ${REALITY_XRAY_PORT:-443} уже существует. Пропускаю."
     HY2_OK=1
+    # v0.7.9: на повторном install auth (и tag/email для блока кредов) существующего
+    # hy2 подтягиваем из БД — иначе финальная сводка ложно писала «Hysteria 2 не
+    # создан» (ей нужен HY2_AUTH), а без HY2_TAG блок кредов падал по set -u.
+    HY2_AUTH=$(sqlite3 "$XUIDB" "SELECT json_extract(settings,'$.clients[0].auth') FROM inbounds WHERE protocol='hysteria' AND port='${REALITY_XRAY_PORT:-443}' LIMIT 1;" 2>/dev/null || true)
+    HY2_TAG=$(sqlite3 "$XUIDB" "SELECT tag FROM inbounds WHERE protocol='hysteria' AND port='${REALITY_XRAY_PORT:-443}' LIMIT 1;" 2>/dev/null || true)
+    HY2_EMAIL=$(sqlite3 "$XUIDB" "SELECT json_extract(settings,'$.clients[0].email') FROM inbounds WHERE protocol='hysteria' AND port='${REALITY_XRAY_PORT:-443}' LIMIT 1;" 2>/dev/null || true)
     return 0
   fi
 
@@ -2677,6 +2712,21 @@ reality_only_vhost_file() { # [порт]
       | while IFS= read -r cand; do grep -q 'ssl_reject_handshake' "$cand" 2>/dev/null || echo "$cand"; done | head -n1 || true)
   [[ -n "$f" ]] || return 1
   readlink -f "$f"
+}
+
+# v0.7.9: порт свободен или занят НАШИМ nginx (Zero-SNI Shield reject-блоком либо
+# вхостом-мишенью XHTTP из прежней установки — оба штатно делят loopback-порт с
+# именным вхостом и не являются конфликтом). Код возврата: 0 — можно использовать;
+# 1 — порт держит чужой процесс. Проверки портов XHTTP (8447/8445) в install и
+# add-xhttp без этого валились на собственном щите: install с третьим именем
+# применяет щит на 8445 ДО вызова add-xhttp, чей чек видел «порт занят».
+lucx_port_free_or_shield() { # порт
+  local p="$1"
+  ss -ltn 2>/dev/null | grep -qE "[:.]${p} " || return 0
+  ss -ltnp 2>/dev/null | grep -E "[:.]${p} " | grep -q 'nginx' || return 1
+  grep -qE "listen[[:space:]]+127\.0\.0\.1:${p}[[:space:]]+ssl[[:space:]]+default_server" "$ZERO_SNI_CONF" 2>/dev/null && return 0
+  grep -qE "^[[:space:]]*listen[[:space:]]+127\.0\.0\.1:${p}[[:space:]]" /etc/nginx/sites-enabled/xhttp-decoy-tls.conf 2>/dev/null && return 0
+  return 1
 }
 
 # h2 уже включён во вхосте (параметр http2 у listen этого порта или директива http2 on;). $1=файл $2=порт
@@ -4515,6 +4565,16 @@ cmd_install() {
     echo "  AAAA OK: $d -> нет (схема IPv4-only)"
   done
 
+  # v0.7.9: на сервере может уже стоять прежняя панель (стоковый 3x-ui и т.п.) —
+  # её подписка по умолчанию слушает 127.0.0.1:2096 и заваливает проверку портов
+  # ниже («ОШИБКА: порт 2096 уже занят»). Install всё равно ставит и настраивает
+  # панель заново, поэтому останавливаем старую заранее; при срыве установки её
+  # вернёт сторож lucx_xui_guard_fire / cleanup.
+  if systemctl is-active --quiet x-ui 2>/dev/null; then
+    echo "Обнаружена запущенная панель x-ui (прежняя установка) — останавливаю её: install настроит панель заново."
+    lucx_xui_stop || true
+  fi
+
   if ss -tlnp 2>/dev/null | grep -q ':443 '; then
     echo "ОШИБКА: порт 443 уже занят:"
     ss -tlnp | grep ':443 ' || true
@@ -4551,7 +4611,8 @@ cmd_install() {
       xh_bad="есть AAAA-запись (${xh_aaaa}); схема IPv4-only"
     else
       for p in "$XHTTP_PORT" "$XHTTP_TARGET_PORT"; do
-        if ss -tlnp 2>/dev/null | grep -q ":$p "; then xh_bad="порт $p занят"; fi
+        # v0.7.9: порт нашего щита/прежнего XHTTP-вхоста — не конфликт (lucx_port_free_or_shield)
+        lucx_port_free_or_shield "$p" || xh_bad="порт $p занят"
       done
     fi
     if [[ -n "$xh_bad" ]]; then
@@ -9933,6 +9994,112 @@ xhttp_remove_vhosts() {
   return 0
 }
 
+# v0.7.9 (аудит В1): снапшот xhttp-вхостов перед перезаписью в режиме починки.
+# Без снапшота откат мог только УДАЛИТЬ вхосты — включая те, что жили на ноде до
+# запуска add-xhttp. Для каждого вхоста фиксируем: файл sites-available (cp -a,
+# symlink сохраняется как symlink) и ФАКТИЧЕСКОЕ состояние записи sites-enabled
+# (аудит Н2, раунд 2): symlink → маркер 'symlink:<target>' (target сохраняется
+# как есть, включая битые ссылки), обычный файл → маркер 'file' + копия
+# содержимого; экзотические типы (каталог, fifo) — отказ ДО изменений, а не
+# молчаливая нормализация при откате.
+xhttp_vhosts_backup() { # dir
+  local d="$1" name e tgt
+  mkdir -p "$d" || return 1
+  for name in xhttp-80.conf xhttp-decoy-tls.conf; do
+    # v0.7.9 (аудит Н2, раунд 3): symlink в sites-available — отказ ДО записей:
+    # создание вхоста идёт через `cat >`, которое перезапишет внешний target,
+    # а откат вернул бы ссылку, но не её содержимое. Консистентно с отказом
+    # на экзотические записи sites-enabled.
+    if [[ -L "/etc/nginx/sites-available/${name}" ]]; then
+      echo "ОШИБКА: /etc/nginx/sites-available/${name} — symlink (нестандартно; запись вхоста перезаписала бы его цель) — остановился до изменений, разберись вручную."
+      return 1
+    fi
+    if [[ -e "/etc/nginx/sites-available/${name}" ]]; then
+      cp -a "/etc/nginx/sites-available/${name}" "${d}/${name}.available" || return 1
+    fi
+    e="/etc/nginx/sites-enabled/${name}"
+    if [[ -L "$e" ]]; then
+      tgt=$(readlink "$e") || return 1
+      [[ -n "$tgt" ]] || return 1
+      printf 'symlink:%s\n' "$tgt" > "${d}/${name}.enabled" || return 1
+    elif [[ -f "$e" ]]; then
+      printf 'file\n' > "${d}/${name}.enabled" || return 1
+      cp -a "$e" "${d}/${name}.enabled.content" || return 1
+    elif [[ -e "$e" ]]; then
+      echo "ОШИБКА: ${e} — нестандартный тип записи (не файл и не symlink) — остановился до изменений, разберись вручную."
+      return 1
+    fi
+  done
+  return 0
+}
+
+# восстанавливает вхосты из снапшота xhttp_vhosts_backup: что было — возвращается
+# как было (файл/symlink с прежним target/обычный файл с прежним содержимым),
+# чего не было — удаляется. Затем nginx -t + reload.
+xhttp_vhosts_restore() { # dir
+  local d="$1" name e marker
+  for name in xhttp-80.conf xhttp-decoy-tls.conf; do
+    if [[ -e "${d}/${name}.available" || -L "${d}/${name}.available" ]]; then
+      cp -a "${d}/${name}.available" "/etc/nginx/sites-available/${name}" || return 1
+    else
+      rm -f "/etc/nginx/sites-available/${name}" || return 1
+    fi
+    e="/etc/nginx/sites-enabled/${name}"
+    marker=""
+    [[ -f "${d}/${name}.enabled" ]] && marker=$(cat "${d}/${name}.enabled" 2>/dev/null) || true
+    # v0.7.9 (аудит В1, раунд 3): fail-closed. Пустой/нечитаемый маркер при
+    # СУЩЕСТВУЮЩЕМ файле маркера — повреждённый снапшот, а не «записи не было»;
+    # содержимое обычного файла проверяется ДО удаления текущей записи; любая
+    # порча снапшота = ошибка restore (попадёт в «ОТКАТ НЕ ПОЛНЫЙ»), а не
+    # молчаливая потеря прежней записи с ложным полным откатом.
+    if [[ -f "${d}/${name}.enabled" && -z "$marker" ]]; then
+      echo "ОШИБКА: маркер ${d}/${name}.enabled пуст или не читается — снапшот повреждён, restore остановлен."
+      return 1
+    fi
+    case "$marker" in
+      symlink:*)
+        ln -sfn "${marker#symlink:}" "$e" || return 1
+        ;;
+      file)
+        if [[ ! -f "${d}/${name}.enabled.content" ]]; then
+          echo "ОШИБКА: в снапшоте нет содержимого прежнего ${e} (${d}/${name}.enabled.content) — restore остановлен, текущая запись НЕ тронута."
+          return 1
+        fi
+        rm -f "$e" || return 1
+        cp -a "${d}/${name}.enabled.content" "$e" || return 1
+        ;;
+      "")
+        rm -f "$e" || return 1
+        ;;
+      *)
+        echo "ОШИБКА: неизвестный маркер '${marker}' в ${d}/${name}.enabled — снапшот повреждён, restore остановлен."
+        return 1
+        ;;
+    esac
+  done
+  if ! nginx -t >/dev/null 2>&1; then
+    echo "ОШИБКА: nginx -t не прошёл после восстановления прежних xhttp-вхостов:"
+    nginx -t 2>&1 | tail -3 | sed 's/^/    /' || true
+    return 1
+  fi
+  if ! systemctl reload nginx; then
+    echo "ОШИБКА: reload nginx не прошёл после восстановления прежних xhttp-вхостов."
+    return 1
+  fi
+  return 0
+}
+
+# сбой add-xhttp после вооружения: в режиме починки (XH_VHBAK задан) возвращаем
+# прежние вхосты из снапшота, в обычном режиме — убираем свежесозданные.
+xhttp_vhosts_rollback() {
+  if [[ -n "${XH_VHBAK:-}" && -d "${XH_VHBAK:-}" ]]; then
+    echo "  Режим починки: возвращаю прежние xhttp-вхосты из ${XH_VHBAK}."
+    xhttp_vhosts_restore "$XH_VHBAK"
+  else
+    xhttp_remove_vhosts
+  fi
+}
+
 # Страховка для панелей, где `x-ui migrate` не перенёс клиента в таблицы clients/client_inbounds
 # (без этого xray получает clients=[] и никто не подключится). Вызывать при ОСТАНОВЛЕННОМ x-ui.
 xhttp_ensure_panel_client() { # tag email uuid subid
@@ -10041,41 +10208,97 @@ SQL
   return 0
 }
 
+# Режим починки (v0.7.9): инбаунд 127.0.0.1:XHTTP_PORT уже в БД (остался после
+# повторного install — тот перегенерирует stream-конфиг без XHTTP, а БД сохраняет).
+# Раньше add-xhttp упирался в «порт 8447 занят» и «дубль в БД» — тупик. Теперь
+# инбаунд переиспользуем (ключи и клиенты сохраняются), достраиваем только
+# nginx-маршрут. Выставляет XH_UUID/XH_PBK/XH_SID/XH_PATH из существующего
+# инбаунда; XH_BAK пуст — БД не трогаем, откат только nginx-части.
+reuse_xhttp_inbound() {
+  XH_BAK=""
+  local w="FROM inbounds WHERE port=${XHTTP_PORT} AND listen='127.0.0.1' LIMIT 1"
+  XH_UUID=$(sqlite3 "$XUIDB" "SELECT json_extract(settings,'$.clients[0].id') ${w};" 2>/dev/null || true)
+  XH_PBK=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'$.realitySettings.settings.publicKey') ${w};" 2>/dev/null || true)
+  XH_SID=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'$.realitySettings.shortIds[0]') ${w};" 2>/dev/null || true)
+  XH_PATH=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'$.xhttpSettings.path') ${w};" 2>/dev/null || true)
+  if [[ -z "$XH_UUID" || -z "$XH_PBK" || -z "$XH_SID" || -z "$XH_PATH" ]]; then
+    echo "  ОШИБКА: инбаунд 127.0.0.1:${XHTTP_PORT} в БД есть, но параметры не читаются (битый JSON?). Убери его: bash $0 remove-xhttp --yes — и повтори."
+    return 1
+  fi
+  echo "  Инбаунд 127.0.0.1:${XHTTP_PORT} уже в БД (остался после повторной установки) — переиспользую: ключи и клиенты сохранены, достраиваю маршрут nginx."
+  return 0
+}
+
 # откат целиком: stream-конфиг из бэкапа, БД из бэкапа (без XHTTP-инбаунда), вхосты nginx убраны.
+# v0.7.9 (аудит В1): в режиме починки (передан vhosts_backup) вхосты НЕ удаляются —
+# возвращаются прежние, зафиксированные до перезаписи; БД в этом режиме не менялась.
 # Сертификат Let's Encrypt остаётся (безвреден, переиспользуется при повторе).
-xhttp_rollback_all() { # stream_backup db_backup
+xhttp_rollback_all() { # stream_backup db_backup [vhosts_backup_dir]
   set +e   # v0.6.4: откат не должен обрываться на первой ошибке (вызывается и из ловушки выхода)
-  local sbak="$1" dbak="${2:-}"
-  [[ -n "$sbak" && -f "$sbak" ]] && cp -a "$sbak" /etc/nginx/stream-sni-router.conf
+  local sbak="$1" dbak="${2:-}" vhbak="${3:-}"
+  # v0.7.9 (аудит В1, раунд 2): результат отката агрегируется — «схема как была»
+  # печатается только при успехе ВСЕХ частей, иначе явный список того, что
+  # требует ручного вмешательства. Код возврата: 0 — откат полный; 1 — нет.
+  local fails=""
+  if [[ -n "$sbak" && -f "$sbak" ]]; then
+    cp -a "$sbak" /etc/nginx/stream-sni-router.conf || fails="${fails} stream-конфиг"
+  else
+    fails="${fails} stream-конфиг(нет бэкапа ${sbak})"
+  fi
   rm -f /etc/nginx/stream-sni-router.conf.new
-  xhttp_remove_vhosts || echo "  ВНИМАНИЕ: nginx не применил удаление вхостов — вручную: nginx -t; systemctl reload nginx"
+  if [[ -n "$vhbak" && -d "$vhbak" ]]; then
+    xhttp_vhosts_restore "$vhbak" || { echo "  ВНИМАНИЕ: не удалось вернуть прежние вхосты из ${vhbak} — проверь вручную: ls -l /etc/nginx/sites-*/xhttp-*"; fails="${fails} вхосты"; }
+  else
+    xhttp_remove_vhosts || { echo "  ВНИМАНИЕ: nginx не применил удаление вхостов — вручную: nginx -t; systemctl reload nginx"; fails="${fails} вхосты"; }
+  fi
   # возвращаем только целую копию БД: недописанная (диск полон) не должна затереть рабочую
   if [[ -n "$dbak" && -f "$dbak" && "$(sqlite3 "$dbak" 'PRAGMA integrity_check;' 2>/dev/null)" != "ok" ]]; then
     echo "  ВНИМАНИЕ: бэкап БД ${dbak} повреждён — БД не трогаю"
     dbak=""
+    fails="${fails} БД(бэкап повреждён)"
   fi
   if [[ -n "$dbak" && -f "$dbak" ]]; then
     lucx_xui_stop
     sleep 1
-    lucx_db_restore "$dbak" || echo "ВНИМАНИЕ: БД не возвращена из ${dbak} — верни вручную (x-ui остановить): rm -f ${XUIDB}-wal ${XUIDB}-shm; cp -a ${dbak} ${XUIDB}"
-    lucx_xui_start || echo "  ВНИМАНИЕ: x-ui не запустился после отката — journalctl -u x-ui -n 50"
+    lucx_db_restore "$dbak" || { echo "ВНИМАНИЕ: БД не возвращена из ${dbak} — верни вручную (x-ui остановить): rm -f ${XUIDB}-wal ${XUIDB}-shm; cp -a ${dbak} ${XUIDB}"; fails="${fails} БД"; }
+    lucx_xui_start || { echo "  ВНИМАНИЕ: x-ui не запустился после отката — journalctl -u x-ui -n 50"; fails="${fails} запуск-x-ui"; }
     sleep 2
   fi
   if nginx -t >/dev/null 2>&1; then
-    systemctl reload nginx 2>/dev/null || true
+    systemctl reload nginx 2>/dev/null || fails="${fails} reload-nginx"
+  else
+    fails="${fails} nginx-конфиг"
   fi
+  if [[ -n "${fails# }" ]]; then
+    echo "  ОТКАТ НЕ ПОЛНЫЙ — требуют ручной проверки:${fails}"
+    return 1
+  fi
+  return 0
 }
 
 # v0.6.4: откат add-xhttp при ЛЮБОМ выходе после начала правок (ошибка, Ctrl+C, обрыв SSH): без него сбой между двумя
 # правками stream-конфига оставлял на диске конфиг, с которым nginx не поднимется после перезагрузки.
-XH_ARMED=0; XH_SBAK=""
+XH_ARMED=0; XH_SBAK=""; XH_VHBAK=""
 xhttp_exit_trap() {
   set +e
   if [[ "${XH_ARMED:-0}" == "1" ]]; then
     XH_ARMED=0
-    echo "Откат add-xhttp: возвращаю nginx-конфиг, БД и вхосты (схема как была; сертификат оставлен)."
-    xhttp_rollback_all "$XH_SBAK" "${XH_BAK:-}"
-    systemctl is-active --quiet x-ui && echo "x-ui active, схема как была." || echo "ВНИМАНИЕ: x-ui не active после отката — journalctl -u x-ui -n 50"
+    local rb_rc=0
+    if [[ -n "${XH_VHBAK:-}" ]]; then
+      echo "Откат починки add-xhttp: возвращаю nginx-конфиг и прежние вхосты (БД не изменялась; сертификат оставлен)."
+    else
+      echo "Откат add-xhttp: возвращаю nginx-конфиг, БД и вхосты (сертификат оставлен)."
+    fi
+    xhttp_rollback_all "$XH_SBAK" "${XH_BAK:-}" "${XH_VHBAK:-}" || rb_rc=1
+    # v0.7.9 (аудит В1, раунд 2): «схема как была» — только при ПОЛНОМ откате
+    # и живом x-ui; активность x-ui сама по себе ничего не подтверждает.
+    if [[ "$rb_rc" == "0" ]] && systemctl is-active --quiet x-ui; then
+      echo "x-ui active, схема как была."
+    elif [[ "$rb_rc" == "0" ]]; then
+      echo "ВНИМАНИЕ: откат применён, но x-ui не active — journalctl -u x-ui -n 50"
+    else
+      echo "ВНИМАНИЕ: откат завершён НЕ полностью (детали выше) — проверь вручную: nginx -t; ls -l /etc/nginx/sites-*/xhttp-*; systemctl status x-ui"
+    fi
   fi
   lucx_xui_guard_fire
 }
@@ -10146,10 +10369,33 @@ cmd_add_xhttp() {
     echo "ОШИБКА: не удалось определить публичный IP сервера."
     exit 1
   fi
+  # v0.7.9: повторный install сохраняет БД (и XHTTP-инбаунд в ней), но
+  # перегенерирует stream-конфиг без XHTTP — полураспад: инбаунд есть, маршрута
+  # нет. Детектим заранее: это режим починки (reuse_xhttp_inbound), а не конфликт.
+  # Инбаунд на ДРУГОЕ имя так не чиним — это осознанная смена домена: remove+add.
+  local xh_stale=0
+  if sqlite3 "$XUIDB" "SELECT 1 FROM inbounds WHERE port=${XHTTP_PORT} AND listen='127.0.0.1' AND protocol='vless' AND json_extract(stream_settings,'$.network')='xhttp' LIMIT 1;" 2>/dev/null | grep -q 1; then
+    local xh_domb
+    xh_domb=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'$.realitySettings.serverNames[0]') FROM inbounds WHERE port=${XHTTP_PORT} AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+    if [[ "$xh_domb" == "$xdom" ]]; then
+      xh_stale=1
+    else
+      echo "ОШИБКА: в БД уже есть XHTTP-инбаунд на имя '${xh_domb:-?}', а не '${xdom}'."
+      echo "  Смена имени — только через пересоздание: bash $0 remove-xhttp --yes && bash $0 add-xhttp ${xdom}"
+      exit 1
+    fi
+  fi
   local p
   for p in "$XHTTP_PORT" "$XHTTP_TARGET_PORT"; do
-    if ss -ltn 2>/dev/null | grep -qE "[:.]${p} "; then
-      echo "ОШИБКА: порт ${p} занят — нужен свободный loopback-порт."
+    # v0.7.9: при починке 8447 держит наш же xray — пропускаем его проверку
+    if [[ "$p" == "$XHTTP_PORT" && "$xh_stale" == "1" ]]; then
+      echo "  порт ${p} держит наш xray (инбаунд сохранился в БД) — режим починки: переиспользую, маршрут дострою."
+      continue
+    fi
+    # v0.7.9: порт, занятый нашим Zero-SNI Shield / прежним XHTTP-вхостом — не конфликт
+    if ! lucx_port_free_or_shield "$p"; then
+      echo "ОШИБКА: порт ${p} занят чужим процессом — нужен свободный loopback-порт."
+      ss -ltnp 2>/dev/null | grep -E "[:.]${p} " | sed 's/^/    /' || true
       exit 1
     fi
   done
@@ -10171,6 +10417,22 @@ cmd_add_xhttp() {
   sbak="/root/stream-sni-router.conf.pre-xhttp-${stamp}"
   cp -a "$stream_conf" "$sbak"
   echo "Бэкап nginx-конфига: ${sbak}"
+  # v0.7.9 (аудит В1): в режиме починки вхосты могли существовать до запуска.
+  # До любых правок фиксируем их наличие, содержимое и symlink-состояние —
+  # откат вернёт прежние вхосты, а не удалит их. Снапшот делается ДО вооружения
+  # ловушки: неполный бэкап = выход без изменений, а не «восстановление» из
+  # пустого каталога.
+  XH_VHBAK=""
+  if [[ "$xh_stale" == "1" ]]; then
+    XH_VHBAK="/root/xhttp-vhosts.pre-xhttp-${stamp}"
+    if xhttp_vhosts_backup "$XH_VHBAK"; then
+      echo "Бэкап прежних xhttp-вхостов: ${XH_VHBAK}"
+    else
+      echo "ОШИБКА: не удалось сохранить прежние xhttp-вхосты — остановился, ничего не изменено."
+      XH_VHBAK=""
+      exit 1
+    fi
+  fi
   # при обрыве SSH самотест тоже прерывается и запускает откат (trap 'exit 130' в подоболочке пробы)
   XH_SBAK="$sbak"; XH_ARMED=1
   trap '' HUP PIPE            # обрыв SSH → откат (ловушка ниже вернёт прежнее состояние)
@@ -10191,12 +10453,12 @@ EOF
   if ! nginx -t >/dev/null 2>&1; then
     echo "ОШИБКА: nginx -t не прошёл после добавления xhttp-80.conf."
     { nginx -t 2>&1 | tail -3 | sed 's/^/    /'; } || true
-    xhttp_remove_vhosts
+    xhttp_vhosts_rollback
     exit 1
   fi
   if ! systemctl reload nginx; then
-    echo "ОШИБКА: reload nginx не прошёл после добавления xhttp-80.conf — убираю вхосты."
-    xhttp_remove_vhosts
+    echo "ОШИБКА: reload nginx не прошёл после добавления xhttp-80.conf — откатываю вхосты."
+    xhttp_vhosts_rollback
     exit 1
   fi
   # 2) сертификат (отдельный, автопродление certbot + reload nginx)
@@ -10205,8 +10467,8 @@ EOF
   if [[ "$have_cert" == "0" ]]; then
     if ! certbot certonly --webroot -w "$webroot" -d "$xdom" --cert-name "$xdom" --keep-until-expiring \
          --non-interactive --agree-tos --register-unsafely-without-email --deploy-hook "systemctl reload nginx"; then
-      echo "ОШИБКА: certbot не получил сертификат для ${xdom} — nginx-вхосты убраны, схема как была."
-      xhttp_remove_vhosts
+      echo "ОШИБКА: certbot не получил сертификат для ${xdom} — откатываю вхосты, схема как была."
+      xhttp_vhosts_rollback
       exit 1
     fi
   else
@@ -10233,12 +10495,12 @@ EOF
   if ! nginx -t >/dev/null 2>&1; then
     echo "ОШИБКА: nginx -t не прошёл после добавления xhttp-decoy-tls.conf."
     nginx -t 2>&1 | sed 's/^/    /' || true
-    xhttp_remove_vhosts
+    xhttp_vhosts_rollback
     exit 1
   fi
   if ! systemctl reload nginx; then
-    echo "ОШИБКА: reload nginx не прошёл после добавления xhttp-decoy-tls.conf — убираю вхосты."
-    xhttp_remove_vhosts
+    echo "ОШИБКА: reload nginx не прошёл после добавления xhttp-decoy-tls.conf — откатываю вхосты."
+    xhttp_vhosts_rollback
     exit 1
   fi
   # v0.7.8: щитим XHTTP-мишень 8445 (и 8444, если его вхост есть, а щита ещё не было)
@@ -10254,11 +10516,16 @@ EOF
   done
   if [[ "$tcode" != "200" ]]; then
     echo "ОШИБКА: вхост-мишень 127.0.0.1:${XHTTP_TARGET_PORT} не отвечает 200 (код ${tcode}) — откатываю."
-    xhttp_remove_vhosts
+    xhttp_vhosts_rollback
     exit 1
   fi
-  # 4) инбаунд + клиент
-  create_xhttp_inbound || { xhttp_remove_vhosts; exit 1; }
+  # 4) инбаунд + клиент (v0.7.9: если инбаунд сохранился в БД после повторного
+  # install — режим починки: переиспользуем его, БД не трогаем)
+  if [[ "$xh_stale" == "1" ]]; then
+    reuse_xhttp_inbound || { xhttp_vhosts_rollback; exit 1; }
+  else
+    create_xhttp_inbound || { xhttp_vhosts_rollback; exit 1; }
+  fi
   # 5) stream: имя -> xhttp_backend
   # обе правки на копии, подмена одной операцией: сбой между ними не оставит полуготовый конфиг
   cp -a "$stream_conf" "${stream_conf}.new"
@@ -10294,8 +10561,12 @@ EOF
   fi
   selftest_443 0 "$fuuid" "$fpbk" "$fsid" || ok=1
   if [[ "$ok" != "0" ]]; then
-    echo "ОШИБКА: самотест не прошёл — возвращаю nginx-конфиг, БД и вхосты (схема как была; сертификат ${xdom} оставлен)."
-    echo "  (БД возвращается на момент до add-xhttp: изменения за последние минуты — трафик, новые клиенты — не сохранятся.)"
+    if [[ "$xh_stale" == "1" ]]; then
+      echo "ОШИБКА: самотест не прошёл — возвращаю nginx-конфиг и прежние вхосты (режим починки: БД не изменялась; сертификат ${xdom} оставлен)."
+    else
+      echo "ОШИБКА: самотест не прошёл — возвращаю nginx-конфиг, БД и вхосты (схема как была; сертификат ${xdom} оставлен)."
+      echo "  (БД возвращается на момент до add-xhttp: изменения за последние минуты — трафик, новые клиенты — не сохранятся.)"
+    fi
     exit 1
   fi
   XH_ARMED=0                  # самотест пройден: откат больше не нужен
@@ -10321,7 +10592,11 @@ EOF
   echo "Ссылка: ${link}"
   echo "TLS и Reality перед TLS не менялись. Не меняй инбаунд через форму панели (настройки sockopt/Reality)."
   echo "Если клиент не заведётся с mode=auto — попробуй mode=stream-up или packet-up в настройках клиента."
-  echo "Откат: sudo bash $0 remove-xhttp   (или вручную: cp ${sbak} ${stream_conf}; БД: ${XH_BAK})"
+  if [[ "$xh_stale" == "1" ]]; then
+    echo "Откат: sudo bash $0 remove-xhttp   (или вручную: cp ${sbak} ${stream_conf}; прежние вхосты: ${XH_VHBAK}; БД при починке не изменялась)"
+  else
+    echo "Откат: sudo bash $0 remove-xhttp   (или вручную: cp ${sbak} ${stream_conf}; БД: ${XH_BAK})"
+  fi
   echo "Проверка: bash $0 healthcheck (блок [7b])."
   echo "=========================================="
 }

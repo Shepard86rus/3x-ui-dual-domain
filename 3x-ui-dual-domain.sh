@@ -10006,7 +10006,15 @@ xhttp_vhosts_backup() { # dir
   local d="$1" name e tgt
   mkdir -p "$d" || return 1
   for name in xhttp-80.conf xhttp-decoy-tls.conf; do
-    if [[ -e "/etc/nginx/sites-available/${name}" || -L "/etc/nginx/sites-available/${name}" ]]; then
+    # v0.7.9 (аудит Н2, раунд 3): symlink в sites-available — отказ ДО записей:
+    # создание вхоста идёт через `cat >`, которое перезапишет внешний target,
+    # а откат вернул бы ссылку, но не её содержимое. Консистентно с отказом
+    # на экзотические записи sites-enabled.
+    if [[ -L "/etc/nginx/sites-available/${name}" ]]; then
+      echo "ОШИБКА: /etc/nginx/sites-available/${name} — symlink (нестандартно; запись вхоста перезаписала бы его цель) — остановился до изменений, разберись вручную."
+      return 1
+    fi
+    if [[ -e "/etc/nginx/sites-available/${name}" ]]; then
       cp -a "/etc/nginx/sites-available/${name}" "${d}/${name}.available" || return 1
     fi
     e="/etc/nginx/sites-enabled/${name}"
@@ -10038,21 +10046,34 @@ xhttp_vhosts_restore() { # dir
     fi
     e="/etc/nginx/sites-enabled/${name}"
     marker=""
-    [[ -f "${d}/${name}.enabled" ]] && marker=$(cat "${d}/${name}.enabled")
+    [[ -f "${d}/${name}.enabled" ]] && marker=$(cat "${d}/${name}.enabled" 2>/dev/null) || true
+    # v0.7.9 (аудит В1, раунд 3): fail-closed. Пустой/нечитаемый маркер при
+    # СУЩЕСТВУЮЩЕМ файле маркера — повреждённый снапшот, а не «записи не было»;
+    # содержимое обычного файла проверяется ДО удаления текущей записи; любая
+    # порча снапшота = ошибка restore (попадёт в «ОТКАТ НЕ ПОЛНЫЙ»), а не
+    # молчаливая потеря прежней записи с ложным полным откатом.
+    if [[ -f "${d}/${name}.enabled" && -z "$marker" ]]; then
+      echo "ОШИБКА: маркер ${d}/${name}.enabled пуст или не читается — снапшот повреждён, restore остановлен."
+      return 1
+    fi
     case "$marker" in
       symlink:*)
         ln -sfn "${marker#symlink:}" "$e" || return 1
         ;;
       file)
-        rm -f "$e" || return 1
-        if [[ -f "${d}/${name}.enabled.content" ]]; then
-          cp -a "${d}/${name}.enabled.content" "$e" || return 1
-        else
-          echo "  ВНИМАНИЕ: содержимое прежнего ${e} в снапшоте не читается — запись убрана."
+        if [[ ! -f "${d}/${name}.enabled.content" ]]; then
+          echo "ОШИБКА: в снапшоте нет содержимого прежнего ${e} (${d}/${name}.enabled.content) — restore остановлен, текущая запись НЕ тронута."
+          return 1
         fi
+        rm -f "$e" || return 1
+        cp -a "${d}/${name}.enabled.content" "$e" || return 1
+        ;;
+      "")
+        rm -f "$e" || return 1
         ;;
       *)
-        rm -f "$e" || return 1
+        echo "ОШИБКА: неизвестный маркер '${marker}' в ${d}/${name}.enabled — снапшот повреждён, restore остановлен."
+        return 1
         ;;
     esac
   done

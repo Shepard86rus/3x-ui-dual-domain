@@ -9994,6 +9994,63 @@ xhttp_remove_vhosts() {
   return 0
 }
 
+# v0.7.9 (аудит В1): снапшот xhttp-вхостов перед перезаписью в режиме починки.
+# Для каждого вхоста фиксируем: существовал ли файл в sites-available (и его
+# содержимое) и была ли запись в sites-enabled. Без снапшота откат мог только
+# УДАЛИТЬ вхосты — включая те, что жили на ноде до запуска add-xhttp.
+xhttp_vhosts_backup() { # dir
+  local d="$1" name
+  mkdir -p "$d" || return 1
+  for name in xhttp-80.conf xhttp-decoy-tls.conf; do
+    if [[ -f "/etc/nginx/sites-available/${name}" ]]; then
+      cp -a "/etc/nginx/sites-available/${name}" "${d}/${name}.available" || return 1
+    fi
+    if [[ -e "/etc/nginx/sites-enabled/${name}" || -L "/etc/nginx/sites-enabled/${name}" ]]; then
+      : > "${d}/${name}.enabled" || return 1
+    fi
+  done
+  return 0
+}
+
+# восстанавливает вхосты из снапшота xhttp_vhosts_backup: что было — возвращается
+# (файл + symlink по конвенции скрипта), чего не было — удаляется. Затем nginx -t + reload.
+xhttp_vhosts_restore() { # dir
+  local d="$1" name
+  for name in xhttp-80.conf xhttp-decoy-tls.conf; do
+    if [[ -f "${d}/${name}.available" ]]; then
+      cp -a "${d}/${name}.available" "/etc/nginx/sites-available/${name}" || return 1
+    else
+      rm -f "/etc/nginx/sites-available/${name}" || return 1
+    fi
+    if [[ -f "${d}/${name}.enabled" && -f "/etc/nginx/sites-available/${name}" ]]; then
+      ln -sf "/etc/nginx/sites-available/${name}" "/etc/nginx/sites-enabled/${name}" || return 1
+    else
+      rm -f "/etc/nginx/sites-enabled/${name}" || return 1
+    fi
+  done
+  if ! nginx -t >/dev/null 2>&1; then
+    echo "ОШИБКА: nginx -t не прошёл после восстановления прежних xhttp-вхостов:"
+    nginx -t 2>&1 | tail -3 | sed 's/^/    /' || true
+    return 1
+  fi
+  if ! systemctl reload nginx; then
+    echo "ОШИБКА: reload nginx не прошёл после восстановления прежних xhttp-вхостов."
+    return 1
+  fi
+  return 0
+}
+
+# сбой add-xhttp после вооружения: в режиме починки (XH_VHBAK задан) возвращаем
+# прежние вхосты из снапшота, в обычном режиме — убираем свежесозданные.
+xhttp_vhosts_rollback() {
+  if [[ -n "${XH_VHBAK:-}" && -d "${XH_VHBAK:-}" ]]; then
+    echo "  Режим починки: возвращаю прежние xhttp-вхосты из ${XH_VHBAK}."
+    xhttp_vhosts_restore "$XH_VHBAK"
+  else
+    xhttp_remove_vhosts
+  fi
+}
+
 # Страховка для панелей, где `x-ui migrate` не перенёс клиента в таблицы clients/client_inbounds
 # (без этого xray получает clients=[] и никто не подключится). Вызывать при ОСТАНОВЛЕННОМ x-ui.
 xhttp_ensure_panel_client() { # tag email uuid subid
@@ -10124,13 +10181,19 @@ reuse_xhttp_inbound() {
 }
 
 # откат целиком: stream-конфиг из бэкапа, БД из бэкапа (без XHTTP-инбаунда), вхосты nginx убраны.
+# v0.7.9 (аудит В1): в режиме починки (передан vhosts_backup) вхосты НЕ удаляются —
+# возвращаются прежние, зафиксированные до перезаписи; БД в этом режиме не менялась.
 # Сертификат Let's Encrypt остаётся (безвреден, переиспользуется при повторе).
-xhttp_rollback_all() { # stream_backup db_backup
+xhttp_rollback_all() { # stream_backup db_backup [vhosts_backup_dir]
   set +e   # v0.6.4: откат не должен обрываться на первой ошибке (вызывается и из ловушки выхода)
-  local sbak="$1" dbak="${2:-}"
+  local sbak="$1" dbak="${2:-}" vhbak="${3:-}"
   [[ -n "$sbak" && -f "$sbak" ]] && cp -a "$sbak" /etc/nginx/stream-sni-router.conf
   rm -f /etc/nginx/stream-sni-router.conf.new
-  xhttp_remove_vhosts || echo "  ВНИМАНИЕ: nginx не применил удаление вхостов — вручную: nginx -t; systemctl reload nginx"
+  if [[ -n "$vhbak" && -d "$vhbak" ]]; then
+    xhttp_vhosts_restore "$vhbak" || echo "  ВНИМАНИЕ: не удалось вернуть прежние вхосты из ${vhbak} — проверь вручную: ls -l /etc/nginx/sites-*/xhttp-*"
+  else
+    xhttp_remove_vhosts || echo "  ВНИМАНИЕ: nginx не применил удаление вхостов — вручную: nginx -t; systemctl reload nginx"
+  fi
   # возвращаем только целую копию БД: недописанная (диск полон) не должна затереть рабочую
   if [[ -n "$dbak" && -f "$dbak" && "$(sqlite3 "$dbak" 'PRAGMA integrity_check;' 2>/dev/null)" != "ok" ]]; then
     echo "  ВНИМАНИЕ: бэкап БД ${dbak} повреждён — БД не трогаю"
@@ -10150,13 +10213,17 @@ xhttp_rollback_all() { # stream_backup db_backup
 
 # v0.6.4: откат add-xhttp при ЛЮБОМ выходе после начала правок (ошибка, Ctrl+C, обрыв SSH): без него сбой между двумя
 # правками stream-конфига оставлял на диске конфиг, с которым nginx не поднимется после перезагрузки.
-XH_ARMED=0; XH_SBAK=""
+XH_ARMED=0; XH_SBAK=""; XH_VHBAK=""
 xhttp_exit_trap() {
   set +e
   if [[ "${XH_ARMED:-0}" == "1" ]]; then
     XH_ARMED=0
-    echo "Откат add-xhttp: возвращаю nginx-конфиг, БД и вхосты (схема как была; сертификат оставлен)."
-    xhttp_rollback_all "$XH_SBAK" "${XH_BAK:-}"
+    if [[ -n "${XH_VHBAK:-}" ]]; then
+      echo "Откат починки add-xhttp: возвращаю nginx-конфиг и прежние вхосты (БД не изменялась; сертификат оставлен)."
+    else
+      echo "Откат add-xhttp: возвращаю nginx-конфиг, БД и вхосты (схема как была; сертификат оставлен)."
+    fi
+    xhttp_rollback_all "$XH_SBAK" "${XH_BAK:-}" "${XH_VHBAK:-}"
     systemctl is-active --quiet x-ui && echo "x-ui active, схема как была." || echo "ВНИМАНИЕ: x-ui не active после отката — journalctl -u x-ui -n 50"
   fi
   lucx_xui_guard_fire
@@ -10276,6 +10343,22 @@ cmd_add_xhttp() {
   sbak="/root/stream-sni-router.conf.pre-xhttp-${stamp}"
   cp -a "$stream_conf" "$sbak"
   echo "Бэкап nginx-конфига: ${sbak}"
+  # v0.7.9 (аудит В1): в режиме починки вхосты могли существовать до запуска.
+  # До любых правок фиксируем их наличие, содержимое и symlink-состояние —
+  # откат вернёт прежние вхосты, а не удалит их. Снапшот делается ДО вооружения
+  # ловушки: неполный бэкап = выход без изменений, а не «восстановление» из
+  # пустого каталога.
+  XH_VHBAK=""
+  if [[ "$xh_stale" == "1" ]]; then
+    XH_VHBAK="/root/xhttp-vhosts.pre-xhttp-${stamp}"
+    if xhttp_vhosts_backup "$XH_VHBAK"; then
+      echo "Бэкап прежних xhttp-вхостов: ${XH_VHBAK}"
+    else
+      echo "ОШИБКА: не удалось сохранить прежние xhttp-вхосты — остановился, ничего не изменено."
+      XH_VHBAK=""
+      exit 1
+    fi
+  fi
   # при обрыве SSH самотест тоже прерывается и запускает откат (trap 'exit 130' в подоболочке пробы)
   XH_SBAK="$sbak"; XH_ARMED=1
   trap '' HUP PIPE            # обрыв SSH → откат (ловушка ниже вернёт прежнее состояние)
@@ -10296,12 +10379,12 @@ EOF
   if ! nginx -t >/dev/null 2>&1; then
     echo "ОШИБКА: nginx -t не прошёл после добавления xhttp-80.conf."
     { nginx -t 2>&1 | tail -3 | sed 's/^/    /'; } || true
-    xhttp_remove_vhosts
+    xhttp_vhosts_rollback
     exit 1
   fi
   if ! systemctl reload nginx; then
-    echo "ОШИБКА: reload nginx не прошёл после добавления xhttp-80.conf — убираю вхосты."
-    xhttp_remove_vhosts
+    echo "ОШИБКА: reload nginx не прошёл после добавления xhttp-80.conf — откатываю вхосты."
+    xhttp_vhosts_rollback
     exit 1
   fi
   # 2) сертификат (отдельный, автопродление certbot + reload nginx)
@@ -10310,8 +10393,8 @@ EOF
   if [[ "$have_cert" == "0" ]]; then
     if ! certbot certonly --webroot -w "$webroot" -d "$xdom" --cert-name "$xdom" --keep-until-expiring \
          --non-interactive --agree-tos --register-unsafely-without-email --deploy-hook "systemctl reload nginx"; then
-      echo "ОШИБКА: certbot не получил сертификат для ${xdom} — nginx-вхосты убраны, схема как была."
-      xhttp_remove_vhosts
+      echo "ОШИБКА: certbot не получил сертификат для ${xdom} — откатываю вхосты, схема как была."
+      xhttp_vhosts_rollback
       exit 1
     fi
   else
@@ -10338,12 +10421,12 @@ EOF
   if ! nginx -t >/dev/null 2>&1; then
     echo "ОШИБКА: nginx -t не прошёл после добавления xhttp-decoy-tls.conf."
     nginx -t 2>&1 | sed 's/^/    /' || true
-    xhttp_remove_vhosts
+    xhttp_vhosts_rollback
     exit 1
   fi
   if ! systemctl reload nginx; then
-    echo "ОШИБКА: reload nginx не прошёл после добавления xhttp-decoy-tls.conf — убираю вхосты."
-    xhttp_remove_vhosts
+    echo "ОШИБКА: reload nginx не прошёл после добавления xhttp-decoy-tls.conf — откатываю вхосты."
+    xhttp_vhosts_rollback
     exit 1
   fi
   # v0.7.8: щитим XHTTP-мишень 8445 (и 8444, если его вхост есть, а щита ещё не было)
@@ -10359,15 +10442,15 @@ EOF
   done
   if [[ "$tcode" != "200" ]]; then
     echo "ОШИБКА: вхост-мишень 127.0.0.1:${XHTTP_TARGET_PORT} не отвечает 200 (код ${tcode}) — откатываю."
-    xhttp_remove_vhosts
+    xhttp_vhosts_rollback
     exit 1
   fi
   # 4) инбаунд + клиент (v0.7.9: если инбаунд сохранился в БД после повторного
   # install — режим починки: переиспользуем его, БД не трогаем)
   if [[ "$xh_stale" == "1" ]]; then
-    reuse_xhttp_inbound || { xhttp_remove_vhosts; exit 1; }
+    reuse_xhttp_inbound || { xhttp_vhosts_rollback; exit 1; }
   else
-    create_xhttp_inbound || { xhttp_remove_vhosts; exit 1; }
+    create_xhttp_inbound || { xhttp_vhosts_rollback; exit 1; }
   fi
   # 5) stream: имя -> xhttp_backend
   # обе правки на копии, подмена одной операцией: сбой между ними не оставит полуготовый конфиг
@@ -10404,8 +10487,12 @@ EOF
   fi
   selftest_443 0 "$fuuid" "$fpbk" "$fsid" || ok=1
   if [[ "$ok" != "0" ]]; then
-    echo "ОШИБКА: самотест не прошёл — возвращаю nginx-конфиг, БД и вхосты (схема как была; сертификат ${xdom} оставлен)."
-    echo "  (БД возвращается на момент до add-xhttp: изменения за последние минуты — трафик, новые клиенты — не сохранятся.)"
+    if [[ "$xh_stale" == "1" ]]; then
+      echo "ОШИБКА: самотест не прошёл — возвращаю nginx-конфиг и прежние вхосты (режим починки: БД не изменялась; сертификат ${xdom} оставлен)."
+    else
+      echo "ОШИБКА: самотест не прошёл — возвращаю nginx-конфиг, БД и вхосты (схема как была; сертификат ${xdom} оставлен)."
+      echo "  (БД возвращается на момент до add-xhttp: изменения за последние минуты — трафик, новые клиенты — не сохранятся.)"
+    fi
     exit 1
   fi
   XH_ARMED=0                  # самотест пройден: откат больше не нужен
@@ -10431,7 +10518,11 @@ EOF
   echo "Ссылка: ${link}"
   echo "TLS и Reality перед TLS не менялись. Не меняй инбаунд через форму панели (настройки sockopt/Reality)."
   echo "Если клиент не заведётся с mode=auto — попробуй mode=stream-up или packet-up в настройках клиента."
-  echo "Откат: sudo bash $0 remove-xhttp   (или вручную: cp ${sbak} ${stream_conf}; БД: ${XH_BAK})"
+  if [[ "$xh_stale" == "1" ]]; then
+    echo "Откат: sudo bash $0 remove-xhttp   (или вручную: cp ${sbak} ${stream_conf}; прежние вхосты: ${XH_VHBAK}; БД при починке не изменялась)"
+  else
+    echo "Откат: sudo bash $0 remove-xhttp   (или вручную: cp ${sbak} ${stream_conf}; БД: ${XH_BAK})"
+  fi
   echo "Проверка: bash $0 healthcheck (блок [7b])."
   echo "=========================================="
 }

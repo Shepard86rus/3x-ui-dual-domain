@@ -9995,38 +9995,66 @@ xhttp_remove_vhosts() {
 }
 
 # v0.7.9 (аудит В1): снапшот xhttp-вхостов перед перезаписью в режиме починки.
-# Для каждого вхоста фиксируем: существовал ли файл в sites-available (и его
-# содержимое) и была ли запись в sites-enabled. Без снапшота откат мог только
-# УДАЛИТЬ вхосты — включая те, что жили на ноде до запуска add-xhttp.
+# Без снапшота откат мог только УДАЛИТЬ вхосты — включая те, что жили на ноде до
+# запуска add-xhttp. Для каждого вхоста фиксируем: файл sites-available (cp -a,
+# symlink сохраняется как symlink) и ФАКТИЧЕСКОЕ состояние записи sites-enabled
+# (аудит Н2, раунд 2): symlink → маркер 'symlink:<target>' (target сохраняется
+# как есть, включая битые ссылки), обычный файл → маркер 'file' + копия
+# содержимого; экзотические типы (каталог, fifo) — отказ ДО изменений, а не
+# молчаливая нормализация при откате.
 xhttp_vhosts_backup() { # dir
-  local d="$1" name
+  local d="$1" name e tgt
   mkdir -p "$d" || return 1
   for name in xhttp-80.conf xhttp-decoy-tls.conf; do
-    if [[ -f "/etc/nginx/sites-available/${name}" ]]; then
+    if [[ -e "/etc/nginx/sites-available/${name}" || -L "/etc/nginx/sites-available/${name}" ]]; then
       cp -a "/etc/nginx/sites-available/${name}" "${d}/${name}.available" || return 1
     fi
-    if [[ -e "/etc/nginx/sites-enabled/${name}" || -L "/etc/nginx/sites-enabled/${name}" ]]; then
-      : > "${d}/${name}.enabled" || return 1
+    e="/etc/nginx/sites-enabled/${name}"
+    if [[ -L "$e" ]]; then
+      tgt=$(readlink "$e") || return 1
+      [[ -n "$tgt" ]] || return 1
+      printf 'symlink:%s\n' "$tgt" > "${d}/${name}.enabled" || return 1
+    elif [[ -f "$e" ]]; then
+      printf 'file\n' > "${d}/${name}.enabled" || return 1
+      cp -a "$e" "${d}/${name}.enabled.content" || return 1
+    elif [[ -e "$e" ]]; then
+      echo "ОШИБКА: ${e} — нестандартный тип записи (не файл и не symlink) — остановился до изменений, разберись вручную."
+      return 1
     fi
   done
   return 0
 }
 
 # восстанавливает вхосты из снапшота xhttp_vhosts_backup: что было — возвращается
-# (файл + symlink по конвенции скрипта), чего не было — удаляется. Затем nginx -t + reload.
+# как было (файл/symlink с прежним target/обычный файл с прежним содержимым),
+# чего не было — удаляется. Затем nginx -t + reload.
 xhttp_vhosts_restore() { # dir
-  local d="$1" name
+  local d="$1" name e marker
   for name in xhttp-80.conf xhttp-decoy-tls.conf; do
-    if [[ -f "${d}/${name}.available" ]]; then
+    if [[ -e "${d}/${name}.available" || -L "${d}/${name}.available" ]]; then
       cp -a "${d}/${name}.available" "/etc/nginx/sites-available/${name}" || return 1
     else
       rm -f "/etc/nginx/sites-available/${name}" || return 1
     fi
-    if [[ -f "${d}/${name}.enabled" && -f "/etc/nginx/sites-available/${name}" ]]; then
-      ln -sf "/etc/nginx/sites-available/${name}" "/etc/nginx/sites-enabled/${name}" || return 1
-    else
-      rm -f "/etc/nginx/sites-enabled/${name}" || return 1
-    fi
+    e="/etc/nginx/sites-enabled/${name}"
+    marker=""
+    [[ -f "${d}/${name}.enabled" ]] && marker=$(cat "${d}/${name}.enabled")
+    case "$marker" in
+      symlink:*)
+        ln -sfn "${marker#symlink:}" "$e" || return 1
+        ;;
+      file)
+        rm -f "$e" || return 1
+        if [[ -f "${d}/${name}.enabled.content" ]]; then
+          cp -a "${d}/${name}.enabled.content" "$e" || return 1
+        else
+          echo "  ВНИМАНИЕ: содержимое прежнего ${e} в снапшоте не читается — запись убрана."
+        fi
+        ;;
+      *)
+        rm -f "$e" || return 1
+        ;;
+    esac
   done
   if ! nginx -t >/dev/null 2>&1; then
     echo "ОШИБКА: nginx -t не прошёл после восстановления прежних xhttp-вхостов:"
@@ -10187,28 +10215,44 @@ reuse_xhttp_inbound() {
 xhttp_rollback_all() { # stream_backup db_backup [vhosts_backup_dir]
   set +e   # v0.6.4: откат не должен обрываться на первой ошибке (вызывается и из ловушки выхода)
   local sbak="$1" dbak="${2:-}" vhbak="${3:-}"
-  [[ -n "$sbak" && -f "$sbak" ]] && cp -a "$sbak" /etc/nginx/stream-sni-router.conf
+  # v0.7.9 (аудит В1, раунд 2): результат отката агрегируется — «схема как была»
+  # печатается только при успехе ВСЕХ частей, иначе явный список того, что
+  # требует ручного вмешательства. Код возврата: 0 — откат полный; 1 — нет.
+  local fails=""
+  if [[ -n "$sbak" && -f "$sbak" ]]; then
+    cp -a "$sbak" /etc/nginx/stream-sni-router.conf || fails="${fails} stream-конфиг"
+  else
+    fails="${fails} stream-конфиг(нет бэкапа ${sbak})"
+  fi
   rm -f /etc/nginx/stream-sni-router.conf.new
   if [[ -n "$vhbak" && -d "$vhbak" ]]; then
-    xhttp_vhosts_restore "$vhbak" || echo "  ВНИМАНИЕ: не удалось вернуть прежние вхосты из ${vhbak} — проверь вручную: ls -l /etc/nginx/sites-*/xhttp-*"
+    xhttp_vhosts_restore "$vhbak" || { echo "  ВНИМАНИЕ: не удалось вернуть прежние вхосты из ${vhbak} — проверь вручную: ls -l /etc/nginx/sites-*/xhttp-*"; fails="${fails} вхосты"; }
   else
-    xhttp_remove_vhosts || echo "  ВНИМАНИЕ: nginx не применил удаление вхостов — вручную: nginx -t; systemctl reload nginx"
+    xhttp_remove_vhosts || { echo "  ВНИМАНИЕ: nginx не применил удаление вхостов — вручную: nginx -t; systemctl reload nginx"; fails="${fails} вхосты"; }
   fi
   # возвращаем только целую копию БД: недописанная (диск полон) не должна затереть рабочую
   if [[ -n "$dbak" && -f "$dbak" && "$(sqlite3 "$dbak" 'PRAGMA integrity_check;' 2>/dev/null)" != "ok" ]]; then
     echo "  ВНИМАНИЕ: бэкап БД ${dbak} повреждён — БД не трогаю"
     dbak=""
+    fails="${fails} БД(бэкап повреждён)"
   fi
   if [[ -n "$dbak" && -f "$dbak" ]]; then
     lucx_xui_stop
     sleep 1
-    lucx_db_restore "$dbak" || echo "ВНИМАНИЕ: БД не возвращена из ${dbak} — верни вручную (x-ui остановить): rm -f ${XUIDB}-wal ${XUIDB}-shm; cp -a ${dbak} ${XUIDB}"
-    lucx_xui_start || echo "  ВНИМАНИЕ: x-ui не запустился после отката — journalctl -u x-ui -n 50"
+    lucx_db_restore "$dbak" || { echo "ВНИМАНИЕ: БД не возвращена из ${dbak} — верни вручную (x-ui остановить): rm -f ${XUIDB}-wal ${XUIDB}-shm; cp -a ${dbak} ${XUIDB}"; fails="${fails} БД"; }
+    lucx_xui_start || { echo "  ВНИМАНИЕ: x-ui не запустился после отката — journalctl -u x-ui -n 50"; fails="${fails} запуск-x-ui"; }
     sleep 2
   fi
   if nginx -t >/dev/null 2>&1; then
-    systemctl reload nginx 2>/dev/null || true
+    systemctl reload nginx 2>/dev/null || fails="${fails} reload-nginx"
+  else
+    fails="${fails} nginx-конфиг"
   fi
+  if [[ -n "${fails# }" ]]; then
+    echo "  ОТКАТ НЕ ПОЛНЫЙ — требуют ручной проверки:${fails}"
+    return 1
+  fi
+  return 0
 }
 
 # v0.6.4: откат add-xhttp при ЛЮБОМ выходе после начала правок (ошибка, Ctrl+C, обрыв SSH): без него сбой между двумя
@@ -10218,13 +10262,22 @@ xhttp_exit_trap() {
   set +e
   if [[ "${XH_ARMED:-0}" == "1" ]]; then
     XH_ARMED=0
+    local rb_rc=0
     if [[ -n "${XH_VHBAK:-}" ]]; then
       echo "Откат починки add-xhttp: возвращаю nginx-конфиг и прежние вхосты (БД не изменялась; сертификат оставлен)."
     else
-      echo "Откат add-xhttp: возвращаю nginx-конфиг, БД и вхосты (схема как была; сертификат оставлен)."
+      echo "Откат add-xhttp: возвращаю nginx-конфиг, БД и вхосты (сертификат оставлен)."
     fi
-    xhttp_rollback_all "$XH_SBAK" "${XH_BAK:-}" "${XH_VHBAK:-}"
-    systemctl is-active --quiet x-ui && echo "x-ui active, схема как была." || echo "ВНИМАНИЕ: x-ui не active после отката — journalctl -u x-ui -n 50"
+    xhttp_rollback_all "$XH_SBAK" "${XH_BAK:-}" "${XH_VHBAK:-}" || rb_rc=1
+    # v0.7.9 (аудит В1, раунд 2): «схема как была» — только при ПОЛНОМ откате
+    # и живом x-ui; активность x-ui сама по себе ничего не подтверждает.
+    if [[ "$rb_rc" == "0" ]] && systemctl is-active --quiet x-ui; then
+      echo "x-ui active, схема как была."
+    elif [[ "$rb_rc" == "0" ]]; then
+      echo "ВНИМАНИЕ: откат применён, но x-ui не active — journalctl -u x-ui -n 50"
+    else
+      echo "ВНИМАНИЕ: откат завершён НЕ полностью (детали выше) — проверь вручную: nginx -t; ls -l /etc/nginx/sites-*/xhttp-*; systemctl status x-ui"
+    fi
   fi
   lucx_xui_guard_fire
 }

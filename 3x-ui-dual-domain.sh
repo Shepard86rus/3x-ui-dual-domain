@@ -1183,6 +1183,15 @@
 #   установки прежнюю панель возвращает сторож lucx_xui_guard_fire / cleanup.
 #   Проверка — systemctl is-active, установленной, но остановленной панели и
 #   серверу без панели ничего не меняет.
+#   Плюс вторая жалоба: на чистом сервере с третьим именем XHTTP не вставал —
+#   «ОШИБКА: порт 8445 занят». Это регрессия v0.7.8 (самострел щита): install
+#   применяет Zero-SNI Shield на 8444/8445 ДО вызова add-xhttp, а чек портов
+#   add-xhttp (и пред-проверка в install) считал занятый нашим же nginx-щитом
+#   порт конфликтом. Новый хелпер lucx_port_free_or_shield: порт, который держит
+#   наш nginx (reject-блок щита или прежний XHTTP-вхост), конфликтом не считается;
+#   чужой слушатель — по-прежнему отказ с диагностикой ss. На флоте не ловилось,
+#   потому что там XHTTP стоял до включения щита; били только чистые установки
+#   с третьим именем и add-xhttp на сервере с уже включённым щитом.
 
 # v0.7.8: Zero-SNI Shield — домен ноды больше не светится сканерам.
 #   Проблема (подтверждена живым зондом на no5, 24.11.2026): fallback Reality
@@ -2687,6 +2696,21 @@ reality_only_vhost_file() { # [порт]
       | while IFS= read -r cand; do grep -q 'ssl_reject_handshake' "$cand" 2>/dev/null || echo "$cand"; done | head -n1 || true)
   [[ -n "$f" ]] || return 1
   readlink -f "$f"
+}
+
+# v0.7.9: порт свободен или занят НАШИМ nginx (Zero-SNI Shield reject-блоком либо
+# вхостом-мишенью XHTTP из прежней установки — оба штатно делят loopback-порт с
+# именным вхостом и не являются конфликтом). Код возврата: 0 — можно использовать;
+# 1 — порт держит чужой процесс. Проверки портов XHTTP (8447/8445) в install и
+# add-xhttp без этого валились на собственном щите: install с третьим именем
+# применяет щит на 8445 ДО вызова add-xhttp, чей чек видел «порт занят».
+lucx_port_free_or_shield() { # порт
+  local p="$1"
+  ss -ltn 2>/dev/null | grep -qE "[:.]${p} " || return 0
+  ss -ltnp 2>/dev/null | grep -E "[:.]${p} " | grep -q 'nginx' || return 1
+  grep -qE "listen[[:space:]]+127\.0\.0\.1:${p}[[:space:]]+ssl[[:space:]]+default_server" "$ZERO_SNI_CONF" 2>/dev/null && return 0
+  grep -qE "^[[:space:]]*listen[[:space:]]+127\.0\.0\.1:${p}[[:space:]]" /etc/nginx/sites-enabled/xhttp-decoy-tls.conf 2>/dev/null && return 0
+  return 1
 }
 
 # h2 уже включён во вхосте (параметр http2 у listen этого порта или директива http2 on;). $1=файл $2=порт
@@ -4571,7 +4595,8 @@ cmd_install() {
       xh_bad="есть AAAA-запись (${xh_aaaa}); схема IPv4-only"
     else
       for p in "$XHTTP_PORT" "$XHTTP_TARGET_PORT"; do
-        if ss -tlnp 2>/dev/null | grep -q ":$p "; then xh_bad="порт $p занят"; fi
+        # v0.7.9: порт нашего щита/прежнего XHTTP-вхоста — не конфликт (lucx_port_free_or_shield)
+        lucx_port_free_or_shield "$p" || xh_bad="порт $p занят"
       done
     fi
     if [[ -n "$xh_bad" ]]; then
@@ -10168,8 +10193,10 @@ cmd_add_xhttp() {
   fi
   local p
   for p in "$XHTTP_PORT" "$XHTTP_TARGET_PORT"; do
-    if ss -ltn 2>/dev/null | grep -qE "[:.]${p} "; then
-      echo "ОШИБКА: порт ${p} занят — нужен свободный loopback-порт."
+    # v0.7.9: порт, занятый нашим Zero-SNI Shield / прежним XHTTP-вхостом — не конфликт
+    if ! lucx_port_free_or_shield "$p"; then
+      echo "ОШИБКА: порт ${p} занят чужим процессом — нужен свободный loopback-порт."
+      ss -ltnp 2>/dev/null | grep -E "[:.]${p} " | sed 's/^/    /' || true
       exit 1
     fi
   done

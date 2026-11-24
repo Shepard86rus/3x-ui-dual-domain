@@ -39,6 +39,7 @@ sudo bash 3x-ui-dual-domain.sh
 | 11 ⚠ | `restore` | восстановить архив на сервер с выполненным `install` ([migration.md](migration.md)) |
 | 12 | `add-bot` | поставить или обновить Telegram-бота ([telegram-bot.md](telegram-bot.md)) |
 | 13 ⚠ | `remove-bot` | удалить бота |
+| 14 | `zero-sni-shield` | Zero-SNI Shield (0.7.8): пустой/чужой SNI обрывается до отправки сертификата — сканеры по голому IP не узнают домен; свежая установка включает сама |
 
 ## Чего в меню нет
 

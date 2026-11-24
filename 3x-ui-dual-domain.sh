@@ -1254,7 +1254,40 @@
 #     пустой/чужой SNI). Каталог на месте enabled-ссылки отклоняется заранее
 #     (ln -sfn иначе молча кладёт ссылку внутрь каталога и возвращает 0),
 #     а после создания ссылка проверяется readlink'ом на наш файл.
-VERSION="0.7.9"
+
+# v0.8.0 (2026-11-25): ХОТФИКС Zero-SNI Shield — стоковая страница nginx при Host ≠ SNI
+#   (находка zcode 24.11, задание владельца; воспроизведена на всех нодах флота).
+#   СЛУЧАЙ: сканер-сервис на no11 получал 200/615 байт «Welcome to nginx» с
+#   `Server: nginx/1.24.0 (Ubuntu)` на пробе «SNI = домен, Host = IP». ПРИЧИНА:
+#   nginx выбирает vhost по SNI, но сам HTTP-запрос маршрутизирует по заголовку
+#   Host; при несовпавшем (или отсутствующем) Host nginx переключается на
+#   default_server порта — а это блок щита v0.7.8, где нет root (nginx отдаёт
+#   дефолтный /usr/share/nginx/html/index.html, 615 байт), нет server_tokens
+#   off (светится версия) и нет error_page (встроенный 404 nginx).
+#   ssl_reject_handshake действует только при выборе по SNI и переключение по Host не
+#   останавливает. Источник пробы значения не имеет (подтверждено с loopback
+#   ноды и снаружи). Версии 0.7.10 не существует (правило нумерации:
+#   после 0.7.9 идёт 0.8.0).
+#   РЕШЕНИЕ: (1) ensure_zero_sni_shield пишет блоки щита с server_tokens off,
+#   root /var/www/decoy-reality, index index.html, error_page 404 и
+#   location / { try_files … } — при Host ≠ SNI блок щита отдаёт тот же декой,
+#   что и основной vhost (без версии nginx в Server). Отбрасывание пустого/
+#   чужого SNI по-прежнему на ssl_reject_handshake — не затронуто.
+#   (2) Идемпотентность ensure (cmp файла) видит старый формат v0.7.8 как
+#   «не наш» и перезаписывает новым при любом вызове ensure: install,
+#   add-xhttp, remove-xhttp, restore, zero-sni-shield. add-h2 и reality-only
+#   щит не трогают; upgrade меняет только файл скрипта и запускает hc —
+#   ЖИВЫЕ ноды лечит явный `zero-sni-shield` (подсказка в hc).
+#   (3) healthcheck «zero-sni»: новая проба Host-mismatch (SNI = домен,
+#   Host = IP ноды) на вхосте-мишени: ok — Server-заголовок без версии nginx;
+#   warn с подсказкой `sudo bash $0 zero-sni-shield` — если отдаётся
+#   «nginx/1…»; warn «заголовок не получен» — если проба не прошла.
+#   (4) Самотест zero-sni-shield дополнен четвёртым зондом (хелпер
+#   zsn_host_mismatch_server, общий с hc): ждёт именно новое поведение —
+#   Host ≠ SNI без версии nginx; арбитр отката не меняется (SNI-поведение
+#   у старого и нового формата щита одинаковое).
+#   Панельный vhost 8443 и порт 80 не затронуты и раньше.
+VERSION="0.8.0"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -2633,10 +2666,14 @@ ensure_zero_sni_shield() { # порт [порт...]
     return 1
   fi
   {
-    echo "# lucx: Zero-SNI Shield (v0.7.8) — на вхостах-мишенях Reality пустой/чужой SNI"
-    echo "# обрывается ДО отправки сертификата: сканер на голом IP не узнаёт домен ноды."
+    echo "# lucx: Zero-SNI Shield (v0.7.8/v0.8.0) — на вхостах-мишенях Reality пустой/чужой"
+    echo "# SNI обрывается ДО отправки сертификата: сканер на голом IP не узнаёт домен ноды."
+    echo "# v0.8.0: nginx маршрутизирует сам HTTP-запрос по заголовку Host — при Host ≠ SNI"
+    echo "# (или запросе без Host) соединение попадает в default_server порта, т.е. в этот"
+    echo "# блок щита. Поэтому здесь, как и в декое: server_tokens off + root /var/www/decoy-reality"
+    echo "# (стоковый /usr/share/nginx/html и версия nginx в Server: наружу не отдаются)."
     for p in $ports; do
-      printf 'server {\n    listen 127.0.0.1:%s ssl default_server;\n    ssl_reject_handshake on;\n}\n' "$p"
+      printf 'server {\n    listen 127.0.0.1:%s ssl default_server;\n    ssl_reject_handshake on;\n    server_tokens off;\n    root /var/www/decoy-reality;\n    index index.html;\n    error_page 404 /404.html;\n    location / { try_files $uri $uri/ =404; }\n}\n' "$p"
     done
   } > "$tmp" || { echo "ОШИБКА: не записать временный файл щита — ничего не изменено."; rm -f "$tmp"; return 1; }
   # v0.7.8 (аудит Н4): идемпотентность — ссылка обязана существовать И вести именно на наш файл
@@ -7500,6 +7537,24 @@ cmd_healthcheck() {
       else
         check "zero-sni: свой домен отвечает, пустой/чужой SNI обрывается без сертификата (домен не светится сканерам)" ok
       fi
+      # v0.8.0: Host-mismatch. nginx маршрутизирует HTTP-запрос по Host: при Host ≠ SNI
+      # соединение попадает в default_server порта = блок щита. Щит v0.7.8 без root и
+      # server_tokens off отдавал оттуда стоковую «Welcome to nginx» (615 байт) с версией
+      # nginx в Server — виден сканерам («SNI=домен, Host=IP» — так зондируют checkip-сервисы).
+      # Щит v0.8.0 отдаёт тот же декой. Критерий — заголовок Server (размер декоя у нод
+      # разный); хелпер общий с самотестом zero-sni-shield. Пробу делаем только при
+      # живом своём SNI (иначе — двойной WARN рядом с уже проваленным зондом).
+      if [[ -n "$zsn_own" ]]; then
+        local zsn_srv
+        zsn_srv=$(zsn_host_mismatch_server "$REALITY_SELF_TARGET_PORT" "$REALITY_DOMAIN" "${SERVER_IP:-127.0.0.1}")
+        if [[ -z "$zsn_srv" ]]; then
+          check "zero-sni: Host≠SNI — заголовок Server не получен (проба не прошла; вручную: curl -sk --resolve ${REALITY_DOMAIN}:${REALITY_SELF_TARGET_PORT}:127.0.0.1 -H 'Host: <IP>' https://${REALITY_DOMAIN}:${REALITY_SELF_TARGET_PORT}/ -D -)" warn
+        elif grep -q 'nginx/[0-9]' <<<"$zsn_srv"; then
+          check "zero-sni: Host≠SNI отдаёт СТОКОВУЮ страницу nginx с версией (${zsn_srv#*: }) — дефект щита v0.7.8; лечит: sudo bash $0 zero-sni-shield" warn
+        else
+          check "zero-sni: Host≠SNI получает тот же декой без версии nginx (${zsn_srv#*: })" ok
+        fi
+      fi
     else
       check "zero-sni: щит НЕ включён — голый IP:443 отдаёт сертификат домена любому сканеру (Shodan/ТСПУ); включи: bash $0 zero-sni-shield" warn
     fi
@@ -8648,6 +8703,15 @@ zsn_probe_cert() { # порт sni
   echo "$out" | openssl x509 -noout -subject 2>/dev/null || true
 }
 
+# v0.8.0: заголовок Server из ответа вхоста-мишени на Host ≠ SNI ($1=порт, $2=SNI, $3=Host).
+# Пусто = проба не прошла. Возврат без «nginx/цифры» = щит нового формата (декой без версии).
+# Общий для самотеста zero-sni-shield и healthcheck — оба проверяют одно и то же поведение.
+zsn_host_mismatch_server() { # порт sni host
+  # --noproxy '*': при https_proxy в окружении curl ушёл бы в прокси и --resolve не спас бы
+  curl -sk --noproxy '*' --max-time 8 --resolve "${2}:${1}:127.0.0.1" -H "Host: ${3}" -o /dev/null -D - \
+    "https://${2}:${1}/" 2>/dev/null | grep -i '^server:' | tr -d '\r\n' || true
+}
+
 cmd_zero_sni_shield() {
   if [[ $EUID -ne 0 ]]; then
     echo "Запусти от root: sudo bash $0 zero-sni-shield"
@@ -8747,6 +8811,21 @@ cmd_zero_sni_shield() {
   if [[ -z "$c" ]]; then echo "  пустой SNI: хендшейк оборван без сертификата — ок"; else echo "  пустой SNI: всё ещё отдаётся $c"; bad=1; fi
   c=$(zsn_probe_cert "$REALITY_SELF_TARGET_PORT" "ya.ru")
   if [[ -z "$c" ]]; then echo "  чужой SNI (ya.ru): хендшейк оборван без сертификата — ок"; else echo "  чужой SNI: всё ещё отдаётся $c"; bad=1; fi
+  # v0.8.0 (аудит В1): четвёртый зонд — ждём именно НОВОЕ поведение щита:
+  # Host ≠ SNI отдаёт декой, а не стоковую страницу nginx с версией.
+  # Цикл — как у SNI-зондов: файл мог уже лежать новым, а воркеры — на старом конфиге.
+  local hsrv=""
+  for _ in $(seq 1 5); do
+    hsrv=$(zsn_host_mismatch_server "$REALITY_SELF_TARGET_PORT" "$REALITY_DOMAIN" 127.0.0.1)
+    if [[ -n "$hsrv" ]] && ! grep -q 'nginx/[0-9]' <<<"$hsrv"; then break; fi
+    sleep 1
+  done
+  if [[ -n "$hsrv" ]] && ! grep -q 'nginx/[0-9]' <<<"$hsrv"; then
+    echo "  Host≠SNI (${REALITY_SELF_TARGET_PORT}): тот же декой без версии nginx (${hsrv#*: }) — ок"
+  else
+    echo "  Host≠SNI (${REALITY_SELF_TARGET_PORT}): стоковая страница или нет ответа (${hsrv:-пусто})"
+    bad=1
+  fi
   if [[ -n "$xdom" ]]; then
     for _ in $(seq 1 5); do
       if [[ -n "$(zsn_probe_cert "$XHTTP_TARGET_PORT" "$xdom")" && -z "$(zsn_probe_cert "$XHTTP_TARGET_PORT" "ya.ru")" ]]; then break; fi
@@ -8756,6 +8835,22 @@ cmd_zero_sni_shield() {
     if [[ -n "$c" ]]; then echo "  XHTTP свой SNI (${xdom}): сертификат на месте — ок"; else echo "  XHTTP свой SNI: сертификата НЕТ"; bad=1; fi
     c=$(zsn_probe_cert "$XHTTP_TARGET_PORT" "ya.ru")
     if [[ -z "$c" ]]; then echo "  XHTTP чужой SNI: оборван — ок"; else echo "  XHTTP чужой SNI: отдаётся $c"; bad=1; fi
+    # v0.8.0 (аудит r2, М6): как у зонда 8444 — цикл и гейт по живому своему SNI,
+    # чтобы не печатать две ошибки об одной причине и не рвать одиночной задержкой
+    if [[ -n "$(zsn_probe_cert "$XHTTP_TARGET_PORT" "$xdom")" ]]; then
+      local xhsrv=""
+      for _ in $(seq 1 5); do
+        xhsrv=$(zsn_host_mismatch_server "$XHTTP_TARGET_PORT" "$xdom" 127.0.0.1)
+        if [[ -n "$xhsrv" ]] && ! grep -q 'nginx/[0-9]' <<<"$xhsrv"; then break; fi
+        sleep 1
+      done
+      if [[ -n "$xhsrv" ]] && ! grep -q 'nginx/[0-9]' <<<"$xhsrv"; then
+        echo "  XHTTP Host≠SNI (${XHTTP_TARGET_PORT}): тот же декой без версии nginx — ок"
+      else
+        echo "  XHTTP Host≠SNI (${XHTTP_TARGET_PORT}): стоковая страница или нет ответа (${xhsrv:-пусто})"
+        bad=1
+      fi
+    fi
   fi
   if (( bad )); then
     echo "ОШИБКА: самотест не прошёл — откат щита (файл + ссылка + вхост)."
@@ -11545,7 +11640,7 @@ menu_list() {
   echo "    7  ⚠ rebind-ip      — сменить IP в nginx после смены адреса у провайдера"
   echo "    8    add-swap       — swap-файл против нехватки памяти"
   echo "    9    remove-swap    — убрать swap-файл, созданный add-swap"
-  echo "   14    zero-sni-shield — не отдавать сертификат домена сканерам (голый IP)"
+  echo "   14    zero-sni-shield — не отдавать сертификат домена сканерам (голый IP); с 0.8.0 — и декой при Host ≠ SNI; повторный запуск обновляет щит 0.7.8"
   echo "  Резервная копия"
   echo "   10    backup         — зашифрованный архив сервера"
   echo "   11  ⚠ restore        — восстановить архив на новый сервер"
@@ -11702,7 +11797,10 @@ zero-sni-shield — не светить домен сканерам (антив�
               с ssl_reject_handshake: на пустой или чужой SNI хендшейк обрывается ДО отправки
               сертификата — Shodan/Censys/ТСПУ на голом IP больше не узнают домен ноды.
               Свой домен получает заглушку как раньше; Reality-клиенты не затронуты
-              (их обслуживает xray до fallback). Бэкап, самотест тремя зондами, автооткат.
+              (их обслуживает xray до fallback). Бэкап, самотест четырьмя зондами, автооткат.
+              С 0.8.0 запрос с Host ≠ SNI (SNI = домен, Host = IP — так зондируют
+              checkip-сервисы) получает ту же заглушку вместо стоковой страницы nginx
+              с версией. Повторный запуск обновляет щит формата 0.7.8 до 0.8.0.
   Нужно:      схема Reality-only и nginx >= 1.19.4 (Ubuntu 22.04 штатно несёт 1.18 — сначала
               обновите nginx; Ubuntu 24.04 и Debian 12 подходят).
   Подводные камни:
@@ -11949,7 +12047,8 @@ case "${1:-install}" in
     echo "  sudo bash $0 rebind-ip     — сменить IP в stream-роутере"
     echo "                               (после смены IP у провайдера)"
     echo "  sudo bash $0 zero-sni-shield — запретить отдавать сертификат домена на пустой/чужой SNI"
-    echo "                               (антивскрытие домена сканерами; Reality-only, nginx >= 1.19.4)"
+    echo "                               (антивскрытие домена сканерами; Reality-only, nginx >= 1.19.4;"
+    echo "                                с 0.8.0 — и декой при Host ≠ SNI; повторный запуск обновляет щит 0.7.8)"
     echo "  sudo bash $0 conntrack-guard — поднять таблицу conntrack (защита от флуда; только параметры ядра)"
     echo "  sudo bash $0 backup        — зашифрованный архив сервера (клиенты, инбаунды, настройки, конфиги; --with-certs"
     echo "                               кладёт и сертификаты); перенос: A-записи -> install -> restore"

@@ -1882,9 +1882,12 @@ create_hy2_inbound() {
   if sqlite3 "$XUIDB" "SELECT 1 FROM inbounds WHERE protocol='hysteria' AND port='${REALITY_XRAY_PORT:-443}' LIMIT 1;" 2>/dev/null | grep -q 1; then
     echo "Hy2-инбаунд на порту ${REALITY_XRAY_PORT:-443} уже существует. Пропускаю."
     HY2_OK=1
-    # v0.7.9: на повторном install auth существующего hy2 подтягиваем из БД —
-    # иначе финальная сводка ложно писала «Hysteria 2 не создан» (ей нужен HY2_AUTH).
+    # v0.7.9: на повторном install auth (и tag/email для блока кредов) существующего
+    # hy2 подтягиваем из БД — иначе финальная сводка ложно писала «Hysteria 2 не
+    # создан» (ей нужен HY2_AUTH), а без HY2_TAG блок кредов падал по set -u.
     HY2_AUTH=$(sqlite3 "$XUIDB" "SELECT json_extract(settings,'$.clients[0].auth') FROM inbounds WHERE protocol='hysteria' AND port='${REALITY_XRAY_PORT:-443}' LIMIT 1;" 2>/dev/null || true)
+    HY2_TAG=$(sqlite3 "$XUIDB" "SELECT tag FROM inbounds WHERE protocol='hysteria' AND port='${REALITY_XRAY_PORT:-443}' LIMIT 1;" 2>/dev/null || true)
+    HY2_EMAIL=$(sqlite3 "$XUIDB" "SELECT json_extract(settings,'$.clients[0].email') FROM inbounds WHERE protocol='hysteria' AND port='${REALITY_XRAY_PORT:-443}' LIMIT 1;" 2>/dev/null || true)
     return 0
   fi
 

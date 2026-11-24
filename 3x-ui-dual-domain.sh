@@ -1192,6 +1192,10 @@
 #   чужой слушатель — по-прежнему отказ с диагностикой ss. На флоте не ловилось,
 #   потому что там XHTTP стоял до включения щита; били только чистые установки
 #   с третьим именем и add-xhttp на сервере с уже включённым щитом.
+#   Плюс мелочь, пойманная на живом прогоне: повторный install (а именно его
+#   пройдут все, кто словил баги выше и перезапускает установку) писал в финальной
+#   сводке ложное «Hysteria 2 не создан»: инбаунд переиспользуется из БД, а сводке
+#   нужен HY2_AUTH — теперь он подтягивается из существующего инбаунда.
 
 # v0.7.8: Zero-SNI Shield — домен ноды больше не светится сканерам.
 #   Проблема (подтверждена живым зондом на no5, 24.11.2026): fallback Reality
@@ -1878,6 +1882,9 @@ create_hy2_inbound() {
   if sqlite3 "$XUIDB" "SELECT 1 FROM inbounds WHERE protocol='hysteria' AND port='${REALITY_XRAY_PORT:-443}' LIMIT 1;" 2>/dev/null | grep -q 1; then
     echo "Hy2-инбаунд на порту ${REALITY_XRAY_PORT:-443} уже существует. Пропускаю."
     HY2_OK=1
+    # v0.7.9: на повторном install auth существующего hy2 подтягиваем из БД —
+    # иначе финальная сводка ложно писала «Hysteria 2 не создан» (ей нужен HY2_AUTH).
+    HY2_AUTH=$(sqlite3 "$XUIDB" "SELECT json_extract(settings,'$.clients[0].auth') FROM inbounds WHERE protocol='hysteria' AND port='${REALITY_XRAY_PORT:-443}' LIMIT 1;" 2>/dev/null || true)
     return 0
   fi
 

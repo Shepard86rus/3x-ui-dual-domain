@@ -1173,7 +1173,59 @@
 #     рамка при UTF-8, иначе — две строки); без UTF-8 локали кириллица
 #     заменяется латиницей. Функция целиком под || true — не может уронить
 #     установку (set -euo pipefail).
-VERSION="0.7.7"
+#
+# v0.7.8: Zero-SNI Shield — домен ноды больше не светится сканерам.
+#   Проблема (подтверждена живым зондом на no5, 24.11.2026): fallback Reality
+#   ведёт на nginx-вхост-мишень 127.0.0.1:8444 (и 8445 у XHTTP), а тот отвечал
+#   на ЛЮБОЙ SNI (и на пустой) сертификатом боевого домена — Shodan/Censys/ТСПУ
+#   одним TLS-хендшейком на голый IP узнавали домен ноды и связывали IP↔домен.
+#   Решение: на вхостах-мишенях добавляется default_server с
+#   `ssl_reject_handshake on;` (nginx >= 1.19.4): пустой/чужой SNI обрывается
+#   ДО отправки сертификата; правильный домен по-прежнему получает заглушку,
+#   Reality-клиенты не затронуты (их обслуживает xray до fallback).
+#   • install (режим Reality) ставит щит сразу; вхост 8444 получает server_name.
+#   • Новая команда `zero-sni-shield` (menu 14) — миграция для работающих нод:
+#     проверка схемы (reality-only, dest=8444) и версии nginx, добавление
+#     server_name в вхост при необходимости, бэкап, nginx -t, самотест тремя
+#     зондами (свой/пустой/чужой SNI), автооткат при сбое. Идемпотентна.
+#   • add-xhttp щитит и 8445; remove-xhttp убирает блок 8445 из щита.
+#   • healthcheck: новая проверка «zero-sni» (warn, если щит не включён;
+#     fail, если щит есть, но сертификат всё ещё отдаётся).
+#   • nginx < 1.19.4 (Ubuntu 22.04 = 1.18): щит пропускается с WARN — обновить
+#     nginx штатными средствами ОС.
+#   • Аудит (ревизия 2): restore архива без щита поверх установки со щитом
+#     раньше оставлял связку «щит + вхост без server_name» (своему домену
+#     handshake рвётся) и сообщал «OK» — теперь restore согласует щит с
+#     восстановленными конфигами (server_name, порты строго по вхостам, зонды
+#     до «OK»; не сходится — щит отключается с WARN, а не молча ломает
+#     маскировку). Самотест ждёт именно новое поведение (свой отвечает +
+#     пустой/чужой обрываются), а не «свой ответил». ensure откатывает и при
+#     неудачном reload (бэкап живёт до подтверждённого применения); состояние
+#     enabled-ссылки (нет/наша/чужая цель) сохраняется и восстанавливается.
+#     hc проверяет обе стороны: свой SNI обязан отвечать, пустой — обрываться.
+#     Регрессионные тесты ревизии 2 поймали ещё одну дыру в самой заплатке:
+#     при идемпотентном щите ensure выходит без reload, а server_name во вхост
+#     уже добавлен — воркеры остаются на старом конфиге, зонды ложно валятся и
+#     исправный щит отключался бы с WARN. Теперь и restore-согласование, и
+#     команда перед зондами принудительно доводят дисковое состояние до
+#     воркеров (systemctl reload; зонды остаются источником истины).
+#     Аудит (ревизия 3): аварийное отключение щита в restore больше не может
+#     напечатать «OK» при неприменённой конфигурации — после снятия щита
+#     подтверждаем reload/restart и зондом, что свой домен отвечает; не
+#     подтверждено — restore завершается ОШИБКОЙ с ручными шагами (В1).
+#     ensure: каждая файловая операция (mktemp/cp/mv/ln) проверяется явно —
+#     в условных контекстах errexit подавлен и сбой мог сойти за успех (Н2).
+#     Откаты (ensure, cmd) подтверждают активное состояние reload→restart и
+#     зондом своего SNI; сбой reload больше не обрывает откат под set -e до
+#     очистки и сообщения (Н3).
+#     Аудит (ревизия 4): «свой SNI отвечает» не различает «щит снят» и «щит
+#     жив и корректен» — подтверждение отключения щита в restore теперь
+#     требует, чтобы пустой SNI снова получал сертификат; арбитр отката в
+#     команде сравнивает поведение с зондами, снятыми ДО изменений (свой/
+#     пустой/чужой SNI). Каталог на месте enabled-ссылки отклоняется заранее
+#     (ln -sfn иначе молча кладёт ссылку внутрь каталога и возвращает 0),
+#     а после создания ссылка проверяется readlink'ом на наш файл.
+VERSION="0.7.8"
 AWG_REBOOT_FLAG="/etc/x-ui/.awg-reboot-needed"
 
 # CLAUDE-FIX-v203: GITHUB_TOKEN больше не нужен.
@@ -2511,10 +2563,118 @@ nginx_http2_directive_ok() {
 # curl с поддержкой HTTP/2 нужен для проверки результата (без него проверка всегда «провалилась» бы и откатила правку)
 curl_has_http2() { curl -V 2>/dev/null | grep -qwi 'HTTP2'; }
 
-# Реальный файл вхоста с listen 127.0.0.1:<порт> ssl... ($1, по умолчанию порт вхоста-мишени); код возврата 1, если не найден
+# ---- v0.7.8: Zero-SNI Shield ----
+# Вхост-мишень Reality (127.0.0.1:8444; у XHTTP — 8445) раньше отвечал сертификатом
+# боевого домена на ЛЮБОЙ SNI (и на пустой): сканер одним хендшейком на голый IP
+# узнавал домен ноды. default_server с `ssl_reject_handshake on;` обрывает
+# хендшейк до отправки сертификата. Щит живёт в отдельном файле, чтобы sed-машинерия
+# h2/миграций не цепляла reject-блоки (reality_only_vhost_file их фильтрует).
+ZERO_SNI_CONF="/etc/nginx/sites-available/zero-sni-shield.conf"
+ZERO_SNI_LINK="/etc/nginx/sites-enabled/zero-sni-shield.conf"
+
+# ssl_reject_handshake появился в nginx 1.19.4 (Ubuntu 22.04 штатно несёт 1.18 — не умеет)
+nginx_ssl_reject_ok() {
+  local v
+  v=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
+  [[ -n "$v" ]] || return 1
+  [[ "$(printf '%s\n%s\n' "$v" "1.19.4" | sort -V | head -n1)" == "1.19.4" ]]
+}
+
+# Создаёт/обновляет файл щита reject-блоками на указанные порты (идемпотентно).
+# Код возврата: 0 — щит применён или nginx старый (тогда WARN и пропуск); 1 — ошибка применения (откачено).
+ensure_zero_sni_shield() { # порт [порт...]
+  local ports="$*"
+  [[ -n "$ports" ]] || return 0
+  if ! nginx_ssl_reject_ok; then
+    echo "  WARN: nginx < 1.19.4 не умеет ssl_reject_handshake — Zero-SNI Shield пропущен (обнови nginx до 1.20+)."
+    return 0
+  fi
+  local p tmp
+  # v0.7.8 (аудит Н2, ревизия 3): ensure вызывается в условных контекстах (if/&&/||) —
+  # errexit внутри подавлен, поэтому статус каждой критичной файловой операции
+  # проверяется явно, сбой отправляет в контролируемый откат, а не в «успех»
+  if ! tmp=$(mktemp); then
+    echo "ОШИБКА: mktemp не удался — щит не тронут."
+    return 1
+  fi
+  {
+    echo "# lucx: Zero-SNI Shield (v0.7.8) — на вхостах-мишенях Reality пустой/чужой SNI"
+    echo "# обрывается ДО отправки сертификата: сканер на голом IP не узнаёт домен ноды."
+    for p in $ports; do
+      printf 'server {\n    listen 127.0.0.1:%s ssl default_server;\n    ssl_reject_handshake on;\n}\n' "$p"
+    done
+  } > "$tmp" || { echo "ОШИБКА: не записать временный файл щита — ничего не изменено."; rm -f "$tmp"; return 1; }
+  # v0.7.8 (аудит Н4): идемпотентность — ссылка обязана существовать И вести именно на наш файл
+  if [[ -f "$ZERO_SNI_CONF" ]] && cmp -s "$tmp" "$ZERO_SNI_CONF" \
+     && [[ -L "$ZERO_SNI_LINK" && "$(readlink -f "$ZERO_SNI_LINK" 2>/dev/null)" == "$ZERO_SNI_CONF" ]]; then
+    rm -f "$tmp"; return 0
+  fi
+  # v0.7.8 (аудит Н2, ревизия 4): каталог на месте ссылки — GNU ln -sfn «успешно»
+  # кладёт ссылку ВНУТРЬ каталога и возвращает 0, а nginx потом падает на чтении
+  # каталога; отклоняем такое состояние явно и заранее, ничего не меняя
+  if [[ -d "$ZERO_SNI_LINK" && ! -L "$ZERO_SNI_LINK" ]]; then
+    echo "ОШИБКА: $ZERO_SNI_LINK — каталог, а не ссылка; щит не тронут. Убери каталог вручную: rm -rf $ZERO_SNI_LINK"
+    rm -f "$tmp"
+    return 1
+  fi
+  # v0.7.8 (аудит В3/Н4): фиксируем ПОЛНОЕ прежнее состояние — файл и ссылка (нет / наша / чужая цель);
+  # бэкап живёт до подтверждённого применения, а не до reload
+  local had_file=0 had_link=0 prev_target=""
+  if [[ -f "$ZERO_SNI_CONF" ]]; then
+    had_file=1
+    if ! cp -p "$ZERO_SNI_CONF" "${ZERO_SNI_CONF}.bak-zsn"; then
+      echo "ОШИБКА: не создать бэкап щита — ничего не изменено."
+      rm -f "$tmp"
+      return 1
+    fi
+  fi
+  if [[ -L "$ZERO_SNI_LINK" ]]; then had_link=1; prev_target=$(readlink "$ZERO_SNI_LINK" 2>/dev/null || true); fi
+  if ! mv "$tmp" "$ZERO_SNI_CONF"; then
+    echo "ОШИБКА: не установить файл щита — прежнее состояние не тронуто."
+    rm -f "$tmp"
+    (( had_file )) && rm -f "${ZERO_SNI_CONF}.bak-zsn"
+    return 1
+  fi
+  # v0.7.8 (аудит Н2, ревизия 4): -T — без семантики «записать внутрь каталога»;
+  # после создания проверяем, что путь стал именно symlink с целью на наш файл
+  if ! ln -sfnT "$ZERO_SNI_CONF" "$ZERO_SNI_LINK" \
+     || [[ ! -L "$ZERO_SNI_LINK" || "$(readlink -f "$ZERO_SNI_LINK" 2>/dev/null)" != "$ZERO_SNI_CONF" ]]; then
+    echo "ОШИБКА: не включить щит (ссылка в sites-enabled) — откат файла."
+    if (( had_file )); then mv -f "${ZERO_SNI_CONF}.bak-zsn" "$ZERO_SNI_CONF" 2>/dev/null || true; else rm -f "$ZERO_SNI_CONF"; fi
+    if (( had_link )) && [[ -n "$prev_target" ]]; then ln -sfn "$prev_target" "$ZERO_SNI_LINK" 2>/dev/null || true; else rm -f "$ZERO_SNI_LINK" 2>/dev/null || true; fi
+    return 1
+  fi
+  local applied=0
+  if ! nginx -t >/dev/null 2>&1; then
+    echo "ОШИБКА: nginx -t не прошёл с Zero-SNI Shield:"
+    nginx -t 2>&1 | tail -3 | sed 's/^/    /' || true
+  elif systemctl is-active --quiet nginx 2>/dev/null && ! systemctl reload nginx 2>/dev/null; then
+    # reload только если nginx уже запущен (в install до [9/10] он может ещё не стартовать — конфиг подхватится при старте)
+    echo "ОШИБКА: reload nginx не прошёл после установки Zero-SNI Shield."
+  else
+    applied=1
+  fi
+  if (( ! applied )); then
+    echo "  откат щита к прежнему состоянию (файл + ссылка):"
+    if (( had_file )); then mv -f "${ZERO_SNI_CONF}.bak-zsn" "$ZERO_SNI_CONF" 2>/dev/null || true; else rm -f "$ZERO_SNI_CONF"; fi
+    if (( had_link )) && [[ -n "$prev_target" ]]; then ln -sfn "$prev_target" "$ZERO_SNI_LINK" 2>/dev/null || true; else rm -f "$ZERO_SNI_LINK"; fi
+    # v0.7.8 (аудит Н3): дисковое состояние возвращено; активное подтверждаем reload,
+    # при его сбое — контролируемый restart; оба с обработкой, без молчаливого || true
+    if nginx -t >/dev/null 2>&1; then
+      systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null \
+        || echo "  ВНИМАНИЕ: откаченное состояние на диске, но nginx его не применил — вручную: systemctl restart nginx"
+    fi
+    return 1
+  fi
+  rm -f "${ZERO_SNI_CONF}.bak-zsn" || true
+}
+
+# Реальный файл вхоста с listen 127.0.0.1:<порт> ssl... ($1, по умолчанию порт вхоста-мишени); код возврата 1, если не найден.
+# v0.7.8: reject-блоки Zero-SNI Shield (ssl_reject_handshake) не считаются вхостом-мишенью.
 reality_only_vhost_file() { # [порт]
   local f port="${1:-$REALITY_SELF_TARGET_PORT}"
-  f=$(grep -lE "^[[:space:]]*listen[[:space:]]+127\.0\.0\.1:${port}[[:space:]]+ssl" /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf 2>/dev/null | head -n1 || true)
+  f=$(grep -lE "^[[:space:]]*listen[[:space:]]+127\.0\.0\.1:${port}[[:space:]]+ssl" /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf 2>/dev/null \
+      | while IFS= read -r cand; do grep -q 'ssl_reject_handshake' "$cand" 2>/dev/null || echo "$cand"; done | head -n1 || true)
   [[ -n "$f" ]] || return 1
   readlink -f "$f"
 }
@@ -6554,6 +6714,7 @@ EOF
   cat > "/etc/nginx/sites-available/${REALITY_DOMAIN}.conf" <<EOF
 server {
     listen 127.0.0.1:${REALITY_DECOY_INTERNAL_PORT} ssl;
+    server_name ${REALITY_DOMAIN};
     server_tokens off;
     add_header Strict-Transport-Security "max-age=31536000" always;
     ssl_certificate     /etc/letsencrypt/live/${REALITY_DOMAIN}/fullchain.pem;
@@ -6571,6 +6732,14 @@ EOF
   if [[ "$VLESS_MODE" == "reality" && "${H2:-1}" != "0" ]]; then
     nginx_vhost_http2_patch "/etc/nginx/sites-available/${REALITY_DOMAIN}.conf" "$REALITY_DECOY_INTERNAL_PORT" \
       || echo "WARN: h2 на вхосте 127.0.0.1:${REALITY_DECOY_INTERNAL_PORT} не включён — сайт-заглушка будет только по http/1.1."
+  fi
+
+  # v0.7.8: Zero-SNI Shield — голый IP/чужой SNI не получают сертификат домена (только Reality-only)
+  if [[ "$VLESS_MODE" == "reality" ]]; then
+    zsn_ports="$REALITY_DECOY_INTERNAL_PORT"
+    [[ -n "${XHTTP_DOM_INST:-}" ]] && zsn_ports="$zsn_ports $XHTTP_TARGET_PORT"
+    ensure_zero_sni_shield $zsn_ports \
+      || echo "WARN: Zero-SNI Shield не применён — включить позже: bash $0 zero-sni-shield"
   fi
 
   # v0.4.0: plain-HTTP фасад decoy №2 (:8080, loopback) — цель fallback'а TLS-режима
@@ -7253,6 +7422,26 @@ cmd_healthcheck() {
     fi
   else
     check "stream-sni-router.conf не найден" fail
+  fi
+
+  # v0.7.8: Zero-SNI Shield — вхост-мишень не должен отдавать сертификат домена
+  # на пустой/чужой SNI. Только для Reality-only (в TLS-режиме TLS терминирует xray).
+  zsn_sec=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.security') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  if [[ "$zsn_sec" == "reality" ]] && reality_only_vhost_file >/dev/null 2>&1; then
+    if [[ -f /etc/nginx/sites-enabled/zero-sni-shield.conf ]]; then
+      # v0.7.8 (аудит К1): проверяем ОБЕ стороны — свой SNI обязан отвечать, пустой обязан обрываться
+      zsn_own=$(zsn_probe_cert "$REALITY_SELF_TARGET_PORT" "$REALITY_DOMAIN")
+      zsn_emp=$(zsn_probe_cert "$REALITY_SELF_TARGET_PORT" "")
+      if [[ -z "$zsn_own" ]]; then
+        check "zero-sni: щит включён, но СВОЙ SNI (${REALITY_DOMAIN}) не получает сертификат — заглушка сломана (нет server_name во вхосте ${REALITY_SELF_TARGET_PORT}?)" fail
+      elif [[ -n "$zsn_emp" ]]; then
+        check "zero-sni: щит включён, но вхост ${REALITY_SELF_TARGET_PORT} всё ещё отдаёт сертификат на пустой SNI — проверь конфиги nginx" fail
+      else
+        check "zero-sni: свой домен отвечает, пустой/чужой SNI обрывается без сертификата (домен не светится сканерам)" ok
+      fi
+    else
+      check "zero-sni: щит НЕ включён — голый IP:443 отдаёт сертификат домена любому сканеру (Shodan/ТСПУ); включи: bash $0 zero-sni-shield" warn
+    fi
   fi
 
   # Проверка stream -> nginx: proxy_protocol должен быть включён с обеих
@@ -8382,6 +8571,166 @@ cmd_rebind_ip() {
   echo "  Подробности — в README (раздел «После установки»)."
   echo "============================================"
   echo "Проверка связки: bash $0 healthcheck (блок [2] и Decoy №2 должны быть зелёными)."
+}
+
+# ================== ZERO-SNI SHIELD (v0.7.8): домен не отдаётся сканерам ==================
+# См. changelog v0.7.8. Команда миграции для работающих нод; install ставит щит сам.
+
+# Печатает subject сертификата, который вхост-мишень ($1=порт) отдаёт на SNI ($2; пусто = без SNI). Пусто = хендшейк не состоялся.
+zsn_probe_cert() { # порт sni
+  local port="$1" sni="$2" out
+  if [[ -n "$sni" ]]; then
+    out=$(timeout 8 openssl s_client -connect "127.0.0.1:${port}" -servername "$sni" </dev/null 2>/dev/null || true)
+  else
+    out=$(timeout 8 openssl s_client -connect "127.0.0.1:${port}" -noservername </dev/null 2>/dev/null || true)
+  fi
+  echo "$out" | openssl x509 -noout -subject 2>/dev/null || true
+}
+
+cmd_zero_sni_shield() {
+  if [[ $EUID -ne 0 ]]; then
+    echo "Запусти от root: sudo bash $0 zero-sni-shield"
+    exit 1
+  fi
+  lucx_scheme_lock "zero-sni-shield"
+  read_domains
+  if [[ -z "${REALITY_DOMAIN:-}" ]]; then
+    echo "ОШИБКА: Reality-домен не определён из ${CREDS_FILE}."
+    exit 1
+  fi
+  if [[ ! -f /etc/nginx/stream-sni-router.conf ]]; then
+    echo "ОШИБКА: /etc/nginx/stream-sni-router.conf не найден — схема не развёрнута."
+    exit 1
+  fi
+  if ! nginx_ssl_reject_ok; then
+    echo "ОШИБКА: nginx < 1.19.4 не умеет ssl_reject_handshake — щит невозможен."
+    echo "      Обнови nginx штатно (apt), затем повтори: bash $0 zero-sni-shield"
+    exit 1
+  fi
+  # щит применим к Reality-only: Reality-инбаунд 127.0.0.1:443, за которым стоит nginx-вхост-мишень
+  local sec up
+  sec=$(sqlite3 "$XUIDB" "SELECT json_extract(stream_settings,'\$.security') FROM inbounds WHERE protocol='vless' AND port=443 AND listen='127.0.0.1' LIMIT 1;" 2>/dev/null || true)
+  up=$(awk '/upstream reality_backend/,/}/' /etc/nginx/stream-sni-router.conf 2>/dev/null | grep -oP "server 127\.0\.0\.1:\K[0-9]+" | head -n1 || true)
+  if [[ "$sec" != "reality" || "$up" != "443" ]]; then
+    echo "Схема не Reality-only (security=${sec:-нет}, reality_backend -> :${up:-?}) — щит не нужен:"
+    echo "в TLS-режиме TLS терминирует сам xray (см. changelog v0.7.8). Ничего не изменено."
+    exit 1
+  fi
+  local vf; vf=$(reality_only_vhost_file) || { echo "ОШИБКА: вхост 127.0.0.1:${REALITY_SELF_TARGET_PORT} не найден."; exit 1; }
+  # XHTTP-мишень (если есть) щитим тем же щитом
+  local xdom=""
+  if [[ -f /etc/nginx/sites-enabled/xhttp-decoy-tls.conf ]]; then
+    xdom=$(grep -oP '^\s*server_name\s+\K[^;\s]+' /etc/nginx/sites-enabled/xhttp-decoy-tls.conf 2>/dev/null | head -n1 || true)
+  fi
+  # v0.7.8 (аудит ревизия 4): фиксируем поведение ДО изменений — арбитр отката
+  # сравнивает с ним, а не с «свой SNI отвечает» (тот одинаков и при живом новом
+  # щите, и при успешном откате)
+  local pre_own pre_emp pre_frn
+  pre_own=$(zsn_probe_cert "$REALITY_SELF_TARGET_PORT" "$REALITY_DOMAIN")
+  pre_emp=$(zsn_probe_cert "$REALITY_SELF_TARGET_PORT" "")
+  pre_frn=$(zsn_probe_cert "$REALITY_SELF_TARGET_PORT" "ya.ru")
+  # у старых установок вхост 8444 без server_name — добавляем (иначе со щитом заглушка перестанет отвечать своему имени)
+  local vh_bak=""
+  if ! grep -qE '^[[:space:]]*server_name[[:space:]]' "$vf"; then
+    vh_bak="${vf}.pre-zsn-$(date +%s)"
+    cp -p "$vf" "$vh_bak"
+    sed -i -E "/^[[:space:]]*listen[[:space:]]+127\.0\.0\.1:${REALITY_SELF_TARGET_PORT}[[:space:]]+ssl/a\\    server_name ${REALITY_DOMAIN};" "$vf"
+    if ! grep -qF "server_name ${REALITY_DOMAIN};" "$vf"; then
+      echo "ОШИБКА: server_name не появился в $vf — откат."
+      cp -p "$vh_bak" "$vf"
+      exit 1
+    fi
+    echo "  вхост 127.0.0.1:${REALITY_SELF_TARGET_PORT}: добавлен server_name ${REALITY_DOMAIN} (бэкап: $vh_bak)"
+  fi
+  # v0.7.8 (аудит Н4): фиксируем полное прежнее состояние щита — файл И ссылку
+  local sh_had=0 sh_bak="" sh_link_had=0 sh_link_target=""
+  if [[ -f "$ZERO_SNI_CONF" ]]; then sh_had=1; sh_bak=$(mktemp); cp -p "$ZERO_SNI_CONF" "$sh_bak"; fi
+  if [[ -L "$ZERO_SNI_LINK" ]]; then sh_link_had=1; sh_link_target=$(readlink "$ZERO_SNI_LINK" 2>/dev/null || true); fi
+  local ports="$REALITY_SELF_TARGET_PORT"
+  [[ -n "$xdom" ]] && ports="$ports $XHTTP_TARGET_PORT"
+  if ! ensure_zero_sni_shield $ports; then
+    # ensure сам вернул щит к прежнему состоянию (файл + ссылка); откатываем только вхост
+    if [[ -n "$vh_bak" ]]; then
+      cp -p "$vh_bak" "$vf" 2>/dev/null || true
+      # v0.7.8 (аудит Н3): reload с обработкой, при сбое — restart; молчаливого || true нет
+      systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null \
+        || echo "  ВНИМАНИЕ: вхост возвращён на диске, но nginx это не применил — вручную: systemctl restart nginx"
+    fi
+    [[ -n "$sh_bak" ]] && rm -f "$sh_bak"
+    echo "ОШИБКА: щит не применён — состояние откачено."
+    exit 1
+  fi
+  echo "Самотест зондами:"
+  local bad=0 c w applied=0
+  # v0.7.8 (ревизия 2): если вхост получил server_name, а щит был идемпотентен
+  # (ensure вышел без reload), воркеры ещё на старом конфиге — доводим дисковое
+  # состояние до воркеров; зонды ниже остаются источником истины
+  systemctl reload nginx 2>/dev/null || true
+  # v0.7.8 (аудит В2): ждём именно НОВОЕ поведение (свой отвечает + пустой/чужой обрываются),
+  # а не «свой ответил» (он отвечал и до щита) — иначе ложный откат исправного щита
+  for w in $(seq 1 10); do
+    if [[ -n "$(zsn_probe_cert "$REALITY_SELF_TARGET_PORT" "$REALITY_DOMAIN")" \
+       && -z "$(zsn_probe_cert "$REALITY_SELF_TARGET_PORT" "")" \
+       && -z "$(zsn_probe_cert "$REALITY_SELF_TARGET_PORT" "ya.ru")" ]]; then
+      applied=1; break
+    fi
+    sleep 1
+  done
+  if (( ! applied )); then
+    echo "  конфигурация не применилась за 10 с (reload nginx не подхватил щит?)"
+    bad=1
+  fi
+  c=$(zsn_probe_cert "$REALITY_SELF_TARGET_PORT" "$REALITY_DOMAIN")
+  if [[ -n "$c" ]]; then echo "  свой SNI (${REALITY_DOMAIN}): сертификат на месте — ок"; else echo "  свой SNI: сертификата НЕТ — заглушка сломана"; bad=1; fi
+  c=$(zsn_probe_cert "$REALITY_SELF_TARGET_PORT" "")
+  if [[ -z "$c" ]]; then echo "  пустой SNI: хендшейк оборван без сертификата — ок"; else echo "  пустой SNI: всё ещё отдаётся $c"; bad=1; fi
+  c=$(zsn_probe_cert "$REALITY_SELF_TARGET_PORT" "ya.ru")
+  if [[ -z "$c" ]]; then echo "  чужой SNI (ya.ru): хендшейк оборван без сертификата — ок"; else echo "  чужой SNI: всё ещё отдаётся $c"; bad=1; fi
+  if [[ -n "$xdom" ]]; then
+    for _ in $(seq 1 5); do
+      if [[ -n "$(zsn_probe_cert "$XHTTP_TARGET_PORT" "$xdom")" && -z "$(zsn_probe_cert "$XHTTP_TARGET_PORT" "ya.ru")" ]]; then break; fi
+      sleep 1
+    done
+    c=$(zsn_probe_cert "$XHTTP_TARGET_PORT" "$xdom")
+    if [[ -n "$c" ]]; then echo "  XHTTP свой SNI (${xdom}): сертификат на месте — ок"; else echo "  XHTTP свой SNI: сертификата НЕТ"; bad=1; fi
+    c=$(zsn_probe_cert "$XHTTP_TARGET_PORT" "ya.ru")
+    if [[ -z "$c" ]]; then echo "  XHTTP чужой SNI: оборван — ок"; else echo "  XHTTP чужой SNI: отдаётся $c"; bad=1; fi
+  fi
+  if (( bad )); then
+    echo "ОШИБКА: самотест не прошёл — откат щита (файл + ссылка + вхост)."
+    # v0.7.8 (аудит Н3, ревизия 3): раньше сбой завершающего reload под set -e обрывал
+    # откат до очистки sh_bak и контролируемого exit 1. Теперь: каждый шаг с явной
+    # обработкой, активное состояние подтверждается зондом, sh_bak чистится всегда.
+    local rb_ok=1 okp=0
+    if (( sh_had )); then cp -p "$sh_bak" "$ZERO_SNI_CONF" 2>/dev/null || rb_ok=0; else rm -f "$ZERO_SNI_CONF"; fi
+    if (( sh_link_had )) && [[ -n "$sh_link_target" ]]; then ln -sfn "$sh_link_target" "$ZERO_SNI_LINK" 2>/dev/null || rb_ok=0; else rm -f "$ZERO_SNI_LINK"; fi
+    if [[ -n "$vh_bak" ]]; then cp -p "$vh_bak" "$vf" 2>/dev/null || rb_ok=0; fi
+    if nginx -t >/dev/null 2>&1; then
+      systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || rb_ok=0
+    else
+      echo "ВНИМАНИЕ: nginx -t не прошёл после отката — проверь конфиги вручную"
+      rb_ok=0
+    fi
+    # зонд-арбитр: поведение обязано совпасть с зафиксированным ДО команды —
+    # «свой SNI отвечает» не различает откат и оставшийся активным новый щит
+    for _ in $(seq 1 5); do
+      if [[ "$(zsn_probe_cert "$REALITY_SELF_TARGET_PORT" "$REALITY_DOMAIN")" == "$pre_own" \
+         && "$(zsn_probe_cert "$REALITY_SELF_TARGET_PORT" "")" == "$pre_emp" \
+         && "$(zsn_probe_cert "$REALITY_SELF_TARGET_PORT" "ya.ru")" == "$pre_frn" ]]; then okp=1; break; fi
+      sleep 1
+    done
+    [[ -n "$sh_bak" ]] && rm -f "$sh_bak"
+    if (( rb_ok && okp )); then
+      echo "Откат завершён и подтверждён: активный nginx отвечает как до команды (зонды свой/пустой/чужой SNI совпали с состоянием до изменений)."
+    elif (( okp )); then
+      echo "Файлы возвращены и активный nginx отвечает как до команды, но reload/restart не подтверждён — проверь вручную: nginx -t && systemctl reload nginx"
+    else
+      echo "ВНИМАНИЕ: активный nginx НЕ подтверждён после отката — вручную: nginx -t; systemctl restart nginx; затем bash $0 healthcheck"
+    fi
+    exit 1
+  fi
+  [[ -n "$sh_bak" ]] && rm -f "$sh_bak"
+  echo "OK: Zero-SNI Shield включён (порты: ${ports// /, }). Голый IP больше не отдаёт сертификат домена."
 }
 
 # ================== PANEL-TUNNEL (v0.6.2): доступ к панели через SSH-туннель ==================
@@ -9892,6 +10241,11 @@ EOF
     xhttp_remove_vhosts
     exit 1
   fi
+  # v0.7.8: щитим XHTTP-мишень 8445 (и 8444, если его вхост есть, а щита ещё не было)
+  local zsn_ports="$XHTTP_TARGET_PORT"
+  reality_only_vhost_file >/dev/null 2>&1 && zsn_ports="${REALITY_SELF_TARGET_PORT} $XHTTP_TARGET_PORT"
+  ensure_zero_sni_shield $zsn_ports \
+    || echo "WARN: Zero-SNI Shield не применён — включить позже: bash $0 zero-sni-shield"
   local i tcode="000"
   for i in 1 2 3 4 5; do
     tcode=$(curl -sk -m 5 -o /dev/null -w "%{http_code}" --resolve "${xdom}:${XHTTP_TARGET_PORT}:127.0.0.1" "https://${xdom}:${XHTTP_TARGET_PORT}/" 2>/dev/null || echo 000)
@@ -10162,6 +10516,11 @@ SQL
   else
     remove_xhttp_rollback "x-ui или nginx не active после удаления"
     exit 1
+  fi
+  # v0.7.8: убрать порт XHTTP-мишени из Zero-SNI Shield (если щит стоит)
+  if [[ -f "$ZERO_SNI_CONF" ]]; then
+    ensure_zero_sni_shield "$REALITY_SELF_TARGET_PORT" \
+      || echo "WARN: щит не пересобран без ${XHTTP_TARGET_PORT} — проверь: bash $0 zero-sni-shield"
   fi
   # креды и сертификат — уже вне окна отката (нефатальные операции)
   [[ -f "$CREDS_FILE" ]] && sed -i '/^XHTTP /d' "$CREDS_FILE" || true
@@ -10707,6 +11066,71 @@ cmd_restore() {
   trap - HUP PIPE        # сброс игнорирования: дальше обычное поведение
   trap bk_cleanup EXIT
 
+  # v0.7.8 (аудит К1): согласование Zero-SNI Shield с восстановленными конфигами.
+  # Архив v0.7.7 или старше не знает про щит: его sites-available перезаписал вхосты
+  # (Reality-вхост мог вернуться БЕЗ server_name), а самого щита в архиве нет —
+  # связка «щит + вхост без server_name» рвёт handshake даже своему домену, и это
+  # синтаксически валидно (nginx -t проходит). Здесь: чиним server_name, пересобираем
+  # щит строго по восстановленным портам (без XHTTP блок 8445 уходит), проверяем
+  # зондами ДО «OK»; не сходится — щит отключаем с WARN (узел работает без щита,
+  # а не со сломанной маскировкой).
+  if [[ -f "$ZERO_SNI_CONF" || -L "$ZERO_SNI_LINK" ]]; then
+    bk_say "Zero-SNI Shield: согласую с восстановленными конфигами..."
+    local zsn_vf zsn_fixed=1 zsn_ports_r="" zsn_ok=0
+    zsn_vf=$(reality_only_vhost_file 2>/dev/null || true)
+    if [[ -n "$zsn_vf" ]]; then
+      if ! grep -qE '^[[:space:]]*server_name[[:space:]]' "$zsn_vf"; then
+        if sed -i -E "/^[[:space:]]*listen[[:space:]]+127\.0\.0\.1:${REALITY_SELF_TARGET_PORT}[[:space:]]+ssl/a\\    server_name ${REALITY_DOMAIN};" "$zsn_vf" \
+           && grep -qF "server_name ${REALITY_DOMAIN};" "$zsn_vf"; then
+          bk_say "  вхост ${REALITY_SELF_TARGET_PORT}: добавлен server_name ${REALITY_DOMAIN}"
+        else
+          zsn_fixed=0
+        fi
+      fi
+      zsn_ports_r="$REALITY_SELF_TARGET_PORT"
+    fi
+    [[ -f /etc/nginx/sites-enabled/xhttp-decoy-tls.conf ]] && zsn_ports_r="${zsn_ports_r:+$zsn_ports_r }$XHTTP_TARGET_PORT"
+    if (( zsn_fixed )) && [[ -n "$zsn_ports_r" ]] && ensure_zero_sni_shield $zsn_ports_r; then
+      # v0.7.8 (аудит К1, ревизия 2): server_name мог быть добавлен во вхост уже ПОСЛЕ
+      # рестарта nginx выше; если щит при этом идемпотентен (ensure без reload), воркеры
+      # остаются на старом конфиге и зонды ложно валятся — доводим дисковое состояние
+      systemctl reload nginx 2>/dev/null || true
+      for _ in $(seq 1 10); do
+        if [[ -n "$(zsn_probe_cert "$REALITY_SELF_TARGET_PORT" "$REALITY_DOMAIN")" \
+           && -z "$(zsn_probe_cert "$REALITY_SELF_TARGET_PORT" "")" \
+           && -z "$(zsn_probe_cert "$REALITY_SELF_TARGET_PORT" "ya.ru")" ]]; then zsn_ok=1; break; fi
+        sleep 1
+      done
+      (( zsn_ok )) && bk_say "  Zero-SNI Shield согласован (порты: $zsn_ports_r): свой домен отвечает, сканеры обрываются."
+    fi
+    if (( ! zsn_ok )); then
+      bk_say "  ВНИМАНИЕ: щит после восстановления не согласован — ОТКЛЮЧАЮ его (включи заново: bash $0 zero-sni-shield)"
+      rm -f "$ZERO_SNI_CONF" "$ZERO_SNI_LINK"
+      # v0.7.8 (аудит В1, ревизия 3): без подтверждения применения «OK» печатать нельзя —
+      # при неудачном reload активный nginx остался бы на связке «щит + вхост без
+      # server_name» (свой SNI рвётся), а hc ветку щита уже не проверяет (файла нет).
+      # Ревизия 4 (аудит В1): «свой SNI отвечает» само по себе не различает «щит снят»
+      # и «щит жив и корректен» — ответ одинаковый. Признак именно ОТКЛЮЧЕНИЯ: свой SNI
+      # отвечает И пустой SNI снова получает сертификат (reject не активен).
+      local zsn_dis=0
+      if nginx -t >/dev/null 2>&1; then
+        systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
+        for _ in $(seq 1 10); do
+          if [[ -n "$(zsn_probe_cert "$REALITY_SELF_TARGET_PORT" "$REALITY_DOMAIN")" \
+             && -n "$(zsn_probe_cert "$REALITY_SELF_TARGET_PORT" "")" ]]; then zsn_dis=1; break; fi
+          sleep 1
+        done
+      fi
+      if (( zsn_dis )); then
+        bk_say "  щит отключён и это подтверждено зондом: свой домен отвечает, пустой SNI снова получает сертификат (щит не активен)."
+      else
+        bk_say "ОШИБКА: щит снят с диска, но активный nginx это не подтвердил (свой SNI ${REALITY_DOMAIN} не отвечает или пустой SNI всё ещё обрывается = щит остался активен) — маскировка может быть сломана."
+        bk_say "  Вручную: nginx -t; systemctl restart nginx; затем sudo bash $0 healthcheck. Restore прерван с ошибкой, «OK» не будет."
+        exit 1
+      fi
+    fi
+  fi
+
   bk_say "OK: восстановлено (панель и nginx запущены). Работу клиентов проверь сам: sudo bash $0 healthcheck и подключение с телефона."
   if pgrep -f 'xray-linux' >/dev/null 2>&1; then bk_say "  xray запущен."; else bk_say "  WARN: процесс xray не найден — подожди минуту, затем смотри: journalctl -u x-ui -n 50"; fi
   local pl
@@ -10846,6 +11270,7 @@ menu_list() {
   echo "    7  ⚠ rebind-ip      — сменить IP в nginx после смены адреса у провайдера"
   echo "    8    add-swap       — swap-файл против нехватки памяти"
   echo "    9    remove-swap    — убрать swap-файл, созданный add-swap"
+  echo "   14    zero-sni-shield — не отдавать сертификат домена сканерам (голый IP)"
   echo "  Резервная копия"
   echo "   10    backup         — зашифрованный архив сервера"
   echo "   11  ⚠ restore        — восстановить архив на новый сервер"
@@ -10996,6 +11421,25 @@ remove-bot — удалить Telegram-бота
                    Сама команда спросит подтверждение ещё раз [y/N].
 EOF
     ;;
+    14) cat <<'EOF'
+zero-sni-shield — не светить домен сканерам (антивскрытие по голому IP)
+  Что делает: на вхостах-мишенях Reality (127.0.0.1:8444, и 8445 у XHTTP) ставит default_server
+              с ssl_reject_handshake: на пустой или чужой SNI хендшейк обрывается ДО отправки
+              сертификата — Shodan/Censys/ТСПУ на голом IP больше не узнают домен ноды.
+              Свой домен получает заглушку как раньше; Reality-клиенты не затронуты
+              (их обслуживает xray до fallback). Бэкап, самотест тремя зондами, автооткат.
+  Нужно:      схема Reality-only и nginx >= 1.19.4 (Ubuntu 22.04 штатно несёт 1.18 — сначала
+              обновите nginx; Ubuntu 24.04 и Debian 12 подходят).
+  Подводные камни:
+    - в TLS-режиме не применимо (там TLS терминирует сам xray) — команда откажет;
+    - домен уже публичен в CT-логах Let's Encrypt: щит закрывает связку IP↔домен,
+      а не существование домена;
+    - мониторинги/боты, ходящие на https://IP без домена, перестанут получать ответ
+      (это и есть цель); панель и подписки по домену работают как прежде.
+  Откат:      при сбое автоматически; вручную — удалить
+              /etc/nginx/sites-enabled/zero-sni-shield.conf и перезагрузить nginx.
+EOF
+    ;;
     *) echo "Нет такого пункта: $1" ;;
   esac
   echo
@@ -11092,6 +11536,7 @@ cmd_menu() {
           fi ;;
       12) menu_run add-bot ;;
       13) menu_card 13; menu_confirm && menu_run remove-bot ;;
+      14) menu_card 14; menu_run zero-sni-shield ;;
       *)  echo "Нет такого пункта: ${ch}"; sleep 1 ;;
     esac
   done
@@ -11153,6 +11598,9 @@ case "${1:-install}" in
     ;;
   rebind-ip|rebind|newip)
     cmd_rebind_ip
+    ;;
+  zero-sni-shield|zsn)
+    cmd_zero_sni_shield
     ;;
   conntrack-guard|conntrack)
     cmd_conntrack_guard
@@ -11225,6 +11673,8 @@ case "${1:-install}" in
     echo "  sudo bash $0 healthcheck   — проверить текущую связку"
     echo "  sudo bash $0 rebind-ip     — сменить IP в stream-роутере"
     echo "                               (после смены IP у провайдера)"
+    echo "  sudo bash $0 zero-sni-shield — запретить отдавать сертификат домена на пустой/чужой SNI"
+    echo "                               (антивскрытие домена сканерами; Reality-only, nginx >= 1.19.4)"
     echo "  sudo bash $0 conntrack-guard — поднять таблицу conntrack (защита от флуда; только параметры ядра)"
     echo "  sudo bash $0 backup        — зашифрованный архив сервера (клиенты, инбаунды, настройки, конфиги; --with-certs"
     echo "                               кладёт и сертификаты); перенос: A-записи -> install -> restore"
